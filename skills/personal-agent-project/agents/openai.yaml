@@ -1,0 +1,4 @@
+interface:
+  display_name: "Personal Agent Project"
+  short_description: "Guide Codex while building this personal AI agent project."
+  default_prompt: "Use this skill when working on the XiaoMiCode personal AI agent project. Preserve durable context locally and help evolve the project from idea to implementation."
