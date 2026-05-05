@@ -52,3 +52,14 @@
 - 2026-05-04 修复本地 key 已写但应用无反应的问题：`localSecrets.ts` 现在会从运行目录向上逐级查找 `config/secrets.local.json`，并且不缓存 secrets；模型配置列表也改为动态生成。
 - 2026-05-04 用户希望在 GUI 里直接查看模型接口请求和返回。已新增 Provider GUI 调试面板：Core 内存记录最近请求、响应、错误、耗时和 baseURL，不记录 API Key；极简对话页右上角可打开“调试”抽屉查看。
 - 2026-05-04 用户进一步要求调试面板能查看请求接口和携带参数。已扩展 ProviderDebugLog，记录 method、endpoint、headers 安全摘要和请求 body；GUI 调试抽屉展示请求 Headers、请求 Body、响应内容和错误，API Key 始终隐藏。
+- 2026-05-05 用户希望 Chat 输出改为流式，避免一次性返回显得奇怪。已新增 ChatStreamEvent、Provider streamChat、ChatService streamChatMessage、Electron IPC 流式事件和前端 delta 追加渲染；MiMo Provider 使用 Anthropic SDK `stream: true`。
+- 2026-05-05 用户要求清理项目，只保留基础对话入口和交互，删除其他遗留项。已删除旧画布、组建团队、旧 ChatPanel、角色/工作流模拟等代码；移除 React Flow 依赖；核心代码收敛为 MinimalChatPage + ChatService + MiMo 流式调用 + 调试面板。
+- 2026-05-05 系统 Prompt/角色记忆文件约定为 `packages/memorizes/agents.md`。不要在业务代码里使用 `../memorizes/agents.md` 这类源码相对路径，因为 Electron/Vite 运行时会按当前工作目录或构建产物目录解析，容易读不到文件；Core 侧 `readMarkdown` 已改为从项目根目录查找稳定路径，并提供默认 Prompt 兜底。
+- 2026-05-05 Chat 发送链路拆为两段：用户按 Enter 后，Core 先调用本地 Ollama 小模型 `qwen2.5:1.5b` 进行意图识别，接口为 `http://127.0.0.1:11434/api/chat`；随后将意图识别摘要注入 MiMo 大模型 System Prompt 上下文，再进行流式对话输出。Ollama 失败时不阻断主对话，会记录调试日志并用兜底摘要继续调用 MiMo。
+- 2026-05-05 用户明确偏好：代码需要按职责拆分到不同文件，避免把 Provider、Prompt、Session、编排和 UI 逻辑揉在一起；项目早期不需要加入过多容错机制，优先让错误暴露出来便于定位；避免在业务代码里使用 `yield`、`async function*`、`for await` 等相对冷门语法，流式事件优先使用普通回调或事件监听。
+- 2026-05-05 修正意图识别上下文注入方式：System Prompt 只保留稳定角色和项目规则，来自 Ollama 的本轮意图识别结果不再塞进 `system`；MiMo 请求时会将意图识别结果作为临时 `user` role 上下文消息插入到 messages 中，且不写入真实会话历史。
+- 2026-05-05 用户希望 Prompt 也按模块拆分，便于手动修改。当前主路径已改为 `packages/memorizes/system/*.md` 组装大模型 System Prompt，`packages/memorizes/intent/*.md` 组装 Ollama 意图识别 Prompt，`packages/memorizes/context/intent-result.md` 组装意图识别结果给 MiMo 的临时上下文。旧的 `packages/memorizes/agents.md` 和 `packages/memorizes/intent.md` 暂时保留为历史内容，不再是主读取路径。
+- 2026-05-05 修正 Ollama 意图识别请求的 role 分工：`packages/memorizes/intent/01-parser.md` 只进入 `system`，用于描述解析器规则；`packages/memorizes/intent/02-input.md` 只进入 `user`，用于承载最近对话和用户输入。不要把规则提示词拼进 user content。
+- 2026-05-05 修复 Ollama 意图识别 `intent` 为空的问题：原因是小模型容易照抄空 JSON 模板，且提示词没有明确要求 `intent` 必填。`packages/memorizes/intent/01-parser.md` 已改为要求 `intent` 必须五选一，并增加判定规则和示例；`ollamaIntentProvider.ts` 增加轻量 JSON 校验，若 intent 为空或非法则直接报错，方便开发期定位。
+- 2026-05-05 修复小模型将 `intent` 返回为 `"code | chat | search | analysis"` 的问题：Prompt 中不要把枚举值写成管道占位字符串，容易被小模型照抄；已改成单选题描述，并为“我想搭建一个自己的agent”增加 `analysis` 示例。代码侧 `normalizeIntent` 会把偶发的管道串收敛为第一个合法 intent。
+- 2026-05-05 用户发现 API 模型回复可能像被截断。MiMo 请求的 `max_tokens` 从 1024 提高到 4096；Provider 调试日志新增 `stopReason` 和 `usage`，GUI 调试面板展示停止原因。若 `stopReason` 为 `max_tokens`，说明确实被输出上限截断；若为 `end_turn`，则是模型自行结束。

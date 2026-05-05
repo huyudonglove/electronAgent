@@ -1,274 +1,78 @@
 import { app, BrowserWindow, ipcMain } from "electron";
-import path$1 from "node:path";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
-const defaultRoles = [
-  {
-    id: "project-manager",
-    name: "项目角色",
-    responsibility: "承接用户输入、拆分任务、协调角色并汇总输出。",
-    systemPrompt: "你是项目入口和协作调度中心，负责明确目标、分派任务、整合角色产出。",
-    permissions: { readFiles: true },
-    outputFormat: "markdown"
-  },
-  {
-    id: "product-manager",
-    name: "产品角色",
-    responsibility: "澄清需求、定义范围、输出验收标准。",
-    systemPrompt: "你是产品经理，关注用户价值、需求边界、功能优先级和验收标准。",
-    permissions: {},
-    outputFormat: "markdown"
-  },
-  {
-    id: "architect",
-    name: "技术角色",
-    responsibility: "设计架构、评估技术方案、识别风险。",
-    systemPrompt: "你是技术架构师，关注模块边界、技术选型、可扩展性和工程风险。",
-    permissions: { readFiles: true },
-    outputFormat: "markdown"
-  },
-  {
-    id: "developer",
-    name: "开发角色",
-    responsibility: "实现功能、修改代码、处理构建问题。",
-    systemPrompt: "你是开发工程师，关注代码实现、测试、构建和可维护性。",
-    permissions: { readFiles: true, writeFiles: true, runCommands: true },
-    outputFormat: "markdown"
-  },
-  {
-    id: "tester",
-    name: "测试角色",
-    responsibility: "设计测试点、验证结果、指出风险。",
-    systemPrompt: "你是测试工程师，关注验收标准、边界情况、回归风险和验证结果。",
-    permissions: { readFiles: true, runCommands: true },
-    outputFormat: "markdown"
+const sessions = /* @__PURE__ */ new Map();
+function getOrCreateSession(request, now) {
+  if (request.sessionId && sessions.has(request.sessionId)) {
+    return sessions.get(request.sessionId);
   }
-];
-function getRole(roleId) {
-  return defaultRoles.find((role) => role.id === roleId);
+  const session = {
+    id: request.sessionId ?? `chat-${Date.now()}`,
+    projectId: request.projectId,
+    title: "项目协作会话",
+    modelProfileId: request.modelProfileId,
+    messages: [],
+    createdAt: now,
+    updatedAt: now
+  };
+  sessions.set(session.id, session);
+  return session;
 }
-const sampleWorkflow = {
-  id: "role-collaboration-mvp",
-  name: "角色协作 MVP",
-  nodes: [
-    {
-      id: "start",
-      kind: "start",
-      data: {
-        label: "项目输入",
-        prompt: "创建一个支持角色编排的 Electron Agent 工作台。"
-      }
-    },
-    {
-      id: "product",
-      kind: "role-agent",
-      data: {
-        label: "产品角色",
-        roleId: "product-manager",
-        prompt: "整理功能范围、用户流程和验收标准。"
-      }
-    },
-    {
-      id: "architecture",
-      kind: "role-agent",
-      data: {
-        label: "技术角色",
-        roleId: "architect",
-        prompt: "设计模块边界、数据模型和技术风险。"
-      }
-    },
-    {
-      id: "development",
-      kind: "role-agent",
-      data: {
-        label: "开发角色",
-        roleId: "developer",
-        prompt: "根据产品与技术输入给出实现计划。"
-      }
-    },
-    {
-      id: "testing",
-      kind: "role-agent",
-      data: {
-        label: "测试角色",
-        roleId: "tester",
-        prompt: "根据前序输入给出测试计划和风险清单。"
-      }
-    },
-    {
-      id: "merge",
-      kind: "merge",
-      data: {
-        label: "项目汇总"
-      }
-    },
-    {
-      id: "artifact",
-      kind: "artifact-output",
-      data: {
-        label: "保存产出"
-      }
-    }
-  ],
-  edges: [
-    { id: "start-product", source: "start", target: "product" },
-    { id: "start-architecture", source: "start", target: "architecture" },
-    { id: "product-development", source: "product", target: "development" },
-    { id: "architecture-development", source: "architecture", target: "development" },
-    { id: "development-testing", source: "development", target: "testing" },
-    { id: "development-merge", source: "development", target: "merge" },
-    { id: "testing-merge", source: "testing", target: "merge" },
-    { id: "merge-artifact", source: "merge", target: "artifact" }
-  ]
-};
-async function runWorkflow(workflow, options) {
-  const startedAt = (/* @__PURE__ */ new Date()).toISOString();
-  const incoming = buildIncomingMap(workflow);
-  const outgoing = buildOutgoingMap(workflow);
-  const completed = /* @__PURE__ */ new Set();
-  const running = /* @__PURE__ */ new Set();
-  const outputs = /* @__PURE__ */ new Map();
-  const runs = /* @__PURE__ */ new Map();
-  for (const node of workflow.nodes) {
-    runs.set(node.id, { nodeId: node.id, status: "idle" });
-  }
-  while (completed.size < workflow.nodes.length) {
-    const readyNodes = workflow.nodes.filter((node) => {
-      if (completed.has(node.id) || running.has(node.id)) {
-        return false;
-      }
-      const upstream = incoming.get(node.id) ?? [];
-      return upstream.every((nodeId) => completed.has(nodeId));
-    });
-    if (readyNodes.length === 0) {
-      throw new Error("Workflow cannot continue. Check for cycles or unresolved dependencies.");
-    }
-    await Promise.all(
-      readyNodes.map(async (node) => {
-        var _a2, _b;
-        running.add(node.id);
-        const input = collectInput(node, incoming, outputs, options.initialInput);
-        runs.set(node.id, {
-          nodeId: node.id,
-          status: "running",
-          startedAt: (/* @__PURE__ */ new Date()).toISOString(),
-          input
-        });
-        try {
-          const output = await executeNode(node, input);
-          outputs.set(node.id, output);
-          completed.add(node.id);
-          runs.set(node.id, {
-            nodeId: node.id,
-            status: "succeeded",
-            startedAt: (_a2 = runs.get(node.id)) == null ? void 0 : _a2.startedAt,
-            completedAt: (/* @__PURE__ */ new Date()).toISOString(),
-            input,
-            output
-          });
-        } catch (error) {
-          runs.set(node.id, {
-            nodeId: node.id,
-            status: "failed",
-            startedAt: (_b = runs.get(node.id)) == null ? void 0 : _b.startedAt,
-            completedAt: (/* @__PURE__ */ new Date()).toISOString(),
-            input,
-            error: error instanceof Error ? error.message : String(error)
-          });
-          throw error;
-        } finally {
-          running.delete(node.id);
-        }
-      })
-    );
-    for (const node of readyNodes) {
-      const targets = outgoing.get(node.id) ?? [];
-      for (const target of targets) {
-        if (!workflow.nodes.some((candidate) => candidate.id === target)) {
-          throw new Error(`Workflow edge points to unknown node: ${target}`);
-        }
-      }
-    }
-  }
+function appendAssistantMessage(session, messages, assistantMessageId, roleLabel, content) {
+  const assistantMessage = {
+    id: assistantMessageId,
+    sender: "assistant",
+    roleLabel,
+    content,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const updatedSession = {
+    ...session,
+    messages: [...messages, assistantMessage],
+    updatedAt: assistantMessage.createdAt
+  };
+  sessions.set(updatedSession.id, updatedSession);
   return {
-    id: `run-${Date.now()}`,
-    workflowId: workflow.id,
-    status: "succeeded",
-    startedAt,
-    completedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    nodes: workflow.nodes.map((node) => runs.get(node.id))
+    session: updatedSession,
+    assistantMessage
   };
 }
-function buildIncomingMap(workflow) {
-  const incoming = /* @__PURE__ */ new Map();
-  for (const node of workflow.nodes) {
-    incoming.set(node.id, []);
-  }
-  for (const edge of workflow.edges) {
-    incoming.set(edge.target, [...incoming.get(edge.target) ?? [], edge.source]);
-  }
-  return incoming;
+function getMimoApiKey() {
+  return readLocalSecrets().mimoApiKey || process.env.MIMO_API_KEY;
 }
-function buildOutgoingMap(workflow) {
-  const outgoing = /* @__PURE__ */ new Map();
-  for (const node of workflow.nodes) {
-    outgoing.set(node.id, []);
+function readLocalSecrets() {
+  const secretsPath = findSecretsPath();
+  if (!fs.existsSync(secretsPath)) {
+    return {};
   }
-  for (const edge of workflow.edges) {
-    outgoing.set(edge.source, [...outgoing.get(edge.source) ?? [], edge.target]);
+  try {
+    const raw = fs.readFileSync(secretsPath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return {};
   }
-  return outgoing;
 }
-function collectInput(node, incoming, outputs, initialInput) {
-  const upstream = incoming.get(node.id) ?? [];
-  if (upstream.length === 0) {
-    return initialInput;
+function findSecretsPath() {
+  let currentDir2 = process.cwd();
+  while (true) {
+    const candidate = path.join(currentDir2, "config", "secrets.local.json");
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    const parentDir = path.dirname(currentDir2);
+    if (parentDir === currentDir2) {
+      return path.resolve(process.cwd(), "config", "secrets.local.json");
+    }
+    currentDir2 = parentDir;
   }
-  return upstream.map((nodeId) => outputs.get(nodeId) ?? "").join("\n\n---\n\n");
 }
-async function executeNode(node, input) {
-  await wait(220);
-  if (node.kind === "start") {
-    return `项目输入已接收：
-
-${input}`;
-  }
-  if (node.kind === "role-agent") {
-    const role = node.data.roleId ? getRole(node.data.roleId) : void 0;
-    const roleName = (role == null ? void 0 : role.name) ?? node.data.label;
-    return [
-      `## ${roleName}产出`,
-      "",
-      `职责：${(role == null ? void 0 : role.responsibility) ?? "根据节点提示完成任务。"}`,
-      `节点任务：${node.data.prompt ?? "处理上游输入。"}`,
-      "",
-      "上游摘要：",
-      summarize(input),
-      "",
-      "下一步建议：",
-      "- 明确交付物。",
-      "- 补齐风险和验收标准。",
-      "- 将结果交回项目角色汇总。"
-    ].join("\n");
-  }
-  if (node.kind === "merge") {
-    return [`## 汇总结果`, "", input, "", "项目角色可基于以上内容形成最终交付物。"].join("\n");
-  }
-  if (node.kind === "artifact-output") {
-    return [`## 产出物`, "", "已生成可保存的项目协作结果。", "", input].join("\n");
-  }
-  return `${node.data.label} 已处理：
-
-${summarize(input)}`;
-}
-function summarize(input) {
-  return input.length > 420 ? `${input.slice(0, 420)}...` : input;
-}
-function wait(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
+const MIMO_BASE_URL = "https://token-plan-cn.xiaomimimo.com/anthropic";
+const MIMO_MODEL = "mimo-v2.5-pro";
+const MIMO_MAX_TOKENS = 8192;
+const OLLAMA_BASE_URL = "http://127.0.0.1:11434";
+const OLLAMA_INTENT_MODEL = "qwen2.5:1.5b";
+const DEFAULT_SYSTEM_PROMPT = "你是一个专注于个人 AI Agent 项目搭建的工作协作助手。请用中文优先回答，帮助用户通过对话完成需求澄清、技术选型、开发实现、测试验证和本地记忆沉淀。";
 function __classPrivateFieldSet(receiver, state, value, kind, f) {
   if (typeof state === "function" ? receiver !== state || true : !state.has(receiver))
     throw new TypeError("Cannot write private member to an object whose class did not declare it");
@@ -1579,7 +1383,7 @@ ${underline}`);
   }
   return path3;
 };
-const path = /* @__PURE__ */ createPathTagFunction(encodeURIPath);
+const path$1 = /* @__PURE__ */ createPathTagFunction(encodeURIPath);
 class Environments extends APIResource {
   /**
    * Create a new environment with the specified configuration.
@@ -1616,7 +1420,7 @@ class Environments extends APIResource {
    */
   retrieve(environmentID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/environments/${environmentID}?beta=true`, {
+    return this._client.get(path$1`/v1/environments/${environmentID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -1637,7 +1441,7 @@ class Environments extends APIResource {
    */
   update(environmentID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/environments/${environmentID}?beta=true`, {
+    return this._client.post(path$1`/v1/environments/${environmentID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -1681,7 +1485,7 @@ class Environments extends APIResource {
    */
   delete(environmentID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path`/v1/environments/${environmentID}?beta=true`, {
+    return this._client.delete(path$1`/v1/environments/${environmentID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -1703,7 +1507,7 @@ class Environments extends APIResource {
    */
   archive(environmentID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path`/v1/environments/${environmentID}/archive?beta=true`, {
+    return this._client.post(path$1`/v1/environments/${environmentID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -1788,7 +1592,7 @@ class Files extends APIResource {
    */
   delete(fileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path`/v1/files/${fileID}?beta=true`, {
+    return this._client.delete(path$1`/v1/files/${fileID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "files-api-2025-04-14"].toString() },
@@ -1811,7 +1615,7 @@ class Files extends APIResource {
    */
   download(fileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/files/${fileID}/content?beta=true`, {
+    return this._client.get(path$1`/v1/files/${fileID}/content?beta=true`, {
       ...options,
       headers: buildHeaders([
         {
@@ -1834,7 +1638,7 @@ class Files extends APIResource {
    */
   retrieveMetadata(fileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/files/${fileID}?beta=true`, {
+    return this._client.get(path$1`/v1/files/${fileID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "files-api-2025-04-14"].toString() },
@@ -1881,7 +1685,7 @@ let Models$1 = class Models extends APIResource {
    */
   retrieve(modelID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/models/${modelID}?beta=true`, {
+    return this._client.get(path$1`/v1/models/${modelID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { ...(betas == null ? void 0 : betas.toString()) != null ? { "anthropic-beta": betas == null ? void 0 : betas.toString() } : void 0 },
@@ -1949,7 +1753,7 @@ class UserProfiles extends APIResource {
    */
   retrieve(userProfileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/user_profiles/${userProfileID}?beta=true`, {
+    return this._client.get(path$1`/v1/user_profiles/${userProfileID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "user-profiles-2026-03-24"].toString() },
@@ -1970,7 +1774,7 @@ class UserProfiles extends APIResource {
    */
   update(userProfileID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/user_profiles/${userProfileID}?beta=true`, {
+    return this._client.post(path$1`/v1/user_profiles/${userProfileID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -2014,7 +1818,7 @@ class UserProfiles extends APIResource {
    */
   createEnrollmentURL(userProfileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path`/v1/user_profiles/${userProfileID}/enrollment_url?beta=true`, {
+    return this._client.post(path$1`/v1/user_profiles/${userProfileID}/enrollment_url?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "user-profiles-2026-03-24"].toString() },
@@ -2039,7 +1843,7 @@ let Versions$1 = class Versions extends APIResource {
    */
   list(agentID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path`/v1/agents/${agentID}/versions?beta=true`, PageCursor, {
+    return this._client.getAPIList(path$1`/v1/agents/${agentID}/versions?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2090,7 +1894,7 @@ class Agents extends APIResource {
    */
   retrieve(agentID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.get(path`/v1/agents/${agentID}?beta=true`, {
+    return this._client.get(path$1`/v1/agents/${agentID}?beta=true`, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2113,7 +1917,7 @@ class Agents extends APIResource {
    */
   update(agentID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/agents/${agentID}?beta=true`, {
+    return this._client.post(path$1`/v1/agents/${agentID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -2157,7 +1961,7 @@ class Agents extends APIResource {
    */
   archive(agentID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path`/v1/agents/${agentID}/archive?beta=true`, {
+    return this._client.post(path$1`/v1/agents/${agentID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2182,7 +1986,7 @@ class Memories extends APIResource {
    */
   create(memoryStoreID, params, options) {
     const { view, betas, ...body } = params;
-    return this._client.post(path`/v1/memory_stores/${memoryStoreID}/memories?beta=true`, {
+    return this._client.post(path$1`/v1/memory_stores/${memoryStoreID}/memories?beta=true`, {
       query: { view },
       body,
       ...options,
@@ -2206,7 +2010,7 @@ class Memories extends APIResource {
    */
   retrieve(memoryID, params, options) {
     const { memory_store_id, betas, ...query } = params;
-    return this._client.get(path`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
+    return this._client.get(path$1`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2229,7 +2033,7 @@ class Memories extends APIResource {
    */
   update(memoryID, params, options) {
     const { memory_store_id, view, betas, ...body } = params;
-    return this._client.post(path`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
+    return this._client.post(path$1`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
       query: { view },
       body,
       ...options,
@@ -2254,7 +2058,7 @@ class Memories extends APIResource {
    */
   list(memoryStoreID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path`/v1/memory_stores/${memoryStoreID}/memories?beta=true`, PageCursor, {
+    return this._client.getAPIList(path$1`/v1/memory_stores/${memoryStoreID}/memories?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2277,7 +2081,7 @@ class Memories extends APIResource {
    */
   delete(memoryID, params, options) {
     const { memory_store_id, expected_content_sha256, betas } = params;
-    return this._client.delete(path`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
+    return this._client.delete(path$1`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
       query: { expected_content_sha256 },
       ...options,
       headers: buildHeaders([
@@ -2302,7 +2106,7 @@ class MemoryVersions extends APIResource {
    */
   retrieve(memoryVersionID, params, options) {
     const { memory_store_id, betas, ...query } = params;
-    return this._client.get(path`/v1/memory_stores/${memory_store_id}/memory_versions/${memoryVersionID}?beta=true`, {
+    return this._client.get(path$1`/v1/memory_stores/${memory_store_id}/memory_versions/${memoryVersionID}?beta=true`, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2326,7 +2130,7 @@ class MemoryVersions extends APIResource {
    */
   list(memoryStoreID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path`/v1/memory_stores/${memoryStoreID}/memory_versions?beta=true`, PageCursor, {
+    return this._client.getAPIList(path$1`/v1/memory_stores/${memoryStoreID}/memory_versions?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2349,7 +2153,7 @@ class MemoryVersions extends APIResource {
    */
   redact(memoryVersionID, params, options) {
     const { memory_store_id, betas } = params;
-    return this._client.post(path`/v1/memory_stores/${memory_store_id}/memory_versions/${memoryVersionID}/redact?beta=true`, {
+    return this._client.post(path$1`/v1/memory_stores/${memory_store_id}/memory_versions/${memoryVersionID}/redact?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2397,7 +2201,7 @@ class MemoryStores extends APIResource {
    */
   retrieve(memoryStoreID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/memory_stores/${memoryStoreID}?beta=true`, {
+    return this._client.get(path$1`/v1/memory_stores/${memoryStoreID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2416,7 +2220,7 @@ class MemoryStores extends APIResource {
    */
   update(memoryStoreID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/memory_stores/${memoryStoreID}?beta=true`, {
+    return this._client.post(path$1`/v1/memory_stores/${memoryStoreID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -2458,7 +2262,7 @@ class MemoryStores extends APIResource {
    */
   delete(memoryStoreID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path`/v1/memory_stores/${memoryStoreID}?beta=true`, {
+    return this._client.delete(path$1`/v1/memory_stores/${memoryStoreID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2477,7 +2281,7 @@ class MemoryStores extends APIResource {
    */
   archive(memoryStoreID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path`/v1/memory_stores/${memoryStoreID}/archive?beta=true`, {
+    return this._client.post(path$1`/v1/memory_stores/${memoryStoreID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2577,7 +2381,7 @@ let Batches$1 = class Batches extends APIResource {
    */
   retrieve(messageBatchID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/messages/batches/${messageBatchID}?beta=true`, {
+    return this._client.get(path$1`/v1/messages/batches/${messageBatchID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "message-batches-2024-09-24"].toString() },
@@ -2630,7 +2434,7 @@ let Batches$1 = class Batches extends APIResource {
    */
   delete(messageBatchID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path`/v1/messages/batches/${messageBatchID}?beta=true`, {
+    return this._client.delete(path$1`/v1/messages/batches/${messageBatchID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "message-batches-2024-09-24"].toString() },
@@ -2662,7 +2466,7 @@ let Batches$1 = class Batches extends APIResource {
    */
   cancel(messageBatchID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path`/v1/messages/batches/${messageBatchID}/cancel?beta=true`, {
+    return this._client.post(path$1`/v1/messages/batches/${messageBatchID}/cancel?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "message-batches-2024-09-24"].toString() },
@@ -4118,7 +3922,7 @@ class Events extends APIResource {
    */
   list(sessionID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path`/v1/sessions/${sessionID}/events?beta=true`, PageCursor, {
+    return this._client.getAPIList(path$1`/v1/sessions/${sessionID}/events?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -4153,7 +3957,7 @@ class Events extends APIResource {
    */
   send(sessionID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/sessions/${sessionID}/events?beta=true`, {
+    return this._client.post(path$1`/v1/sessions/${sessionID}/events?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4175,7 +3979,7 @@ class Events extends APIResource {
    */
   stream(sessionID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/sessions/${sessionID}/events/stream?beta=true`, {
+    return this._client.get(path$1`/v1/sessions/${sessionID}/events/stream?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4200,7 +4004,7 @@ class Resources extends APIResource {
    */
   retrieve(resourceID, params, options) {
     const { session_id, betas } = params;
-    return this._client.get(path`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
+    return this._client.get(path$1`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4225,7 +4029,7 @@ class Resources extends APIResource {
    */
   update(resourceID, params, options) {
     const { session_id, betas, ...body } = params;
-    return this._client.post(path`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
+    return this._client.post(path$1`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4249,7 +4053,7 @@ class Resources extends APIResource {
    */
   list(sessionID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path`/v1/sessions/${sessionID}/resources?beta=true`, PageCursor, {
+    return this._client.getAPIList(path$1`/v1/sessions/${sessionID}/resources?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -4272,7 +4076,7 @@ class Resources extends APIResource {
    */
   delete(resourceID, params, options) {
     const { session_id, betas } = params;
-    return this._client.delete(path`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
+    return this._client.delete(path$1`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4297,7 +4101,7 @@ class Resources extends APIResource {
    */
   add(sessionID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/sessions/${sessionID}/resources?beta=true`, {
+    return this._client.post(path$1`/v1/sessions/${sessionID}/resources?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4349,7 +4153,7 @@ class Sessions extends APIResource {
    */
   retrieve(sessionID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/sessions/${sessionID}?beta=true`, {
+    return this._client.get(path$1`/v1/sessions/${sessionID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4370,7 +4174,7 @@ class Sessions extends APIResource {
    */
   update(sessionID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/sessions/${sessionID}?beta=true`, {
+    return this._client.post(path$1`/v1/sessions/${sessionID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4414,7 +4218,7 @@ class Sessions extends APIResource {
    */
   delete(sessionID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path`/v1/sessions/${sessionID}?beta=true`, {
+    return this._client.delete(path$1`/v1/sessions/${sessionID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4435,7 +4239,7 @@ class Sessions extends APIResource {
    */
   archive(sessionID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path`/v1/sessions/${sessionID}/archive?beta=true`, {
+    return this._client.post(path$1`/v1/sessions/${sessionID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4459,7 +4263,7 @@ class Versions2 extends APIResource {
    */
   create(skillID, params = {}, options) {
     const { betas, ...body } = params ?? {};
-    return this._client.post(path`/v1/skills/${skillID}/versions?beta=true`, multipartFormRequestOptions({
+    return this._client.post(path$1`/v1/skills/${skillID}/versions?beta=true`, multipartFormRequestOptions({
       body,
       ...options,
       headers: buildHeaders([
@@ -4481,7 +4285,7 @@ class Versions2 extends APIResource {
    */
   retrieve(version, params, options) {
     const { skill_id, betas } = params;
-    return this._client.get(path`/v1/skills/${skill_id}/versions/${version}?beta=true`, {
+    return this._client.get(path$1`/v1/skills/${skill_id}/versions/${version}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "skills-2025-10-02"].toString() },
@@ -4504,7 +4308,7 @@ class Versions2 extends APIResource {
    */
   list(skillID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path`/v1/skills/${skillID}/versions?beta=true`, PageCursor, {
+    return this._client.getAPIList(path$1`/v1/skills/${skillID}/versions?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -4526,7 +4330,7 @@ class Versions2 extends APIResource {
    */
   delete(version, params, options) {
     const { skill_id, betas } = params;
-    return this._client.delete(path`/v1/skills/${skill_id}/versions/${version}?beta=true`, {
+    return this._client.delete(path$1`/v1/skills/${skill_id}/versions/${version}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "skills-2025-10-02"].toString() },
@@ -4569,7 +4373,7 @@ class Skills extends APIResource {
    */
   retrieve(skillID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/skills/${skillID}?beta=true`, {
+    return this._client.get(path$1`/v1/skills/${skillID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "skills-2025-10-02"].toString() },
@@ -4609,7 +4413,7 @@ class Skills extends APIResource {
    */
   delete(skillID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path`/v1/skills/${skillID}?beta=true`, {
+    return this._client.delete(path$1`/v1/skills/${skillID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "skills-2025-10-02"].toString() },
@@ -4641,7 +4445,7 @@ class Credentials extends APIResource {
    */
   create(vaultID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/vaults/${vaultID}/credentials?beta=true`, {
+    return this._client.post(path$1`/v1/vaults/${vaultID}/credentials?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4664,7 +4468,7 @@ class Credentials extends APIResource {
    */
   retrieve(credentialID, params, options) {
     const { vault_id, betas } = params;
-    return this._client.get(path`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
+    return this._client.get(path$1`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4686,7 +4490,7 @@ class Credentials extends APIResource {
    */
   update(credentialID, params, options) {
     const { vault_id, betas, ...body } = params;
-    return this._client.post(path`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
+    return this._client.post(path$1`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4710,7 +4514,7 @@ class Credentials extends APIResource {
    */
   list(vaultID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path`/v1/vaults/${vaultID}/credentials?beta=true`, PageCursor, {
+    return this._client.getAPIList(path$1`/v1/vaults/${vaultID}/credentials?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -4733,7 +4537,7 @@ class Credentials extends APIResource {
    */
   delete(credentialID, params, options) {
     const { vault_id, betas } = params;
-    return this._client.delete(path`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
+    return this._client.delete(path$1`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4755,7 +4559,7 @@ class Credentials extends APIResource {
    */
   archive(credentialID, params, options) {
     const { vault_id, betas } = params;
-    return this._client.post(path`/v1/vaults/${vault_id}/credentials/${credentialID}/archive?beta=true`, {
+    return this._client.post(path$1`/v1/vaults/${vault_id}/credentials/${credentialID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4804,7 +4608,7 @@ class Vaults extends APIResource {
    */
   retrieve(vaultID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/vaults/${vaultID}?beta=true`, {
+    return this._client.get(path$1`/v1/vaults/${vaultID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4825,7 +4629,7 @@ class Vaults extends APIResource {
    */
   update(vaultID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path`/v1/vaults/${vaultID}?beta=true`, {
+    return this._client.post(path$1`/v1/vaults/${vaultID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4869,7 +4673,7 @@ class Vaults extends APIResource {
    */
   delete(vaultID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path`/v1/vaults/${vaultID}?beta=true`, {
+    return this._client.delete(path$1`/v1/vaults/${vaultID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4890,7 +4694,7 @@ class Vaults extends APIResource {
    */
   archive(vaultID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path`/v1/vaults/${vaultID}/archive?beta=true`, {
+    return this._client.post(path$1`/v1/vaults/${vaultID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -5612,7 +5416,7 @@ class Batches2 extends APIResource {
    * ```
    */
   retrieve(messageBatchID, options) {
-    return this._client.get(path`/v1/messages/batches/${messageBatchID}`, options);
+    return this._client.get(path$1`/v1/messages/batches/${messageBatchID}`, options);
   }
   /**
    * List all Message Batches within a Workspace. Most recently created batches are
@@ -5648,7 +5452,7 @@ class Batches2 extends APIResource {
    * ```
    */
   delete(messageBatchID, options) {
-    return this._client.delete(path`/v1/messages/batches/${messageBatchID}`, options);
+    return this._client.delete(path$1`/v1/messages/batches/${messageBatchID}`, options);
   }
   /**
    * Batches may be canceled any time before processing ends. Once cancellation is
@@ -5672,7 +5476,7 @@ class Batches2 extends APIResource {
    * ```
    */
   cancel(messageBatchID, options) {
-    return this._client.post(path`/v1/messages/batches/${messageBatchID}/cancel`, options);
+    return this._client.post(path$1`/v1/messages/batches/${messageBatchID}/cancel`, options);
   }
   /**
    * Streams the results of a Message Batch as a `.jsonl` file.
@@ -5827,7 +5631,7 @@ class Models2 extends APIResource {
    */
   retrieve(modelID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path`/v1/models/${modelID}`, {
+    return this._client.get(path$1`/v1/models/${modelID}`, {
       ...options,
       headers: buildHeaders([
         { ...(betas == null ? void 0 : betas.toString()) != null ? { "anthropic-beta": betas == null ? void 0 : betas.toString() } : void 0 },
@@ -6341,35 +6145,6 @@ Anthropic.Completions = Completions;
 Anthropic.Messages = Messages2;
 Anthropic.Models = Models2;
 Anthropic.Beta = Beta;
-function getMimoApiKey() {
-  return readLocalSecrets().mimoApiKey || process.env.MIMO_API_KEY;
-}
-function readLocalSecrets() {
-  const secretsPath = findSecretsPath();
-  if (!fs.existsSync(secretsPath)) {
-    return {};
-  }
-  try {
-    const raw = fs.readFileSync(secretsPath, "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
-}
-function findSecretsPath() {
-  let currentDir2 = process.cwd();
-  while (true) {
-    const candidate = path$1.join(currentDir2, "config", "secrets.local.json");
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-    const parentDir = path$1.dirname(currentDir2);
-    if (parentDir === currentDir2) {
-      return path$1.resolve(process.cwd(), "config", "secrets.local.json");
-    }
-    currentDir2 = parentDir;
-  }
-}
 const logs = [];
 function addProviderDebugLog(log) {
   logs.unshift(log);
@@ -6386,202 +6161,172 @@ function createDebugLogBase(input) {
     startedAt: (/* @__PURE__ */ new Date()).toISOString()
   };
 }
-function listModelProfiles$1() {
-  return [
-    {
-      id: "mimo-v2-5-pro",
-      providerId: "mimo-anthropic",
-      label: "MiMo v2.5 Pro",
-      model: "mimo-v2.5-pro",
-      status: getMimoApiKey() ? "configured" : "missing-config",
-      capabilities: {
-        chat: true,
-        streamChat: false,
-        structuredOutput: false,
-        toolCalling: false
-      }
-    },
-    {
-      id: "openai-compatible-default",
-      providerId: "openai-compatible",
-      label: "OpenAI-compatible / 待配置",
-      model: "configured-later",
-      status: "missing-config",
-      capabilities: {
-        chat: true,
-        streamChat: true,
-        structuredOutput: true,
-        toolCalling: true
-      }
-    },
-    {
-      id: "mock-project-role",
-      providerId: "mock",
-      label: "项目角色 / UI Mock",
-      model: "mock-project-role",
-      status: "mock",
-      capabilities: {
-        chat: true,
-        streamChat: false,
-        structuredOutput: false,
-        toolCalling: false
-      }
-    },
-    {
-      id: "mock-developer-role",
-      providerId: "mock",
-      label: "开发角色 / UI Mock",
-      model: "mock-developer-role",
-      status: "mock",
-      capabilities: {
-        chat: true,
-        streamChat: false,
-        structuredOutput: false,
-        toolCalling: false
-      }
-    }
-  ];
-}
-const mockProvider = {
-  id: "mock",
-  name: "Mock Provider",
-  async chat(request) {
-    var _a2, _b;
-    const latestUserMessage = findLatestUserMessage(request.messages);
-    const workflowSummary = ((_a2 = request.context) == null ? void 0 : _a2.workflow) ? `当前画布包含 ${request.context.workflow.nodes.length} 个节点和 ${request.context.workflow.edges.length} 条连接。` : "当前没有可用工作流上下文。";
-    const runSummary = ((_b = request.context) == null ? void 0 : _b.latestRun) ? `最近一次运行状态为 ${request.context.latestRun.status}。` : "还没有运行记录。";
-    return {
-      roleLabel: request.modelProfile.id === "mock-developer-role" ? "开发角色" : "项目角色",
-      content: [
-        "已通过 Core ChatService 接收到你的消息。",
-        "",
-        `你的输入：${latestUserMessage}`,
-        workflowSummary,
-        runSummary,
-        "",
-        "真实模型 Provider 接入后，这里会基于项目记忆、画布和运行记录继续协作。"
-      ].join("\n")
-    };
+const ROOT_MARKERS = ["pnpm-workspace.yaml", "package.json"];
+function readMarkdown(filePath, fallback = "") {
+  const markdownPath = resolveMarkdownPath(filePath);
+  if (!markdownPath) {
+    return fallback;
   }
-};
-const mimoAnthropicProvider = {
-  id: "mimo-anthropic",
-  name: "MiMo Anthropic-compatible Provider",
-  async chat(request) {
-    const baseURL = "https://token-plan-cn.xiaomimimo.com/anthropic";
-    const startedAtMs = Date.now();
-    const anthropicMessages = toAnthropicMessages(request.messages);
-    const requestBody = {
-      model: request.modelProfile.model,
-      max_tokens: 1024,
-      system: "你是一个资深的agent开发工程师，能够协助用户完成agent相关的开发任务。请基于用户输入和上下文信息，提供专业、准确的建议和解决方案。包括记忆模式，流程编排，代码开发等任务。请确保你的回答清晰、简洁，并且直接针对用户的问题进行解答。请显示输出自己的思考过程，以便用户理解你的建议是如何得出的。",
-      messages: anthropicMessages,
-      top_p: 0.95,
-      stream: false,
-      temperature: 1
-    };
-    const debugLog = createDebugLogBase({
-      providerId: "mimo-anthropic",
-      model: request.modelProfile.model,
-      baseURL,
-      request: {
-        method: "POST",
-        endpoint: `${baseURL}/v1/messages`,
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": "[redacted]",
-          "anthropic-version": "sdk-managed"
-        },
-        body: requestBody,
-        messageCount: request.messages.length,
-        latestUserMessage: findLatestUserMessage(request.messages)
-      }
-    });
-    const apiKey = getMimoApiKey();
-    if (!apiKey) {
-      addProviderDebugLog({
-        ...debugLog,
-        status: "failed",
-        completedAt: (/* @__PURE__ */ new Date()).toISOString(),
-        durationMs: Date.now() - startedAtMs,
-        error: "未检测到 MiMo API Key。"
-      });
-      return {
-        roleLabel: "系统",
-        content: "未检测到 MiMo API Key。请复制 config/secrets.example.json 为 config/secrets.local.json，并填写 mimoApiKey；或配置环境变量 MIMO_API_KEY 后重新启动应用。"
-      };
+  try {
+    return fs.readFileSync(markdownPath, "utf8");
+  } catch {
+    return fallback;
+  }
+}
+function readMarkdownFiles(filePaths, fallback = "") {
+  const content = filePaths.map((filePath) => readMarkdown(filePath)).filter((item) => item.trim().length > 0).join("\n\n");
+  return content || fallback;
+}
+function resolveMarkdownPath(filePath) {
+  if (path.isAbsolute(filePath)) {
+    return fs.existsSync(filePath) ? filePath : void 0;
+  }
+  const rootDir = findProjectRoot();
+  const normalizedPath = normalizeRelativePath(filePath);
+  const candidatePaths = /* @__PURE__ */ new Set();
+  candidatePaths.add(path.resolve(process.cwd(), filePath));
+  if (rootDir) {
+    candidatePaths.add(path.resolve(rootDir, filePath));
+    candidatePaths.add(path.resolve(rootDir, normalizedPath));
+    candidatePaths.add(path.resolve(rootDir, "packages", normalizedPath));
+  }
+  for (const candidatePath of candidatePaths) {
+    if (fs.existsSync(candidatePath)) {
+      return candidatePath;
     }
-    const client = new Anthropic({
-      apiKey: apiKey.trim(),
-      baseURL
+  }
+  return void 0;
+}
+function normalizeRelativePath(filePath) {
+  return filePath.replace(/\\/g, "/").replace(/^(\.\.\/)+/, "").replace(/^(\.\/)+/, "");
+}
+function findProjectRoot() {
+  let currentDir2 = process.cwd();
+  while (true) {
+    if (ROOT_MARKERS.every((marker) => fs.existsSync(path.join(currentDir2, marker)))) {
+      return currentDir2;
+    }
+    const parentDir = path.dirname(currentDir2);
+    if (parentDir === currentDir2) {
+      return void 0;
+    }
+    currentDir2 = parentDir;
+  }
+}
+const SYSTEM_PROMPT_MODULES = [
+  "packages/memorizes/system/01-role.md",
+  "packages/memorizes/system/02-goals.md",
+  "packages/memorizes/system/03-style.md"
+];
+const INTENT_PROMPT_MODULES = [
+  "packages/memorizes/intent/01-parser.md"
+];
+const INTENT_USER_MODULES = [
+  "packages/memorizes/intent/02-input.md"
+];
+const INTENT_CONTEXT_TEMPLATE = "packages/memorizes/context/intent-result.md";
+function buildIntentSystemPrompt() {
+  return readMarkdownFiles(INTENT_PROMPT_MODULES);
+}
+function buildIntentUserPrompt(messages, latestUserMessage) {
+  return renderTemplate(readMarkdownFiles(INTENT_USER_MODULES), {
+    recent_messages: formatRecentMessages(messages),
+    input: latestUserMessage
+  });
+}
+function buildSystemPrompt() {
+  return readMarkdownFiles(SYSTEM_PROMPT_MODULES, DEFAULT_SYSTEM_PROMPT);
+}
+function buildIntentContextMessage(intentSummary) {
+  return renderTemplate(readMarkdown(INTENT_CONTEXT_TEMPLATE), {
+    intent_result: intentSummary
+  });
+}
+function formatRecentMessages(messages) {
+  return messages.slice(-8).map((message) => `${message.roleLabel}: ${message.content}`).join("\n\n") || "无";
+}
+function renderTemplate(template, values) {
+  return Object.entries(values).reduce((content, [key, value]) => {
+    return content.replaceAll(`{{${key}}}`, value);
+  }, template);
+}
+async function streamMimoChat(input) {
+  const startedAtMs = Date.now();
+  const requestBody = {
+    model: MIMO_MODEL,
+    max_tokens: MIMO_MAX_TOKENS,
+    system: buildSystemPrompt(),
+    messages: buildMimoMessages(input.messages, input.intentSummary),
+    top_p: 0.95,
+    stream: true,
+    temperature: 1
+  };
+  const debugLog = createDebugLogBase({
+    providerId: "mimo-anthropic",
+    model: MIMO_MODEL,
+    baseURL: MIMO_BASE_URL,
+    request: {
+      method: "POST",
+      endpoint: `${MIMO_BASE_URL}/v1/messages`,
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "[redacted]",
+        "anthropic-version": "sdk-managed"
+      },
+      body: requestBody,
+      messageCount: input.messages.length,
+      latestUserMessage: input.latestUserMessage
+    }
+  });
+  const apiKey = getMimoApiKey();
+  if (!apiKey) {
+    addProviderDebugLog({
+      ...debugLog,
+      status: "failed",
+      completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      error: "未检测到 MiMo API Key。"
     });
-    const response = await client.messages.create(requestBody).catch((error) => {
-      const message = toProviderErrorMessage(error);
-      addProviderDebugLog({
-        ...debugLog,
-        status: "failed",
-        completedAt: (/* @__PURE__ */ new Date()).toISOString(),
-        durationMs: Date.now() - startedAtMs,
-        error: message
-      });
-      throw new Error(message);
+    return "未检测到 MiMo API Key。请复制 config/secrets.example.json 为 config/secrets.local.json，并填写 mimoApiKey；或配置环境变量 MIMO_API_KEY 后重新启动应用。";
+  }
+  const client = new Anthropic({
+    apiKey: apiKey.trim(),
+    baseURL: MIMO_BASE_URL
+  });
+  try {
+    let content = "";
+    const stream = client.messages.stream(requestBody);
+    stream.on("text", (delta) => {
+      content += delta;
+      input.onDelta(delta);
     });
-    const content = extractTextContent(response.content);
+    const finalMessage = await stream.finalMessage();
     addProviderDebugLog({
       ...debugLog,
       status: "succeeded",
       completedAt: (/* @__PURE__ */ new Date()).toISOString(),
       durationMs: Date.now() - startedAtMs,
       response: {
-        content
+        content,
+        stopReason: finalMessage.stop_reason ?? void 0,
+        usage: finalMessage.usage
       }
     });
-    return {
-      roleLabel: "MiMo",
-      content
-    };
+    return content;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    addProviderDebugLog({
+      ...debugLog,
+      status: "failed",
+      completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      error: message
+    });
+    throw new Error(toMimoErrorMessage(message));
   }
-};
-function toProviderErrorMessage(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (message.includes("401") || message.toLowerCase().includes("invalid api key")) {
-    return "MiMo 服务返回 401：API Key 无效。请确认 config/secrets.local.json 中的 mimoApiKey 是小米 MiMo 平台生成的有效 Key，并且该 Key 有权限调用 mimo-v2.5-pro。";
-  }
-  return `MiMo 调用失败：${message}`;
 }
-function findLatestUserMessage(messages) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.sender === "user") {
-      return message.content;
-    }
-  }
-  return "";
-}
-function getModelProfile(modelProfileId) {
-  const profiles = listModelProfiles$1();
-  return profiles.find((profile) => profile.id === modelProfileId) ?? profiles[0];
-}
-function getProvider(providerId) {
-  if (providerId === "mimo-anthropic") {
-    return mimoAnthropicProvider;
-  }
-  if (providerId === "mock") {
-    return mockProvider;
-  }
-  return {
-    id: providerId,
-    name: providerId,
-    async chat() {
-      return {
-        roleLabel: "系统",
-        content: "该 Provider 尚未配置。请先完成 baseURL、模型和 API Key 设置。"
-      };
-    }
-  };
-}
-function toAnthropicMessages(messages) {
-  return messages.filter((message) => message.sender === "user" || message.sender === "assistant").map((message) => ({
+function buildMimoMessages(messages, intentSummary) {
+  const conversationMessages = messages.filter((message) => message.sender === "user" || message.sender === "assistant").map((message) => ({
     role: message.sender === "assistant" ? "assistant" : "user",
     content: [
       {
@@ -6590,79 +6335,210 @@ function toAnthropicMessages(messages) {
       }
     ]
   }));
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: buildIntentContextMessage(intentSummary)
+        }
+      ]
+    },
+    ...conversationMessages
+  ];
 }
-function extractTextContent(content) {
-  const text = content.map((block) => {
-    if (block.type === "text") {
-      return block.text;
+function toMimoErrorMessage(message) {
+  if (message.includes("401") || message.toLowerCase().includes("invalid api key")) {
+    return "MiMo 服务返回 401：API Key 无效。请确认 config/secrets.local.json 中的 mimoApiKey 是小米 MiMo 平台生成的有效 Key，并且该 Key 有权限调用 mimo-v2.5-pro。";
+  }
+  return `MiMo 调用失败：${message}`;
+}
+async function recognizeIntent(messages, latestUserMessage) {
+  var _a2;
+  const startedAtMs = Date.now();
+  const requestBody = {
+    model: OLLAMA_INTENT_MODEL,
+    stream: false,
+    messages: [
+      {
+        role: "system",
+        content: buildIntentSystemPrompt()
+      },
+      {
+        role: "user",
+        content: buildIntentUserPrompt(messages, latestUserMessage)
+      }
+    ],
+    options: {
+      temperature: 0.2,
+      num_predict: 512
     }
-    return "";
-  }).filter(Boolean).join("\n\n");
-  return text || "MiMo 返回了空内容。";
+  };
+  const debugLog = createDebugLogBase({
+    providerId: "ollama-intent",
+    model: OLLAMA_INTENT_MODEL,
+    baseURL: OLLAMA_BASE_URL,
+    request: {
+      method: "POST",
+      endpoint: `${OLLAMA_BASE_URL}/api/chat`,
+      headers: {
+        "content-type": "application/json"
+      },
+      body: requestBody,
+      messageCount: messages.length,
+      latestUserMessage
+    }
+  });
+  const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(requestBody)
+  });
+  if (!response.ok) {
+    throw new Error(`Ollama HTTP ${response.status}: ${await response.text()}`);
+  }
+  const data = await response.json();
+  const summary = (((_a2 = data.message) == null ? void 0 : _a2.content) ?? data.response ?? "").trim();
+  const intentResult = parseIntentResult(summary);
+  addProviderDebugLog({
+    ...debugLog,
+    status: "succeeded",
+    completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    durationMs: Date.now() - startedAtMs,
+    response: {
+      content: summary
+    }
+  });
+  return JSON.stringify(intentResult, null, 2);
 }
-const sessions = /* @__PURE__ */ new Map();
+function parseIntentResult(content) {
+  const parsed = JSON.parse(content);
+  const allowedIntents = ["code", "chat", "search", "debug", "analysis"];
+  const intent = normalizeIntent(parsed.intent, allowedIntents);
+  if (!intent) {
+    throw new Error(`意图识别结果无效：intent 必须是 ${allowedIntents.join(" | ")} 之一。实际返回：${content}`);
+  }
+  return {
+    rewritten_input: parsed.rewritten_input ?? "",
+    intent,
+    keywords: Array.isArray(parsed.keywords) ? parsed.keywords : []
+  };
+}
+function normalizeIntent(intent, allowedIntents) {
+  if (typeof intent !== "string") {
+    return void 0;
+  }
+  const exactIntent = intent.trim();
+  if (allowedIntents.includes(exactIntent)) {
+    return exactIntent;
+  }
+  const candidates = exactIntent.split("|").map((item) => item.trim());
+  const firstAllowedIntent = candidates.find((item) => allowedIntents.includes(item));
+  return firstAllowedIntent;
+}
 function listModelProfiles() {
-  return listModelProfiles$1();
+  return [
+    {
+      id: "mimo-v2-5-pro",
+      providerId: "mimo-anthropic",
+      label: "MiMo v2.5 Pro",
+      model: MIMO_MODEL,
+      status: getMimoApiKey() ? "configured" : "missing-config",
+      capabilities: {
+        chat: true,
+        streamChat: true,
+        structuredOutput: false,
+        toolCalling: false
+      }
+    }
+  ];
 }
 async function sendChatMessage(request) {
+  let response = null;
+  await streamChatMessage(request, (event) => {
+    if (event.type === "done") {
+      response = {
+        session: event.session,
+        assistantMessage: event.assistantMessage
+      };
+    }
+    if (event.type === "error") {
+      throw new Error(event.error);
+    }
+  });
+  if (!response) {
+    throw new Error("MiMo 未返回内容。");
+  }
+  return response;
+}
+async function streamChatMessage(request, onEvent) {
   const now = (/* @__PURE__ */ new Date()).toISOString();
   const session = getOrCreateSession(request, now);
-  const userMessage = {
+  const userMessage = createUserMessage(request.message, now);
+  const messages = [...session.messages, userMessage];
+  const assistantMessageId = `msg-assistant-${Date.now()}`;
+  onEvent({
+    type: "stage",
+    label: "意图识别",
+    detail: `正在调用本地 Ollama 小模型 ${OLLAMA_INTENT_MODEL}`
+  });
+  const intentSummary = await recognizeIntent(messages, request.message);
+  onEvent({
+    type: "stage",
+    label: "大模型对话",
+    detail: "正在将意图识别结果组装进 MiMo 上下文"
+  });
+  onEvent({
+    type: "start",
+    sessionId: session.id,
+    messageId: assistantMessageId,
+    roleLabel: "MiMo"
+  });
+  try {
+    const content = await streamMimoChat({
+      messages,
+      latestUserMessage: request.message,
+      intentSummary,
+      onDelta: (delta) => {
+        onEvent({
+          type: "delta",
+          sessionId: session.id,
+          messageId: assistantMessageId,
+          delta
+        });
+      }
+    });
+    const result = appendAssistantMessage(session, messages, assistantMessageId, "MiMo", content);
+    onEvent({
+      type: "done",
+      session: result.session,
+      assistantMessage: result.assistantMessage
+    });
+  } catch (error) {
+    onEvent({
+      type: "error",
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+function createUserMessage(content, createdAt) {
+  return {
     id: `msg-user-${Date.now()}`,
     sender: "user",
     roleLabel: "你",
-    content: request.message,
-    createdAt: now
+    content,
+    createdAt
   };
-  const nextMessages = [...session.messages, userMessage];
-  const modelProfile = getModelProfile(request.modelProfileId);
-  const provider = getProvider(modelProfile.providerId);
-  const providerResponse = await provider.chat({
-    ...request,
-    messages: nextMessages,
-    modelProfile
-  });
-  const assistantMessage = {
-    id: `msg-assistant-${Date.now()}`,
-    sender: "assistant",
-    roleLabel: providerResponse.roleLabel,
-    content: providerResponse.content,
-    createdAt: (/* @__PURE__ */ new Date()).toISOString()
-  };
-  const updatedSession = {
-    ...session,
-    modelProfileId: modelProfile.id,
-    messages: [...nextMessages, assistantMessage],
-    updatedAt: assistantMessage.createdAt
-  };
-  sessions.set(updatedSession.id, updatedSession);
-  return {
-    session: updatedSession,
-    assistantMessage
-  };
-}
-function getOrCreateSession(request, now) {
-  if (request.sessionId && sessions.has(request.sessionId)) {
-    return sessions.get(request.sessionId);
-  }
-  const session = {
-    id: request.sessionId ?? `chat-${Date.now()}`,
-    projectId: request.projectId,
-    title: "项目协作会话",
-    modelProfileId: request.modelProfileId,
-    messages: [],
-    createdAt: now,
-    updatedAt: now
-  };
-  sessions.set(session.id, session);
-  return session;
 }
 const currentFile = fileURLToPath(import.meta.url);
-const currentDir = path$1.dirname(currentFile);
-process.env.APP_ROOT = path$1.join(currentDir, "..");
+const currentDir = path.dirname(currentFile);
+process.env.APP_ROOT = path.join(currentDir, "..");
 const viteDevServerUrl = process.env.VITE_DEV_SERVER_URL;
-const rendererDist = path$1.join(process.env.APP_ROOT, "dist");
-const preloadPath = path$1.join(currentDir, "preload.cjs");
+const rendererDist = path.join(process.env.APP_ROOT, "dist");
+const preloadPath = path.join(currentDir, "preload.cjs");
 let mainWindow = null;
 async function createWindow() {
   mainWindow = new BrowserWindow({
@@ -6683,7 +6559,7 @@ async function createWindow() {
     await mainWindow.loadURL(viteDevServerUrl);
     mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
-    await mainWindow.loadFile(path$1.join(rendererDist, "index.html"));
+    await mainWindow.loadFile(path.join(rendererDist, "index.html"));
   }
 }
 app.whenReady().then(async () => {
@@ -6702,15 +6578,15 @@ app.on("window-all-closed", () => {
 });
 function registerIpcHandlers() {
   ipcMain.handle("workbench:get-initial-state", () => ({
-    roles: defaultRoles,
-    workflow: sampleWorkflow,
     modelProfiles: listModelProfiles()
   }));
-  ipcMain.handle("workbench:run-workflow", async (_event, initialInput) => {
-    return runWorkflow(sampleWorkflow, { initialInput });
-  });
   ipcMain.handle("workbench:send-chat-message", async (_event, request) => {
     return sendChatMessage(request);
+  });
+  ipcMain.handle("workbench:stream-chat-message", async (event, request) => {
+    await streamChatMessage(request, (streamEvent) => {
+      event.sender.send("workbench:chat-stream-event", streamEvent);
+    });
   });
   ipcMain.handle("workbench:list-provider-debug-logs", () => {
     return listProviderDebugLogs();

@@ -306,6 +306,200 @@
 
 - `corepack pnpm build` 成功。
 
+## 2026-05-05 Chat 流式输出
+
+用户觉得一次性返回看起来不自然，希望改成流式输出。
+
+已完成：
+
+- 新增共享类型 `ChatStreamEvent`。
+- Provider 抽象增加 `streamChat`。
+- MiMo Provider 使用 Anthropic SDK 非阻塞流式调用：
+  - `stream: true`
+  - 监听 `content_block_delta` / `text_delta`
+- ChatService 新增 `streamChatMessage`。
+- Electron Main 新增 `workbench:stream-chat-message`。
+- Preload 新增：
+  - `streamChatMessage`
+  - `onChatStreamEvent`
+- 极简 Chat 页面改为：
+  - 发送后立即创建助手消息气泡。
+  - 收到 delta 后持续追加内容。
+  - done 后同步最终 session。
+- 调试日志仍记录最终请求和完整响应。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-05 项目瘦身
+
+用户删除了一些文件导致构建报错，并要求清理项目，只保留基础对话入口和交互，其他遗留项先删除。
+
+已完成：
+
+- 删除旧的复杂 UI 页面：
+  - `AgentBuilderPage`
+  - `AgentFlowNode`
+  - `ChatHomePage`
+  - `ChatPanel`
+  - `workflowViewModel`
+- 删除旧的角色/工作流模拟 Core：
+  - `roles`
+  - `sampleWorkflow`
+  - `workflowExecutor`
+  - `modelProviders`
+- 移除 `@xyflow/react` 依赖。
+- 移除 React Flow 样式 import。
+- 重写 `styles.css`，只保留极简 Chat 页面和调试抽屉样式。
+- 将 MiMo Provider、流式输出、会话和调试日志逻辑收敛到 `chatService.ts`。
+- 精简共享类型，只保留 Chat、Provider、调试日志相关类型。
+
+当前保留的源码主线：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+- `packages/core/src/chatService.ts`
+- `packages/core/src/localSecrets.ts`
+- `packages/core/src/providerDebugLogs.ts`
+- `packages/shared/src/index.ts`
+
+注意：
+
+- `apps/memorizes/agents.md` 看起来是用户资料文件，未删除。
+
+验证：
+
+- `corepack pnpm install` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-05 Prompt 文件路径修复
+
+用户将系统 Prompt 改为 `readMarkdown("../memorizes/agents.md")` 后提示不对。
+
+原因：
+
+- `readMarkdown` 原实现使用 `path.resolve(filePath)`，这是按运行时当前工作目录解析，不是按 `chatService.ts` 源码文件位置解析。
+- Electron/Vite 在 dev 和 build 后的运行目录可能不同，`../memorizes/agents.md` 容易指向错误位置。
+- 当前实际 Prompt 文件位于 `packages/memorizes/agents.md`。
+
+修复：
+
+- `readMarkdown` 改为支持从项目根目录解析稳定相对路径。
+- `chatService.ts` 改为读取 `packages/memorizes/agents.md`。
+- 增加默认中文 System Prompt 兜底，避免文件缺失时传入空 prompt。
+- System Prompt 改为每次请求时读取，便于后续编辑 `agents.md` 后快速生效。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-05 两段式 Chat 调用链路
+
+用户要求：点击 Enter 后先调用小模型做意图识别，再将识别描述组装进大模型对话上下文。
+
+已完成：
+
+- 新增本地 Ollama 意图识别步骤：
+  - Base URL：`http://127.0.0.1:11434`
+  - Endpoint：`/api/chat`
+  - Model：`qwen2.5:1.5b`
+  - `stream: false`
+- `streamChatMessage` 调用顺序调整为：
+  1. 创建用户消息。
+  2. 发送 `stage` 事件：意图识别。
+  3. 调用 Ollama 小模型生成中文意图摘要。
+  4. 发送 `stage` 事件：大模型对话。
+  5. 将意图摘要追加到 MiMo System Prompt。
+  6. 调用 MiMo 并保持原有流式输出。
+- 调试面板现在会记录两类请求：
+  - `ollama-intent`
+  - `mimo-anthropic`
+- 新增 `ChatStreamEvent` 的 `stage` 事件。
+- 极简 Chat 页面增加阶段提示，用户可以看到“意图识别”和“大模型对话”的过渡。
+- Ollama 调用失败不会中断主对话，会记录失败日志并用兜底摘要继续调用 MiMo。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-05 Core 职责拆分
+
+用户反馈：当前逻辑都在一个文件里，难以阅读；前期不需要过多容错机制；不要使用 `yield` 等冷门语法。
+
+已完成：
+
+- 拆分 `packages/core/src/chatService.ts`：
+  - `chatService.ts`：只保留 Chat 两段式流程编排。
+  - `chatSessions.ts`：管理内存会话和助手消息追加。
+  - `modelConfig.ts`：集中保存 MiMo/Ollama 模型和地址配置。
+  - `prompts.ts`：管理意图识别 Prompt 和大模型 System Prompt 组装。
+  - `providers/ollamaIntentProvider.ts`：只负责本地 Ollama 意图识别请求。
+  - `providers/mimoProvider.ts`：只负责 MiMo 大模型流式请求。
+- 移除自有代码中的 `async function*`、`yield`、`yield*` 和 `for await`。
+- 流式消息改为普通回调：`streamChatMessage(request, onEvent)`。
+- Electron IPC 改为把事件发送函数传给 Core，不再消费异步迭代器。
+- 简化前期容错：Ollama 意图识别失败会直接暴露错误，方便开发阶段定位。
+
+验证：
+
+- 使用 `Select-String` 确认源码中没有 `yield|async function*|for await`。
+- `corepack pnpm build` 成功。
+
+## 2026-05-05 意图上下文 Role 修正
+
+用户指出：意图识别结果不应该被塞进 `system`，应进入对话上下文里的 role。
+
+修正：
+
+- `system` 现在只读取 `packages/memorizes/agents.md`，用于稳定角色和项目规则。
+- 新增 `buildIntentContextMessage`，将 Ollama 意图识别结果包装为本轮内部上下文。
+- MiMo 请求的 `messages` 会临时插入一条 `user` role 消息承载意图识别结果。
+- 这条意图上下文只存在于本次大模型请求中，不写入真实 ChatSession 历史。
+
+说明：
+
+- Anthropic Messages API 的 `messages` role 只支持 `user` / `assistant`，没有通用 `system` message role；因此内部上下文用 `user` role 包装，并在内容中明确说明它不是用户直接输入。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-05 Prompt 模块化
+
+用户反馈：提示词不希望是一整份大文件，手动修改困难，希望拆成模块。
+
+原因：
+
+- 原先 `agents.md` 是一整份 System Prompt，不利于局部修改。
+- 用户新增了 `intent.md`，但代码没有进行 `{{input}}` 变量替换，实际只是把文件内容拼接进上下文。
+- 部分意图识别 Prompt 仍硬编码在 `prompts.ts` 中。
+
+已完成：
+
+- 新增 `readMarkdownFiles`，支持按顺序读取多个 Markdown 模块并拼接。
+- 大模型 System Prompt 改为读取：
+  - `packages/memorizes/system/01-role.md`
+  - `packages/memorizes/system/02-goals.md`
+  - `packages/memorizes/system/03-style.md`
+- Ollama 意图识别 Prompt 改为读取：
+  - `packages/memorizes/intent/01-parser.md`
+  - `packages/memorizes/intent/02-input.md`
+- MiMo 临时意图上下文改为读取：
+  - `packages/memorizes/context/intent-result.md`
+- 新增简单模板变量替换：
+  - `{{recent_messages}}`
+  - `{{input}}`
+  - `{{intent_result}}`
+- `prompts.ts` 现在只负责声明模块路径、读取模块、替换变量，不再硬编码大段 Prompt。
+
+注意：
+
+- 旧 `packages/memorizes/agents.md` 和 `packages/memorizes/intent.md` 暂时保留，避免丢失用户手动修改内容；当前主流程不再读取这两个文件。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
 ### 下一步建议
 
 1. 接入真实模型 Provider 抽象。

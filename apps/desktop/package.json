@@ -15,7 +15,6 @@
     "@vitejs/plugin-react": "^4.3.4",
     "@xiaomi/core": "workspace:*",
     "@xiaomi/shared": "workspace:*",
-    "@xyflow/react": "^12.3.6",
     "electron": "^33.2.1",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",

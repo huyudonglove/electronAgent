@@ -3,10 +3,9 @@ import { Bug, RefreshCw, Send, X } from "lucide-react";
 import type {
   ChatMessage,
   ChatSessionId,
+  ChatStreamEvent,
   ModelProfile,
   ProviderDebugLog,
-  WorkflowDefinition,
-  WorkflowRun
 } from "@xiaomi/shared";
 
 const initialMessage: ChatMessage = {
@@ -19,16 +18,15 @@ const initialMessage: ChatMessage = {
 
 interface MinimalChatPageProps {
   readonly modelProfiles: readonly ModelProfile[];
-  readonly workflow: WorkflowDefinition | null;
-  readonly latestRun: WorkflowRun | null;
 }
 
-export function MinimalChatPage({ modelProfiles, workflow, latestRun }: MinimalChatPageProps): JSX.Element {
+export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.Element {
   const [messages, setMessages] = useState<readonly ChatMessage[]>([initialMessage]);
   const [draft, setDraft] = useState("");
   const [sessionId, setSessionId] = useState<ChatSessionId | undefined>();
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [stageLabel, setStageLabel] = useState<string | null>(null);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugLogs, setDebugLogs] = useState<readonly ProviderDebugLog[]>([]);
 
@@ -50,28 +48,74 @@ export function MinimalChatPage({ modelProfiles, workflow, latestRun }: MinimalC
     setDraft("");
     setIsSending(true);
     setError(null);
+    setStageLabel(null);
 
     try {
-      const response = await window.workbench.sendChatMessage({
+      const removeListener = window.workbench.onChatStreamEvent((event) => {
+        handleStreamEvent(event);
+      });
+      await window.workbench.streamChatMessage({
         sessionId,
         projectId: "local-project",
         modelProfileId: modelProfiles.find((profile) => profile.id === "mimo-v2-5-pro")?.id ?? "mimo-v2-5-pro",
         message: content,
-        context: {
-          workflow: workflow ?? undefined,
-          latestRun
-        }
       });
-
-      setSessionId(response.session.id);
-      setMessages(response.session.messages);
+      removeListener();
       await refreshDebugLogs();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       await refreshDebugLogs();
     } finally {
       setIsSending(false);
+      setStageLabel(null);
     }
+  }
+
+  function handleStreamEvent(event: ChatStreamEvent): void {
+    if (event.type === "stage") {
+      setStageLabel(event.detail ? `${event.label}：${event.detail}` : event.label);
+      return;
+    }
+
+    if (event.type === "start") {
+      setStageLabel(null);
+      setSessionId(event.sessionId);
+      setMessages((current) => [
+        ...current,
+        {
+          id: event.messageId,
+          sender: "assistant",
+          roleLabel: event.roleLabel,
+          content: "",
+          createdAt: new Date().toISOString()
+        }
+      ]);
+      return;
+    }
+
+    if (event.type === "delta") {
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === event.messageId
+            ? {
+                ...message,
+                content: `${message.content}${event.delta}`
+              }
+            : message
+        )
+      );
+      return;
+    }
+
+    if (event.type === "done") {
+      setStageLabel(null);
+      setSessionId(event.session.id);
+      setMessages(event.session.messages);
+      return;
+    }
+
+    setStageLabel(null);
+    setError(event.error);
   }
 
   async function refreshDebugLogs(): Promise<void> {
@@ -103,6 +147,7 @@ export function MinimalChatPage({ modelProfiles, workflow, latestRun }: MinimalC
             <p>{message.content}</p>
           </article>
         ))}
+        {stageLabel ? <div className="minimal-chat__stage">{stageLabel}</div> : null}
         {error ? <div className="minimal-chat__error">{error}</div> : null}
       </section>
 
@@ -175,6 +220,10 @@ export function MinimalChatPage({ modelProfiles, workflow, latestRun }: MinimalC
                       <dt>Latest User</dt>
                       <dd>{log.request.latestUserMessage ?? "-"}</dd>
                     </div>
+                    <div>
+                      <dt>Stop Reason</dt>
+                      <dd>{log.response?.stopReason ?? "-"}</dd>
+                    </div>
                   </dl>
                   <details className="debug-details" open>
                     <summary>请求 Headers</summary>
@@ -187,7 +236,7 @@ export function MinimalChatPage({ modelProfiles, workflow, latestRun }: MinimalC
                   {log.response ? (
                     <details className="debug-details" open>
                       <summary>响应内容</summary>
-                      <pre>{log.response.content}</pre>
+                      <pre>{formatResponse(log.response)}</pre>
                     </details>
                   ) : log.error ? (
                     <details className="debug-details" open>
@@ -209,4 +258,17 @@ export function MinimalChatPage({ modelProfiles, workflow, latestRun }: MinimalC
 
 function formatJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
+}
+
+function formatResponse(response: ProviderDebugLog["response"]): string {
+  if (!response) {
+    return "";
+  }
+
+  return [
+    `stopReason: ${response.stopReason ?? "-"}`,
+    `usage: ${formatJson(response.usage ?? {})}`,
+    "",
+    response.content
+  ].join("\n");
 }

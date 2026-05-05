@@ -1,7 +1,12 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultRoles, listModelProfiles, listProviderDebugLogs, runWorkflow, sampleWorkflow, sendChatMessage } from "@xiaomi/core";
+import {
+  listModelProfiles,
+  listProviderDebugLogs,
+  sendChatMessage,
+  streamChatMessage
+} from "@xiaomi/core";
 import type { ChatRequest } from "@xiaomi/shared";
 
 const currentFile = fileURLToPath(import.meta.url);
@@ -58,17 +63,17 @@ app.on("window-all-closed", () => {
 
 function registerIpcHandlers(): void {
   ipcMain.handle("workbench:get-initial-state", () => ({
-    roles: defaultRoles,
-    workflow: sampleWorkflow,
     modelProfiles: listModelProfiles()
   }));
 
-  ipcMain.handle("workbench:run-workflow", async (_event, initialInput: string) => {
-    return runWorkflow(sampleWorkflow, { initialInput });
-  });
-
   ipcMain.handle("workbench:send-chat-message", async (_event, request: ChatRequest) => {
     return sendChatMessage(request);
+  });
+
+  ipcMain.handle("workbench:stream-chat-message", async (event, request: ChatRequest) => {
+    await streamChatMessage(request, (streamEvent) => {
+      event.sender.send("workbench:chat-stream-event", streamEvent);
+    });
   });
 
   ipcMain.handle("workbench:list-provider-debug-logs", () => {
