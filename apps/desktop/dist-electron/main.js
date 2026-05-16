@@ -1,7 +1,11 @@
 import { app, BrowserWindow, ipcMain } from "electron";
-import path from "node:path";
+import path$1 from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs";
+import Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
 const sessions = /* @__PURE__ */ new Map();
 function getOrCreateSession(request, now) {
   if (request.sessionId && sessions.has(request.sessionId)) {
@@ -38,6 +42,525 @@ function appendAssistantMessage(session, messages, assistantMessageId, roleLabel
     assistantMessage
   };
 }
+const ROOT_MARKERS$1 = ["pnpm-workspace.yaml", "package.json"];
+function findProjectRoot$1() {
+  let currentDir2 = process.cwd();
+  while (true) {
+    if (ROOT_MARKERS$1.every((marker) => fs.existsSync(path$1.join(currentDir2, marker)))) {
+      return currentDir2;
+    }
+    const parentDir = path$1.dirname(currentDir2);
+    if (parentDir === currentDir2) {
+      return void 0;
+    }
+    currentDir2 = parentDir;
+  }
+}
+function resolveProjectPath(...parts) {
+  return path$1.resolve(findProjectRoot$1() ?? process.cwd(), ...parts);
+}
+const execFileAsync = promisify(execFile);
+const MAX_OUTPUT_LENGTH = 2e4;
+const DEFAULT_TIMEOUT_MS = 3e4;
+const BUILD_TIMEOUT_MS = 12e4;
+async function runCommandThroughGateway(input) {
+  const startedAt = Date.now();
+  const policy = decideCommand(input.request, input.toolSelection);
+  if (policy.decision !== "allow") {
+    return {
+      request: input.request,
+      decision: policy.decision,
+      status: "skipped",
+      reason: policy.reason,
+      durationMs: Date.now() - startedAt
+    };
+  }
+  try {
+    const result = await execFileAsync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", input.request.command],
+      {
+        cwd: path$1.resolve(input.request.cwd),
+        timeout: getTimeout(input.request.command),
+        windowsHide: true,
+        maxBuffer: MAX_OUTPUT_LENGTH * 2
+      }
+    );
+    return {
+      request: input.request,
+      decision: "allow",
+      status: "executed",
+      reason: policy.reason,
+      exitCode: 0,
+      stdout: truncateOutput(result.stdout),
+      stderr: truncateOutput(result.stderr),
+      durationMs: Date.now() - startedAt
+    };
+  } catch (error) {
+    const execError = error;
+    return {
+      request: input.request,
+      decision: "allow",
+      status: "failed",
+      reason: policy.reason,
+      exitCode: typeof execError.code === "number" ? execError.code : void 0,
+      stdout: truncateOutput(execError.stdout ?? ""),
+      stderr: truncateOutput(execError.stderr ?? execError.message ?? ""),
+      durationMs: Date.now() - startedAt
+    };
+  }
+}
+function decideCommand(request, toolSelection) {
+  if (!toolSelection.selected_tools.includes("command.run") || toolSelection.access_mode === "none") {
+    return {
+      decision: "deny",
+      reason: "本轮 Core 未开放 command.run。"
+    };
+  }
+  if (request.shell !== "powershell") {
+    return {
+      decision: "deny",
+      reason: "第一版 Command Gateway 只允许 PowerShell。"
+    };
+  }
+  const cwdCheck = checkWorkspaceCwd(request.cwd);
+  if (!cwdCheck.allowed) {
+    return {
+      decision: "deny",
+      reason: cwdCheck.reason
+    };
+  }
+  const command = request.command.trim();
+  if (isDangerousCommand(command)) {
+    return {
+      decision: "deny",
+      reason: "命令命中危险模式，已拒绝执行。"
+    };
+  }
+  if (toolSelection.access_mode === "project_read" && !isReadCommand(command)) {
+    return {
+      decision: "confirm",
+      reason: "当前只开放项目只读工具能力，这条命令需要更高权限。"
+    };
+  }
+  if (toolSelection.access_mode === "project_verify" && !isReadCommand(command) && !isVerifyCommand(command)) {
+    return {
+      decision: "confirm",
+      reason: "当前只开放项目读取和验证能力，这条命令需要写权限。"
+    };
+  }
+  if (requiresConfirm(command)) {
+    return {
+      decision: "confirm",
+      reason: "该命令需要用户确认，第一版暂不自动执行。"
+    };
+  }
+  return {
+    decision: "allow",
+    reason: "命令通过 Command Gateway 第一版策略。"
+  };
+}
+function checkWorkspaceCwd(cwd) {
+  const workspaceRoot = path$1.resolve(resolveProjectPath());
+  const resolvedCwd = path$1.resolve(cwd);
+  const relative = path$1.relative(workspaceRoot, resolvedCwd);
+  const isInsideWorkspace = relative === "" || !relative.startsWith("..") && !path$1.isAbsolute(relative);
+  return isInsideWorkspace ? { allowed: true, reason: "cwd 位于工作区内。" } : { allowed: false, reason: `cwd 不在工作区内：${resolvedCwd}` };
+}
+function isDangerousCommand(command) {
+  const lowerCommand = command.toLowerCase();
+  const dangerousPatterns = [
+    "invoke-expression",
+    "iex",
+    "curl |",
+    "irm ",
+    "iwr ",
+    "format-volume",
+    "format ",
+    "diskpart",
+    "shutdown",
+    "restart-computer",
+    "remove-item -recurse",
+    "rm -r",
+    "rmdir /s",
+    "del /s",
+    "set-executionpolicy"
+  ];
+  return dangerousPatterns.some((pattern) => lowerCommand.includes(pattern));
+}
+function isReadCommand(command) {
+  const normalized = command.trim().toLowerCase();
+  const readPrefixes = [
+    "get-childitem",
+    "dir",
+    "ls",
+    "get-content",
+    "select-string",
+    "test-path",
+    "resolve-path",
+    "git status",
+    "git diff",
+    "git log"
+  ];
+  return readPrefixes.some((prefix) => normalized.startsWith(prefix));
+}
+function isVerifyCommand(command) {
+  const normalized = command.trim().toLowerCase();
+  const verifyCommands = [
+    "corepack pnpm build",
+    "corepack pnpm test",
+    "pnpm build",
+    "pnpm test",
+    "npm run build",
+    "npm test"
+  ];
+  return verifyCommands.some((prefix) => normalized.startsWith(prefix));
+}
+function requiresConfirm(command) {
+  const normalized = command.trim().toLowerCase();
+  const confirmPatterns = ["git add", "git commit", "git push", "pnpm add", "npm install", "corepack pnpm add"];
+  return confirmPatterns.some((pattern) => normalized.startsWith(pattern));
+}
+function getTimeout(command) {
+  return isVerifyCommand(command) ? BUILD_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+}
+function truncateOutput(output) {
+  return output.length > MAX_OUTPUT_LENGTH ? `${output.slice(0, MAX_OUTPUT_LENGTH)}
+[output truncated]` : output;
+}
+let database;
+function getDatabase() {
+  if (database) {
+    return database;
+  }
+  const dataDir = resolveProjectPath("data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  database = new Database(path$1.join(dataDir, "agent.db"));
+  database.pragma("journal_mode = WAL");
+  migrate(database);
+  return database;
+}
+function migrate(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS events (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      message_id TEXT,
+      type TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      role_label TEXT,
+      content TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_events_session
+      ON events (project_id, session_id, created_at);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_events_message_id
+      ON events (message_id)
+      WHERE message_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS conversation_summaries (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      source_start_message_id TEXT NOT NULL,
+      source_end_message_id TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      decisions_json TEXT NOT NULL DEFAULT '[]',
+      open_questions_json TEXT NOT NULL DEFAULT '[]',
+      constraints_json TEXT NOT NULL DEFAULT '[]',
+      task_progress_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_summaries_session
+      ON conversation_summaries (project_id, session_id, updated_at);
+  `);
+}
+function getLatestConversationSummary(projectId, sessionId) {
+  const row = getDatabase().prepare(
+    `
+        SELECT *
+        FROM conversation_summaries
+        WHERE project_id = ? AND session_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `
+  ).get(projectId, sessionId);
+  return row ? toConversationSummary(row) : void 0;
+}
+function saveConversationSummary(input) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const firstMessage = input.sourceMessages[0];
+  const lastMessage = input.sourceMessages.at(-1);
+  if (!firstMessage || !lastMessage) {
+    throw new Error("会话压缩失败：没有可压缩的消息。");
+  }
+  const summary = {
+    id: `summary-${Date.now()}`,
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    sourceStartMessageId: firstMessage.id,
+    sourceEndMessageId: lastMessage.id,
+    summary: input.summary,
+    decisions: input.decisions,
+    openQuestions: input.openQuestions,
+    constraints: input.constraints,
+    taskProgress: input.taskProgress,
+    createdAt: now,
+    updatedAt: now
+  };
+  getDatabase().prepare(
+    `
+        INSERT INTO conversation_summaries (
+          id,
+          project_id,
+          session_id,
+          source_start_message_id,
+          source_end_message_id,
+          summary,
+          decisions_json,
+          open_questions_json,
+          constraints_json,
+          task_progress_json,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+  ).run(
+    summary.id,
+    summary.projectId,
+    summary.sessionId,
+    summary.sourceStartMessageId,
+    summary.sourceEndMessageId,
+    summary.summary,
+    JSON.stringify(summary.decisions),
+    JSON.stringify(summary.openQuestions),
+    JSON.stringify(summary.constraints),
+    JSON.stringify(summary.taskProgress),
+    summary.createdAt,
+    summary.updatedAt
+  );
+  return summary;
+}
+function toConversationSummary(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    sessionId: row.session_id,
+    sourceStartMessageId: row.source_start_message_id,
+    sourceEndMessageId: row.source_end_message_id,
+    summary: row.summary,
+    decisions: parseStringArray(row.decisions_json),
+    openQuestions: parseStringArray(row.open_questions_json),
+    constraints: parseStringArray(row.constraints_json),
+    taskProgress: parseStringArray(row.task_progress_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+function parseStringArray(value) {
+  const parsed = JSON.parse(value);
+  return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
+}
+function saveChatMessageEvent(input) {
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    messageId: input.message.id,
+    type: "chat_message",
+    actor: input.message.sender,
+    roleLabel: input.message.roleLabel,
+    content: input.message.content,
+    payload: {
+      createdAt: input.message.createdAt
+    },
+    createdAt: input.message.createdAt
+  });
+}
+function saveRouterResultEvent(input) {
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "router_result",
+    actor: "router",
+    roleLabel: "Ollama Router",
+    content: input.content,
+    payload: parseJsonPayload(input.content),
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveToolSelectionEvent(input) {
+  const content = JSON.stringify(input.result, null, 2);
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "tool_selection",
+    actor: "core",
+    roleLabel: "Tool Selection Policy",
+    content,
+    payload: input.result,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveToolCallEvent(input) {
+  const content = JSON.stringify(input.request, null, 2);
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "tool_call",
+    actor: "model",
+    roleLabel: "command.run",
+    content,
+    payload: input.request,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveToolResultEvent(input) {
+  const content = JSON.stringify(
+    {
+      decision: input.result.decision,
+      status: input.result.status,
+      reason: input.result.reason,
+      exitCode: input.result.exitCode,
+      durationMs: input.result.durationMs
+    },
+    null,
+    2
+  );
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "tool_result",
+    actor: "tool",
+    roleLabel: "Command Gateway",
+    content,
+    payload: input.result,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveConversationSummaryEvent(input) {
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "conversation_summary",
+    actor: "system",
+    roleLabel: "Conversation Compressor",
+    content: input.content,
+    payload: {
+      summaryId: input.summaryId,
+      value: input.payload
+    },
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveModelReturnEvent(input) {
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "model_return",
+    actor: "model",
+    roleLabel: "MiMo",
+    payload: {
+      stopReason: input.stopReason,
+      usage: input.usage
+    },
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveErrorEvent(input) {
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "error",
+    actor: "system",
+    roleLabel: "Error",
+    content: input.message,
+    payload: {
+      stage: input.stage
+    },
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function listSessionEvents(input) {
+  const rows = getDatabase().prepare(
+    `
+        SELECT *
+        FROM events
+        WHERE project_id = ? AND session_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `
+  ).all(input.projectId, input.sessionId, input.limit ?? 100);
+  return rows.map(toEventRecord).reverse();
+}
+function saveEvent(input) {
+  const event = {
+    ...input,
+    id: `event-${randomUUID()}`
+  };
+  getDatabase().prepare(
+    `
+        INSERT OR IGNORE INTO events (
+          id,
+          project_id,
+          session_id,
+          message_id,
+          type,
+          actor,
+          role_label,
+          content,
+          payload_json,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+  ).run(
+    event.id,
+    event.projectId,
+    event.sessionId,
+    event.messageId ?? null,
+    event.type,
+    event.actor,
+    event.roleLabel ?? null,
+    event.content ?? null,
+    JSON.stringify(event.payload ?? {}),
+    event.createdAt
+  );
+  return event;
+}
+function toEventRecord(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    sessionId: row.session_id,
+    messageId: row.message_id ?? void 0,
+    type: row.type,
+    actor: row.actor,
+    roleLabel: row.role_label ?? void 0,
+    content: row.content ?? void 0,
+    payload: parseJsonPayload(row.payload_json),
+    createdAt: row.created_at
+  };
+}
+function parseJsonPayload(content) {
+  try {
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
+}
+const MIMO_BASE_URL = "https://token-plan-cn.xiaomimimo.com/anthropic";
+const MIMO_MODEL = "mimo-v2.5-pro";
+const MIMO_MAX_TOKENS = 8192;
+const OLLAMA_BASE_URL = "http://127.0.0.1:11434";
+const OLLAMA_INTENT_MODEL = "qwen2.5:1.5b";
+const DEFAULT_SYSTEM_PROMPT = "你是一个专注于个人 AI Agent 项目搭建的工作协作助手。请用中文优先回答，帮助用户通过对话完成需求澄清、技术选型、开发实现、测试验证和本地记忆沉淀。";
 function getMimoApiKey() {
   return readLocalSecrets().mimoApiKey || process.env.MIMO_API_KEY;
 }
@@ -56,23 +579,568 @@ function readLocalSecrets() {
 function findSecretsPath() {
   let currentDir2 = process.cwd();
   while (true) {
-    const candidate = path.join(currentDir2, "config", "secrets.local.json");
+    const candidate = path$1.join(currentDir2, "config", "secrets.local.json");
     if (fs.existsSync(candidate)) {
       return candidate;
     }
-    const parentDir = path.dirname(currentDir2);
+    const parentDir = path$1.dirname(currentDir2);
     if (parentDir === currentDir2) {
-      return path.resolve(process.cwd(), "config", "secrets.local.json");
+      return path$1.resolve(process.cwd(), "config", "secrets.local.json");
     }
     currentDir2 = parentDir;
   }
 }
-const MIMO_BASE_URL = "https://token-plan-cn.xiaomimimo.com/anthropic";
-const MIMO_MODEL = "mimo-v2.5-pro";
-const MIMO_MAX_TOKENS = 8192;
-const OLLAMA_BASE_URL = "http://127.0.0.1:11434";
-const OLLAMA_INTENT_MODEL = "qwen2.5:1.5b";
-const DEFAULT_SYSTEM_PROMPT = "你是一个专注于个人 AI Agent 项目搭建的工作协作助手。请用中文优先回答，帮助用户通过对话完成需求澄清、技术选型、开发实现、测试验证和本地记忆沉淀。";
+const CONFIG_PATH = resolveProjectPath("config", "model-runtime.local.json");
+function getModelRuntimeSettings() {
+  return normalizeSettings(readModelRuntimeSettings());
+}
+function saveModelRuntimeSettings(settings) {
+  const normalized = normalizeSettings(settings);
+  fs.mkdirSync(path$1.dirname(CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(normalized, null, 2)}
+`, "utf8");
+  return normalized;
+}
+function getModelRuntimeConfig(role) {
+  return getModelRuntimeSettings()[role];
+}
+function readModelRuntimeSettings() {
+  if (!fs.existsSync(CONFIG_PATH)) {
+    return {};
+  }
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function normalizeSettings(settings) {
+  return {
+    router: normalizeConfig(settings.router, defaultRouterConfig()),
+    main: normalizeConfig(settings.main, defaultMainConfig()),
+    compression: normalizeConfig(settings.compression, defaultCompressionConfig())
+  };
+}
+function normalizeConfig(value, fallback) {
+  return {
+    role: fallback.role,
+    label: stringOr(value == null ? void 0 : value.label, fallback.label),
+    providerKind: (value == null ? void 0 : value.providerKind) === "openai-compatible" || (value == null ? void 0 : value.providerKind) === "anthropic-compatible" || (value == null ? void 0 : value.providerKind) === "ollama" ? value.providerKind : fallback.providerKind,
+    baseURL: stringOr(value == null ? void 0 : value.baseURL, fallback.baseURL),
+    model: stringOr(value == null ? void 0 : value.model, fallback.model),
+    apiKey: stringOr(value == null ? void 0 : value.apiKey, fallback.apiKey),
+    temperature: numberOr(value == null ? void 0 : value.temperature, fallback.temperature),
+    maxTokens: numberOr(value == null ? void 0 : value.maxTokens, fallback.maxTokens)
+  };
+}
+function defaultRouterConfig() {
+  return {
+    role: "router",
+    label: "Local Qwen Router",
+    providerKind: "ollama",
+    baseURL: OLLAMA_BASE_URL,
+    model: OLLAMA_INTENT_MODEL,
+    apiKey: "",
+    temperature: 0.2,
+    maxTokens: 768
+  };
+}
+function defaultMainConfig() {
+  return {
+    role: "main",
+    label: "MiMo Main",
+    providerKind: "anthropic-compatible",
+    baseURL: MIMO_BASE_URL,
+    model: MIMO_MODEL,
+    apiKey: getMimoApiKey() ?? "",
+    temperature: 1,
+    maxTokens: MIMO_MAX_TOKENS
+  };
+}
+function defaultCompressionConfig() {
+  return {
+    role: "compression",
+    label: "Local Qwen Compression",
+    providerKind: "ollama",
+    baseURL: OLLAMA_BASE_URL,
+    model: OLLAMA_INTENT_MODEL,
+    apiKey: "",
+    temperature: 0.2,
+    maxTokens: 1024
+  };
+}
+function stringOr(value, fallback) {
+  return typeof value === "string" ? value : fallback;
+}
+function numberOr(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+const logs = [];
+function addProviderDebugLog(log) {
+  logs.unshift(log);
+  logs.splice(50);
+}
+function listProviderDebugLogs() {
+  return logs;
+}
+function createDebugLogBase(input) {
+  return {
+    ...input,
+    id: `provider-log-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    status: "pending",
+    startedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+const ROOT_MARKERS = ["pnpm-workspace.yaml", "package.json"];
+function readMarkdown(filePath, fallback = "") {
+  const markdownPath = resolveMarkdownPath(filePath);
+  if (!markdownPath) {
+    return fallback;
+  }
+  try {
+    return fs.readFileSync(markdownPath, "utf8");
+  } catch {
+    return fallback;
+  }
+}
+function readMarkdownFiles(filePaths, fallback = "") {
+  const content = filePaths.map((filePath) => readMarkdown(filePath)).filter((item) => item.trim().length > 0).join("\n\n");
+  return content || fallback;
+}
+function resolveMarkdownPath(filePath) {
+  if (path$1.isAbsolute(filePath)) {
+    return fs.existsSync(filePath) ? filePath : void 0;
+  }
+  const rootDir = findProjectRoot();
+  const normalizedPath = normalizeRelativePath(filePath);
+  const candidatePaths = /* @__PURE__ */ new Set();
+  candidatePaths.add(path$1.resolve(process.cwd(), filePath));
+  if (rootDir) {
+    candidatePaths.add(path$1.resolve(rootDir, filePath));
+    candidatePaths.add(path$1.resolve(rootDir, normalizedPath));
+    candidatePaths.add(path$1.resolve(rootDir, "packages", normalizedPath));
+  }
+  for (const candidatePath of candidatePaths) {
+    if (fs.existsSync(candidatePath)) {
+      return candidatePath;
+    }
+  }
+  return void 0;
+}
+function normalizeRelativePath(filePath) {
+  return filePath.replace(/\\/g, "/").replace(/^(\.\.\/)+/, "").replace(/^(\.\/)+/, "");
+}
+function findProjectRoot() {
+  let currentDir2 = process.cwd();
+  while (true) {
+    if (ROOT_MARKERS.every((marker) => fs.existsSync(path$1.join(currentDir2, marker)))) {
+      return currentDir2;
+    }
+    const parentDir = path$1.dirname(currentDir2);
+    if (parentDir === currentDir2) {
+      return void 0;
+    }
+    currentDir2 = parentDir;
+  }
+}
+const SYSTEM_PROMPT_MODULES = [
+  "packages/memorizes/system/01-role.md",
+  "packages/memorizes/system/02-goals.md",
+  "packages/memorizes/system/03-style.md"
+];
+const INTENT_PROMPT_MODULES = [
+  "packages/memorizes/intent/01-parser.md"
+];
+const INTENT_USER_MODULES = [
+  "packages/memorizes/intent/02-input.md"
+];
+const INTENT_CONTEXT_TEMPLATE = "packages/memorizes/context/intent-result.md";
+const COMPRESSION_PROMPT_MODULES = [
+  "packages/memorizes/compression/01-system.md"
+];
+const COMPRESSION_USER_MODULES = [
+  "packages/memorizes/compression/02-input.md"
+];
+function buildIntentSystemPrompt() {
+  return readMarkdownFiles(INTENT_PROMPT_MODULES);
+}
+function buildIntentUserPrompt(messages, latestUserMessage) {
+  return renderTemplate(readMarkdownFiles(INTENT_USER_MODULES), {
+    recent_messages: formatRecentMessages(messages),
+    input: latestUserMessage
+  });
+}
+function buildSystemPrompt() {
+  return readMarkdownFiles(SYSTEM_PROMPT_MODULES, DEFAULT_SYSTEM_PROMPT);
+}
+function buildIntentContextMessage(intentSummary) {
+  return renderTemplate(readMarkdown(INTENT_CONTEXT_TEMPLATE), {
+    intent_result: intentSummary
+  });
+}
+function buildCompressionSystemPrompt() {
+  return readMarkdownFiles(COMPRESSION_PROMPT_MODULES);
+}
+function buildCompressionUserPrompt(input) {
+  return renderTemplate(readMarkdownFiles(COMPRESSION_USER_MODULES), {
+    previous_summary: input.previousSummary || "无",
+    messages: formatMessages(input.messages)
+  });
+}
+function formatRecentMessages(messages) {
+  return messages.slice(-8).map((message) => `${message.roleLabel}: ${message.content}`).join("\n\n") || "无";
+}
+function formatMessages(messages) {
+  return messages.map((message) => {
+    return [
+      `id: ${message.id}`,
+      `role: ${message.sender}`,
+      `label: ${message.roleLabel}`,
+      `time: ${message.createdAt}`,
+      `content: ${message.content}`
+    ].join("\n");
+  }).join("\n\n---\n\n") || "无";
+}
+function renderTemplate(template, values) {
+  return Object.entries(values).reduce((content, [key, value]) => {
+    return content.replaceAll(`{{${key}}}`, value);
+  }, template);
+}
+async function createOpenAiJsonChat(input) {
+  var _a2, _b, _c, _d, _e, _f;
+  const startedAtMs = Date.now();
+  const requestBody = {
+    model: input.config.model,
+    messages: input.messages,
+    temperature: input.config.temperature,
+    max_tokens: input.config.maxTokens,
+    response_format: {
+      type: "json_object"
+    },
+    stream: false
+  };
+  const endpoint = `${trimTrailingSlash(input.config.baseURL)}/chat/completions`;
+  const debugLog = createDebugLogBase({
+    providerId: input.providerId,
+    model: input.config.model,
+    baseURL: input.config.baseURL,
+    request: {
+      method: "POST",
+      endpoint,
+      headers: buildDebugHeaders(input.config),
+      body: requestBody,
+      messageCount: input.messages.length,
+      latestUserMessage: input.latestUserMessage
+    }
+  });
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: buildHeaders$1(input.config),
+    body: JSON.stringify(requestBody)
+  });
+  if (!response.ok) {
+    const message = `${response.status}: ${await response.text()}`;
+    addProviderDebugLog({
+      ...debugLog,
+      status: "failed",
+      completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      error: message
+    });
+    throw new Error(`OpenAI-compatible 调用失败：${message}`);
+  }
+  const data = await response.json();
+  const content = ((_d = (_c = (_b = (_a2 = data.choices) == null ? void 0 : _a2[0]) == null ? void 0 : _b.message) == null ? void 0 : _c.content) == null ? void 0 : _d.trim()) ?? "";
+  addProviderDebugLog({
+    ...debugLog,
+    status: "succeeded",
+    completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    durationMs: Date.now() - startedAtMs,
+    response: {
+      content,
+      stopReason: (_f = (_e = data.choices) == null ? void 0 : _e[0]) == null ? void 0 : _f.finish_reason,
+      usage: data.usage
+    }
+  });
+  return content;
+}
+async function streamOpenAiChat(input) {
+  var _a2, _b;
+  const startedAtMs = Date.now();
+  const requestBody = {
+    model: input.config.model,
+    messages: buildOpenAiMessages(input),
+    temperature: input.config.temperature,
+    max_tokens: input.config.maxTokens,
+    stream: true
+  };
+  const endpoint = `${trimTrailingSlash(input.config.baseURL)}/chat/completions`;
+  const debugLog = createDebugLogBase({
+    providerId: `${input.config.role}-${input.config.providerKind}`,
+    model: input.config.model,
+    baseURL: input.config.baseURL,
+    request: {
+      method: "POST",
+      endpoint,
+      headers: buildDebugHeaders(input.config),
+      body: requestBody,
+      messageCount: requestBody.messages.length,
+      latestUserMessage: input.latestUserMessage
+    }
+  });
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: buildHeaders$1(input.config),
+    body: JSON.stringify(requestBody)
+  });
+  if (!response.ok || !response.body) {
+    const message = `${response.status}: ${await response.text()}`;
+    addProviderDebugLog({
+      ...debugLog,
+      status: "failed",
+      completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      error: message
+    });
+    throw new Error(`OpenAI-compatible 流式调用失败：${message}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let stopReason;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) {
+        continue;
+      }
+      const data = trimmed.slice("data:".length).trim();
+      if (data === "[DONE]") {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(data);
+        const choice = (_a2 = parsed.choices) == null ? void 0 : _a2[0];
+        const delta = ((_b = choice == null ? void 0 : choice.delta) == null ? void 0 : _b.content) ?? "";
+        if (delta) {
+          content += delta;
+          input.onDelta(delta);
+        }
+        if (choice == null ? void 0 : choice.finish_reason) {
+          stopReason = choice.finish_reason;
+        }
+      } catch {
+      }
+    }
+  }
+  addProviderDebugLog({
+    ...debugLog,
+    status: "succeeded",
+    completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    durationMs: Date.now() - startedAtMs,
+    response: {
+      content,
+      stopReason
+    }
+  });
+  return {
+    content,
+    stopReason
+  };
+}
+function buildOpenAiMessages(input) {
+  const conversationMessages = input.messages.filter((message) => message.sender === "user" || message.sender === "assistant").map((message) => ({
+    role: message.sender === "assistant" ? "assistant" : "user",
+    content: message.content
+  }));
+  const latestUserMessage = conversationMessages.at(-1);
+  const historyMessages = latestUserMessage ? conversationMessages.slice(0, -1) : conversationMessages;
+  return [
+    {
+      role: "system",
+      content: input.system
+    },
+    ...historyMessages,
+    {
+      role: "user",
+      content: input.runtimeContext
+    },
+    ...latestUserMessage ? [latestUserMessage] : []
+  ];
+}
+function buildHeaders$1(config) {
+  return {
+    "content-type": "application/json",
+    ...config.apiKey ? { authorization: `Bearer ${config.apiKey.trim()}` } : {}
+  };
+}
+function buildDebugHeaders(config) {
+  return {
+    "content-type": "application/json",
+    authorization: config.apiKey ? "Bearer [redacted]" : ""
+  };
+}
+function trimTrailingSlash(value) {
+  return value.replace(/\/+$/, "");
+}
+async function compressConversationWithOllama(input) {
+  var _a2, _b, _c;
+  const startedAtMs = Date.now();
+  const config = getModelRuntimeConfig("compression");
+  const compressionMessages = [
+    {
+      role: "system",
+      content: buildCompressionSystemPrompt()
+    },
+    {
+      role: "user",
+      content: buildCompressionUserPrompt({
+        previousSummary: input.previousSummary ?? "",
+        messages: input.messages
+      })
+    }
+  ];
+  if (config.providerKind === "openai-compatible") {
+    const content2 = await createOpenAiJsonChat({
+      config,
+      providerId: "compression-openai-compatible",
+      latestUserMessage: (_a2 = input.messages.at(-1)) == null ? void 0 : _a2.content,
+      messages: compressionMessages
+    });
+    return parseCompressionResult(content2);
+  }
+  if (config.providerKind !== "ollama") {
+    throw new Error(`会话压缩当前只支持 ollama 或 openai-compatible，实际配置为：${config.providerKind}`);
+  }
+  const requestBody = {
+    model: config.model,
+    stream: false,
+    format: "json",
+    messages: compressionMessages,
+    options: {
+      temperature: config.temperature,
+      num_predict: config.maxTokens
+    }
+  };
+  const latestUserMessage = (_b = input.messages.at(-1)) == null ? void 0 : _b.content;
+  const debugLog = createDebugLogBase({
+    providerId: "ollama-compression",
+    model: config.model,
+    baseURL: config.baseURL,
+    request: {
+      method: "POST",
+      endpoint: `${config.baseURL}/api/chat`,
+      headers: {
+        "content-type": "application/json"
+      },
+      body: requestBody,
+      messageCount: input.messages.length,
+      latestUserMessage
+    }
+  });
+  const response = await fetch(`${config.baseURL}/api/chat`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(requestBody)
+  });
+  if (!response.ok) {
+    throw new Error(`Ollama 会话压缩 HTTP ${response.status}: ${await response.text()}`);
+  }
+  const data = await response.json();
+  const content = (((_c = data.message) == null ? void 0 : _c.content) ?? data.response ?? "").trim();
+  const result = parseCompressionResult(content);
+  addProviderDebugLog({
+    ...debugLog,
+    status: "succeeded",
+    completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    durationMs: Date.now() - startedAtMs,
+    response: {
+      content
+    }
+  });
+  return result;
+}
+function parseCompressionResult(content) {
+  const parsed = JSON.parse(content);
+  if (!parsed.summary || typeof parsed.summary !== "string") {
+    throw new Error(`会话压缩结果无效：summary 不能为空。实际返回：${content}`);
+  }
+  return {
+    summary: parsed.summary,
+    decisions: toStringArray$1(parsed.decisions),
+    openQuestions: toStringArray$1(parsed.open_questions),
+    constraints: toStringArray$1(parsed.constraints),
+    taskProgress: toStringArray$1(parsed.task_progress)
+  };
+}
+function toStringArray$1(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+const MIN_MESSAGES_BEFORE_COMPRESSION = 24;
+const RECENT_MESSAGES_TO_KEEP = 10;
+const MIN_NEW_MESSAGES_TO_COMPRESS = 6;
+async function maybeCompressConversation(input) {
+  const latestSummary = getLatestConversationSummary(input.projectId, input.sessionId);
+  if (input.messages.length < MIN_MESSAGES_BEFORE_COMPRESSION) {
+    return latestSummary;
+  }
+  const compressionEndIndex = input.messages.length - RECENT_MESSAGES_TO_KEEP - 1;
+  if (compressionEndIndex < 0) {
+    return latestSummary;
+  }
+  const compressionEndMessage = input.messages[compressionEndIndex];
+  if (!compressionEndMessage || (latestSummary == null ? void 0 : latestSummary.sourceEndMessageId) === compressionEndMessage.id) {
+    return latestSummary;
+  }
+  const sourceMessages = selectSourceMessages(input.messages, latestSummary, compressionEndIndex);
+  if (sourceMessages.length < MIN_NEW_MESSAGES_TO_COMPRESS) {
+    return latestSummary;
+  }
+  const compressed = await compressConversationWithOllama({
+    messages: sourceMessages,
+    previousSummary: latestSummary == null ? void 0 : latestSummary.summary
+  });
+  const summary = saveConversationSummary({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    sourceMessages,
+    summary: compressed.summary,
+    decisions: compressed.decisions,
+    openQuestions: compressed.openQuestions,
+    constraints: compressed.constraints,
+    taskProgress: compressed.taskProgress
+  });
+  saveConversationSummaryEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    summaryId: summary.id,
+    content: summary.summary,
+    payload: {
+      sourceStartMessageId: summary.sourceStartMessageId,
+      sourceEndMessageId: summary.sourceEndMessageId,
+      decisions: summary.decisions,
+      openQuestions: summary.openQuestions,
+      constraints: summary.constraints,
+      taskProgress: summary.taskProgress
+    }
+  });
+  return summary;
+}
+function selectSourceMessages(messages, latestSummary, compressionEndIndex) {
+  const afterPreviousSummaryIndex = latestSummary ? messages.findIndex((message) => message.id === latestSummary.sourceEndMessageId) + 1 : 0;
+  const startIndex = afterPreviousSummaryIndex > 0 ? afterPreviousSummaryIndex : 0;
+  return messages.slice(startIndex, compressionEndIndex + 1);
+}
 function __classPrivateFieldSet(receiver, state, value, kind, f) {
   if (typeof state === "function" ? receiver !== state || true : !state.has(receiver))
     throw new TypeError("Cannot write private member to an object whose class did not declare it");
@@ -1383,7 +2451,7 @@ ${underline}`);
   }
   return path3;
 };
-const path$1 = /* @__PURE__ */ createPathTagFunction(encodeURIPath);
+const path = /* @__PURE__ */ createPathTagFunction(encodeURIPath);
 class Environments extends APIResource {
   /**
    * Create a new environment with the specified configuration.
@@ -1420,7 +2488,7 @@ class Environments extends APIResource {
    */
   retrieve(environmentID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/environments/${environmentID}?beta=true`, {
+    return this._client.get(path`/v1/environments/${environmentID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -1441,7 +2509,7 @@ class Environments extends APIResource {
    */
   update(environmentID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/environments/${environmentID}?beta=true`, {
+    return this._client.post(path`/v1/environments/${environmentID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -1485,7 +2553,7 @@ class Environments extends APIResource {
    */
   delete(environmentID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path$1`/v1/environments/${environmentID}?beta=true`, {
+    return this._client.delete(path`/v1/environments/${environmentID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -1507,7 +2575,7 @@ class Environments extends APIResource {
    */
   archive(environmentID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path$1`/v1/environments/${environmentID}/archive?beta=true`, {
+    return this._client.post(path`/v1/environments/${environmentID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -1592,7 +2660,7 @@ class Files extends APIResource {
    */
   delete(fileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path$1`/v1/files/${fileID}?beta=true`, {
+    return this._client.delete(path`/v1/files/${fileID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "files-api-2025-04-14"].toString() },
@@ -1615,7 +2683,7 @@ class Files extends APIResource {
    */
   download(fileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/files/${fileID}/content?beta=true`, {
+    return this._client.get(path`/v1/files/${fileID}/content?beta=true`, {
       ...options,
       headers: buildHeaders([
         {
@@ -1638,7 +2706,7 @@ class Files extends APIResource {
    */
   retrieveMetadata(fileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/files/${fileID}?beta=true`, {
+    return this._client.get(path`/v1/files/${fileID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "files-api-2025-04-14"].toString() },
@@ -1685,7 +2753,7 @@ let Models$1 = class Models extends APIResource {
    */
   retrieve(modelID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/models/${modelID}?beta=true`, {
+    return this._client.get(path`/v1/models/${modelID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { ...(betas == null ? void 0 : betas.toString()) != null ? { "anthropic-beta": betas == null ? void 0 : betas.toString() } : void 0 },
@@ -1753,7 +2821,7 @@ class UserProfiles extends APIResource {
    */
   retrieve(userProfileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/user_profiles/${userProfileID}?beta=true`, {
+    return this._client.get(path`/v1/user_profiles/${userProfileID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "user-profiles-2026-03-24"].toString() },
@@ -1774,7 +2842,7 @@ class UserProfiles extends APIResource {
    */
   update(userProfileID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/user_profiles/${userProfileID}?beta=true`, {
+    return this._client.post(path`/v1/user_profiles/${userProfileID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -1818,7 +2886,7 @@ class UserProfiles extends APIResource {
    */
   createEnrollmentURL(userProfileID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path$1`/v1/user_profiles/${userProfileID}/enrollment_url?beta=true`, {
+    return this._client.post(path`/v1/user_profiles/${userProfileID}/enrollment_url?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "user-profiles-2026-03-24"].toString() },
@@ -1843,7 +2911,7 @@ let Versions$1 = class Versions extends APIResource {
    */
   list(agentID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path$1`/v1/agents/${agentID}/versions?beta=true`, PageCursor, {
+    return this._client.getAPIList(path`/v1/agents/${agentID}/versions?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -1894,7 +2962,7 @@ class Agents extends APIResource {
    */
   retrieve(agentID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.get(path$1`/v1/agents/${agentID}?beta=true`, {
+    return this._client.get(path`/v1/agents/${agentID}?beta=true`, {
       query,
       ...options,
       headers: buildHeaders([
@@ -1917,7 +2985,7 @@ class Agents extends APIResource {
    */
   update(agentID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/agents/${agentID}?beta=true`, {
+    return this._client.post(path`/v1/agents/${agentID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -1961,7 +3029,7 @@ class Agents extends APIResource {
    */
   archive(agentID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path$1`/v1/agents/${agentID}/archive?beta=true`, {
+    return this._client.post(path`/v1/agents/${agentID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -1986,7 +3054,7 @@ class Memories extends APIResource {
    */
   create(memoryStoreID, params, options) {
     const { view, betas, ...body } = params;
-    return this._client.post(path$1`/v1/memory_stores/${memoryStoreID}/memories?beta=true`, {
+    return this._client.post(path`/v1/memory_stores/${memoryStoreID}/memories?beta=true`, {
       query: { view },
       body,
       ...options,
@@ -2010,7 +3078,7 @@ class Memories extends APIResource {
    */
   retrieve(memoryID, params, options) {
     const { memory_store_id, betas, ...query } = params;
-    return this._client.get(path$1`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
+    return this._client.get(path`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2033,7 +3101,7 @@ class Memories extends APIResource {
    */
   update(memoryID, params, options) {
     const { memory_store_id, view, betas, ...body } = params;
-    return this._client.post(path$1`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
+    return this._client.post(path`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
       query: { view },
       body,
       ...options,
@@ -2058,7 +3126,7 @@ class Memories extends APIResource {
    */
   list(memoryStoreID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path$1`/v1/memory_stores/${memoryStoreID}/memories?beta=true`, PageCursor, {
+    return this._client.getAPIList(path`/v1/memory_stores/${memoryStoreID}/memories?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2081,7 +3149,7 @@ class Memories extends APIResource {
    */
   delete(memoryID, params, options) {
     const { memory_store_id, expected_content_sha256, betas } = params;
-    return this._client.delete(path$1`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
+    return this._client.delete(path`/v1/memory_stores/${memory_store_id}/memories/${memoryID}?beta=true`, {
       query: { expected_content_sha256 },
       ...options,
       headers: buildHeaders([
@@ -2106,7 +3174,7 @@ class MemoryVersions extends APIResource {
    */
   retrieve(memoryVersionID, params, options) {
     const { memory_store_id, betas, ...query } = params;
-    return this._client.get(path$1`/v1/memory_stores/${memory_store_id}/memory_versions/${memoryVersionID}?beta=true`, {
+    return this._client.get(path`/v1/memory_stores/${memory_store_id}/memory_versions/${memoryVersionID}?beta=true`, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2130,7 +3198,7 @@ class MemoryVersions extends APIResource {
    */
   list(memoryStoreID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path$1`/v1/memory_stores/${memoryStoreID}/memory_versions?beta=true`, PageCursor, {
+    return this._client.getAPIList(path`/v1/memory_stores/${memoryStoreID}/memory_versions?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -2153,7 +3221,7 @@ class MemoryVersions extends APIResource {
    */
   redact(memoryVersionID, params, options) {
     const { memory_store_id, betas } = params;
-    return this._client.post(path$1`/v1/memory_stores/${memory_store_id}/memory_versions/${memoryVersionID}/redact?beta=true`, {
+    return this._client.post(path`/v1/memory_stores/${memory_store_id}/memory_versions/${memoryVersionID}/redact?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2201,7 +3269,7 @@ class MemoryStores extends APIResource {
    */
   retrieve(memoryStoreID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/memory_stores/${memoryStoreID}?beta=true`, {
+    return this._client.get(path`/v1/memory_stores/${memoryStoreID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2220,7 +3288,7 @@ class MemoryStores extends APIResource {
    */
   update(memoryStoreID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/memory_stores/${memoryStoreID}?beta=true`, {
+    return this._client.post(path`/v1/memory_stores/${memoryStoreID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -2262,7 +3330,7 @@ class MemoryStores extends APIResource {
    */
   delete(memoryStoreID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path$1`/v1/memory_stores/${memoryStoreID}?beta=true`, {
+    return this._client.delete(path`/v1/memory_stores/${memoryStoreID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2281,7 +3349,7 @@ class MemoryStores extends APIResource {
    */
   archive(memoryStoreID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path$1`/v1/memory_stores/${memoryStoreID}/archive?beta=true`, {
+    return this._client.post(path`/v1/memory_stores/${memoryStoreID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -2381,7 +3449,7 @@ let Batches$1 = class Batches extends APIResource {
    */
   retrieve(messageBatchID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/messages/batches/${messageBatchID}?beta=true`, {
+    return this._client.get(path`/v1/messages/batches/${messageBatchID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "message-batches-2024-09-24"].toString() },
@@ -2434,7 +3502,7 @@ let Batches$1 = class Batches extends APIResource {
    */
   delete(messageBatchID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path$1`/v1/messages/batches/${messageBatchID}?beta=true`, {
+    return this._client.delete(path`/v1/messages/batches/${messageBatchID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "message-batches-2024-09-24"].toString() },
@@ -2466,7 +3534,7 @@ let Batches$1 = class Batches extends APIResource {
    */
   cancel(messageBatchID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path$1`/v1/messages/batches/${messageBatchID}/cancel?beta=true`, {
+    return this._client.post(path`/v1/messages/batches/${messageBatchID}/cancel?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "message-batches-2024-09-24"].toString() },
@@ -3922,7 +4990,7 @@ class Events extends APIResource {
    */
   list(sessionID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path$1`/v1/sessions/${sessionID}/events?beta=true`, PageCursor, {
+    return this._client.getAPIList(path`/v1/sessions/${sessionID}/events?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -3957,7 +5025,7 @@ class Events extends APIResource {
    */
   send(sessionID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/sessions/${sessionID}/events?beta=true`, {
+    return this._client.post(path`/v1/sessions/${sessionID}/events?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -3979,7 +5047,7 @@ class Events extends APIResource {
    */
   stream(sessionID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/sessions/${sessionID}/events/stream?beta=true`, {
+    return this._client.get(path`/v1/sessions/${sessionID}/events/stream?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4004,7 +5072,7 @@ class Resources extends APIResource {
    */
   retrieve(resourceID, params, options) {
     const { session_id, betas } = params;
-    return this._client.get(path$1`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
+    return this._client.get(path`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4029,7 +5097,7 @@ class Resources extends APIResource {
    */
   update(resourceID, params, options) {
     const { session_id, betas, ...body } = params;
-    return this._client.post(path$1`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
+    return this._client.post(path`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4053,7 +5121,7 @@ class Resources extends APIResource {
    */
   list(sessionID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path$1`/v1/sessions/${sessionID}/resources?beta=true`, PageCursor, {
+    return this._client.getAPIList(path`/v1/sessions/${sessionID}/resources?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -4076,7 +5144,7 @@ class Resources extends APIResource {
    */
   delete(resourceID, params, options) {
     const { session_id, betas } = params;
-    return this._client.delete(path$1`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
+    return this._client.delete(path`/v1/sessions/${session_id}/resources/${resourceID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4101,7 +5169,7 @@ class Resources extends APIResource {
    */
   add(sessionID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/sessions/${sessionID}/resources?beta=true`, {
+    return this._client.post(path`/v1/sessions/${sessionID}/resources?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4153,7 +5221,7 @@ class Sessions extends APIResource {
    */
   retrieve(sessionID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/sessions/${sessionID}?beta=true`, {
+    return this._client.get(path`/v1/sessions/${sessionID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4174,7 +5242,7 @@ class Sessions extends APIResource {
    */
   update(sessionID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/sessions/${sessionID}?beta=true`, {
+    return this._client.post(path`/v1/sessions/${sessionID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4218,7 +5286,7 @@ class Sessions extends APIResource {
    */
   delete(sessionID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path$1`/v1/sessions/${sessionID}?beta=true`, {
+    return this._client.delete(path`/v1/sessions/${sessionID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4239,7 +5307,7 @@ class Sessions extends APIResource {
    */
   archive(sessionID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path$1`/v1/sessions/${sessionID}/archive?beta=true`, {
+    return this._client.post(path`/v1/sessions/${sessionID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4263,7 +5331,7 @@ class Versions2 extends APIResource {
    */
   create(skillID, params = {}, options) {
     const { betas, ...body } = params ?? {};
-    return this._client.post(path$1`/v1/skills/${skillID}/versions?beta=true`, multipartFormRequestOptions({
+    return this._client.post(path`/v1/skills/${skillID}/versions?beta=true`, multipartFormRequestOptions({
       body,
       ...options,
       headers: buildHeaders([
@@ -4285,7 +5353,7 @@ class Versions2 extends APIResource {
    */
   retrieve(version, params, options) {
     const { skill_id, betas } = params;
-    return this._client.get(path$1`/v1/skills/${skill_id}/versions/${version}?beta=true`, {
+    return this._client.get(path`/v1/skills/${skill_id}/versions/${version}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "skills-2025-10-02"].toString() },
@@ -4308,7 +5376,7 @@ class Versions2 extends APIResource {
    */
   list(skillID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path$1`/v1/skills/${skillID}/versions?beta=true`, PageCursor, {
+    return this._client.getAPIList(path`/v1/skills/${skillID}/versions?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -4330,7 +5398,7 @@ class Versions2 extends APIResource {
    */
   delete(version, params, options) {
     const { skill_id, betas } = params;
-    return this._client.delete(path$1`/v1/skills/${skill_id}/versions/${version}?beta=true`, {
+    return this._client.delete(path`/v1/skills/${skill_id}/versions/${version}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "skills-2025-10-02"].toString() },
@@ -4373,7 +5441,7 @@ class Skills extends APIResource {
    */
   retrieve(skillID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/skills/${skillID}?beta=true`, {
+    return this._client.get(path`/v1/skills/${skillID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "skills-2025-10-02"].toString() },
@@ -4413,7 +5481,7 @@ class Skills extends APIResource {
    */
   delete(skillID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path$1`/v1/skills/${skillID}?beta=true`, {
+    return this._client.delete(path`/v1/skills/${skillID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "skills-2025-10-02"].toString() },
@@ -4445,7 +5513,7 @@ class Credentials extends APIResource {
    */
   create(vaultID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/vaults/${vaultID}/credentials?beta=true`, {
+    return this._client.post(path`/v1/vaults/${vaultID}/credentials?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4468,7 +5536,7 @@ class Credentials extends APIResource {
    */
   retrieve(credentialID, params, options) {
     const { vault_id, betas } = params;
-    return this._client.get(path$1`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
+    return this._client.get(path`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4490,7 +5558,7 @@ class Credentials extends APIResource {
    */
   update(credentialID, params, options) {
     const { vault_id, betas, ...body } = params;
-    return this._client.post(path$1`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
+    return this._client.post(path`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4514,7 +5582,7 @@ class Credentials extends APIResource {
    */
   list(vaultID, params = {}, options) {
     const { betas, ...query } = params ?? {};
-    return this._client.getAPIList(path$1`/v1/vaults/${vaultID}/credentials?beta=true`, PageCursor, {
+    return this._client.getAPIList(path`/v1/vaults/${vaultID}/credentials?beta=true`, PageCursor, {
       query,
       ...options,
       headers: buildHeaders([
@@ -4537,7 +5605,7 @@ class Credentials extends APIResource {
    */
   delete(credentialID, params, options) {
     const { vault_id, betas } = params;
-    return this._client.delete(path$1`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
+    return this._client.delete(path`/v1/vaults/${vault_id}/credentials/${credentialID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4559,7 +5627,7 @@ class Credentials extends APIResource {
    */
   archive(credentialID, params, options) {
     const { vault_id, betas } = params;
-    return this._client.post(path$1`/v1/vaults/${vault_id}/credentials/${credentialID}/archive?beta=true`, {
+    return this._client.post(path`/v1/vaults/${vault_id}/credentials/${credentialID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4608,7 +5676,7 @@ class Vaults extends APIResource {
    */
   retrieve(vaultID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/vaults/${vaultID}?beta=true`, {
+    return this._client.get(path`/v1/vaults/${vaultID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4629,7 +5697,7 @@ class Vaults extends APIResource {
    */
   update(vaultID, params, options) {
     const { betas, ...body } = params;
-    return this._client.post(path$1`/v1/vaults/${vaultID}?beta=true`, {
+    return this._client.post(path`/v1/vaults/${vaultID}?beta=true`, {
       body,
       ...options,
       headers: buildHeaders([
@@ -4673,7 +5741,7 @@ class Vaults extends APIResource {
    */
   delete(vaultID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.delete(path$1`/v1/vaults/${vaultID}?beta=true`, {
+    return this._client.delete(path`/v1/vaults/${vaultID}?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -4694,7 +5762,7 @@ class Vaults extends APIResource {
    */
   archive(vaultID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.post(path$1`/v1/vaults/${vaultID}/archive?beta=true`, {
+    return this._client.post(path`/v1/vaults/${vaultID}/archive?beta=true`, {
       ...options,
       headers: buildHeaders([
         { "anthropic-beta": [...betas ?? [], "managed-agents-2026-04-01"].toString() },
@@ -5416,7 +6484,7 @@ class Batches2 extends APIResource {
    * ```
    */
   retrieve(messageBatchID, options) {
-    return this._client.get(path$1`/v1/messages/batches/${messageBatchID}`, options);
+    return this._client.get(path`/v1/messages/batches/${messageBatchID}`, options);
   }
   /**
    * List all Message Batches within a Workspace. Most recently created batches are
@@ -5452,7 +6520,7 @@ class Batches2 extends APIResource {
    * ```
    */
   delete(messageBatchID, options) {
-    return this._client.delete(path$1`/v1/messages/batches/${messageBatchID}`, options);
+    return this._client.delete(path`/v1/messages/batches/${messageBatchID}`, options);
   }
   /**
    * Batches may be canceled any time before processing ends. Once cancellation is
@@ -5476,7 +6544,7 @@ class Batches2 extends APIResource {
    * ```
    */
   cancel(messageBatchID, options) {
-    return this._client.post(path$1`/v1/messages/batches/${messageBatchID}/cancel`, options);
+    return this._client.post(path`/v1/messages/batches/${messageBatchID}/cancel`, options);
   }
   /**
    * Streams the results of a Message Batch as a `.jsonl` file.
@@ -5631,7 +6699,7 @@ class Models2 extends APIResource {
    */
   retrieve(modelID, params = {}, options) {
     const { betas } = params ?? {};
-    return this._client.get(path$1`/v1/models/${modelID}`, {
+    return this._client.get(path`/v1/models/${modelID}`, {
       ...options,
       headers: buildHeaders([
         { ...(betas == null ? void 0 : betas.toString()) != null ? { "anthropic-beta": betas == null ? void 0 : betas.toString() } : void 0 },
@@ -6145,129 +7213,43 @@ Anthropic.Completions = Completions;
 Anthropic.Messages = Messages2;
 Anthropic.Models = Models2;
 Anthropic.Beta = Beta;
-const logs = [];
-function addProviderDebugLog(log) {
-  logs.unshift(log);
-  logs.splice(50);
-}
-function listProviderDebugLogs() {
-  return logs;
-}
-function createDebugLogBase(input) {
-  return {
-    ...input,
-    id: `provider-log-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    status: "pending",
-    startedAt: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-const ROOT_MARKERS = ["pnpm-workspace.yaml", "package.json"];
-function readMarkdown(filePath, fallback = "") {
-  const markdownPath = resolveMarkdownPath(filePath);
-  if (!markdownPath) {
-    return fallback;
-  }
-  try {
-    return fs.readFileSync(markdownPath, "utf8");
-  } catch {
-    return fallback;
-  }
-}
-function readMarkdownFiles(filePaths, fallback = "") {
-  const content = filePaths.map((filePath) => readMarkdown(filePath)).filter((item) => item.trim().length > 0).join("\n\n");
-  return content || fallback;
-}
-function resolveMarkdownPath(filePath) {
-  if (path.isAbsolute(filePath)) {
-    return fs.existsSync(filePath) ? filePath : void 0;
-  }
-  const rootDir = findProjectRoot();
-  const normalizedPath = normalizeRelativePath(filePath);
-  const candidatePaths = /* @__PURE__ */ new Set();
-  candidatePaths.add(path.resolve(process.cwd(), filePath));
-  if (rootDir) {
-    candidatePaths.add(path.resolve(rootDir, filePath));
-    candidatePaths.add(path.resolve(rootDir, normalizedPath));
-    candidatePaths.add(path.resolve(rootDir, "packages", normalizedPath));
-  }
-  for (const candidatePath of candidatePaths) {
-    if (fs.existsSync(candidatePath)) {
-      return candidatePath;
-    }
-  }
-  return void 0;
-}
-function normalizeRelativePath(filePath) {
-  return filePath.replace(/\\/g, "/").replace(/^(\.\.\/)+/, "").replace(/^(\.\/)+/, "");
-}
-function findProjectRoot() {
-  let currentDir2 = process.cwd();
-  while (true) {
-    if (ROOT_MARKERS.every((marker) => fs.existsSync(path.join(currentDir2, marker)))) {
-      return currentDir2;
-    }
-    const parentDir = path.dirname(currentDir2);
-    if (parentDir === currentDir2) {
-      return void 0;
-    }
-    currentDir2 = parentDir;
-  }
-}
-const SYSTEM_PROMPT_MODULES = [
-  "packages/memorizes/system/01-role.md",
-  "packages/memorizes/system/02-goals.md",
-  "packages/memorizes/system/03-style.md"
-];
-const INTENT_PROMPT_MODULES = [
-  "packages/memorizes/intent/01-parser.md"
-];
-const INTENT_USER_MODULES = [
-  "packages/memorizes/intent/02-input.md"
-];
-const INTENT_CONTEXT_TEMPLATE = "packages/memorizes/context/intent-result.md";
-function buildIntentSystemPrompt() {
-  return readMarkdownFiles(INTENT_PROMPT_MODULES);
-}
-function buildIntentUserPrompt(messages, latestUserMessage) {
-  return renderTemplate(readMarkdownFiles(INTENT_USER_MODULES), {
-    recent_messages: formatRecentMessages(messages),
-    input: latestUserMessage
-  });
-}
-function buildSystemPrompt() {
-  return readMarkdownFiles(SYSTEM_PROMPT_MODULES, DEFAULT_SYSTEM_PROMPT);
-}
-function buildIntentContextMessage(intentSummary) {
-  return renderTemplate(readMarkdown(INTENT_CONTEXT_TEMPLATE), {
-    intent_result: intentSummary
-  });
-}
-function formatRecentMessages(messages) {
-  return messages.slice(-8).map((message) => `${message.roleLabel}: ${message.content}`).join("\n\n") || "无";
-}
-function renderTemplate(template, values) {
-  return Object.entries(values).reduce((content, [key, value]) => {
-    return content.replaceAll(`{{${key}}}`, value);
-  }, template);
-}
 async function streamMimoChat(input) {
+  const config = getModelRuntimeConfig("main");
+  const systemPrompt = buildSystemPrompt();
+  if (config.providerKind === "openai-compatible") {
+    const runtimeContext = [
+      input.conversationSummary ? formatConversationSummary(input.conversationSummary) : "",
+      buildIntentContextMessage(input.intentSummary)
+    ].filter((item) => item.trim().length > 0).join("\n\n---\n\n");
+    return streamOpenAiChat({
+      config,
+      system: systemPrompt,
+      messages: trimCompressedMessages(input.messages, input.conversationSummary),
+      runtimeContext,
+      latestUserMessage: input.latestUserMessage,
+      onDelta: input.onDelta
+    });
+  }
+  if (config.providerKind !== "anthropic-compatible") {
+    throw new Error(`主模型当前只支持 anthropic-compatible 或 openai-compatible，实际配置为：${config.providerKind}`);
+  }
   const startedAtMs = Date.now();
   const requestBody = {
-    model: MIMO_MODEL,
-    max_tokens: MIMO_MAX_TOKENS,
-    system: buildSystemPrompt(),
-    messages: buildMimoMessages(input.messages, input.intentSummary),
+    model: config.model,
+    max_tokens: config.maxTokens,
+    system: systemPrompt,
+    messages: buildMimoMessages(input.messages, input.intentSummary, input.conversationSummary),
     top_p: 0.95,
     stream: true,
-    temperature: 1
+    temperature: config.temperature
   };
   const debugLog = createDebugLogBase({
-    providerId: "mimo-anthropic",
-    model: MIMO_MODEL,
-    baseURL: MIMO_BASE_URL,
+    providerId: "main-anthropic-compatible",
+    model: config.model,
+    baseURL: config.baseURL,
     request: {
       method: "POST",
-      endpoint: `${MIMO_BASE_URL}/v1/messages`,
+      endpoint: `${config.baseURL}/v1/messages`,
       headers: {
         "content-type": "application/json",
         "x-api-key": "[redacted]",
@@ -6278,20 +7260,23 @@ async function streamMimoChat(input) {
       latestUserMessage: input.latestUserMessage
     }
   });
-  const apiKey = getMimoApiKey();
+  const apiKey = config.apiKey;
   if (!apiKey) {
     addProviderDebugLog({
       ...debugLog,
       status: "failed",
       completedAt: (/* @__PURE__ */ new Date()).toISOString(),
       durationMs: Date.now() - startedAtMs,
-      error: "未检测到 MiMo API Key。"
+      error: "未检测到主模型 API Key。"
     });
-    return "未检测到 MiMo API Key。请复制 config/secrets.example.json 为 config/secrets.local.json，并填写 mimoApiKey；或配置环境变量 MIMO_API_KEY 后重新启动应用。";
+    return {
+      content: "未检测到主模型 API Key。请打开模型配置，填写 main 模型的 API Key 后重新发送。",
+      stopReason: "missing_api_key"
+    };
   }
   const client = new Anthropic({
     apiKey: apiKey.trim(),
-    baseURL: MIMO_BASE_URL
+    baseURL: config.baseURL
   });
   try {
     let content = "";
@@ -6312,7 +7297,11 @@ async function streamMimoChat(input) {
         usage: finalMessage.usage
       }
     });
-    return content;
+    return {
+      content,
+      stopReason: finalMessage.stop_reason ?? void 0,
+      usage: finalMessage.usage
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     addProviderDebugLog({
@@ -6325,8 +7314,67 @@ async function streamMimoChat(input) {
     throw new Error(toMimoErrorMessage(message));
   }
 }
-function buildMimoMessages(messages, intentSummary) {
-  const conversationMessages = messages.filter((message) => message.sender === "user" || message.sender === "assistant").map((message) => ({
+function buildMimoMessages(messages, intentSummary, conversationSummary) {
+  const activeMessages = trimCompressedMessages(messages, conversationSummary);
+  const conversationMessages = toAnthropicMessages(activeMessages);
+  const latestUserMessage = conversationMessages.at(-1);
+  const historyMessages = latestUserMessage ? conversationMessages.slice(0, -1) : conversationMessages;
+  const summaryContextMessage = conversationSummary ? {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text: formatConversationSummary(conversationSummary)
+      }
+    ]
+  } : void 0;
+  const runtimeContextMessage = {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text: buildIntentContextMessage(intentSummary)
+      }
+    ]
+  };
+  const stableContextMessages = summaryContextMessage ? [summaryContextMessage] : [];
+  if (!latestUserMessage) {
+    return [...stableContextMessages, runtimeContextMessage];
+  }
+  return [...stableContextMessages, ...historyMessages, runtimeContextMessage, latestUserMessage];
+}
+function trimCompressedMessages(messages, conversationSummary) {
+  if (!conversationSummary) {
+    return messages;
+  }
+  const sourceEndIndex = messages.findIndex((message) => message.id === conversationSummary.sourceEndMessageId);
+  return sourceEndIndex >= 0 ? messages.slice(sourceEndIndex + 1) : messages;
+}
+function formatConversationSummary(summary) {
+  return [
+    "【会话压缩摘要】",
+    "",
+    "以下内容是系统根据较早真实对话生成的会话摘要，不是用户本轮输入。它用于替代已从上下文中裁剪的早期对话。",
+    "",
+    `覆盖范围：${summary.sourceStartMessageId} -> ${summary.sourceEndMessageId}`,
+    "",
+    "摘要：",
+    summary.summary,
+    "",
+    formatList("已确认决策", summary.decisions),
+    formatList("未确认问题", summary.openQuestions),
+    formatList("约束与偏好", summary.constraints),
+    formatList("任务进度", summary.taskProgress)
+  ].filter((item) => item.trim().length > 0).join("\n");
+}
+function formatList(label, items) {
+  if (items.length === 0) {
+    return "";
+  }
+  return [`${label}：`, ...items.map((item) => `- ${item}`)].join("\n");
+}
+function toAnthropicMessages(messages) {
+  return messages.filter((message) => message.sender === "user" || message.sender === "assistant").map((message) => ({
     role: message.sender === "assistant" ? "assistant" : "user",
     content: [
       {
@@ -6335,30 +7383,40 @@ function buildMimoMessages(messages, intentSummary) {
       }
     ]
   }));
-  return [
-    {
-      role: "user",
-      content: [
-        {
-          type: "text",
-          text: buildIntentContextMessage(intentSummary)
-        }
-      ]
-    },
-    ...conversationMessages
-  ];
 }
 function toMimoErrorMessage(message) {
   if (message.includes("401") || message.toLowerCase().includes("invalid api key")) {
-    return "MiMo 服务返回 401：API Key 无效。请确认 config/secrets.local.json 中的 mimoApiKey 是小米 MiMo 平台生成的有效 Key，并且该 Key 有权限调用 mimo-v2.5-pro。";
+    return "主模型服务返回 401：API Key 无效。请确认模型配置中的 API Key、Base URL 和模型名正确。";
   }
-  return `MiMo 调用失败：${message}`;
+  return `主模型调用失败：${message}`;
 }
 async function recognizeIntent(messages, latestUserMessage) {
   var _a2;
   const startedAtMs = Date.now();
+  const config = getModelRuntimeConfig("router");
+  if (config.providerKind === "openai-compatible") {
+    const content2 = await createOpenAiJsonChat({
+      config,
+      providerId: "router-openai-compatible",
+      latestUserMessage,
+      messages: [
+        {
+          role: "system",
+          content: buildIntentSystemPrompt()
+        },
+        {
+          role: "user",
+          content: buildIntentUserPrompt(messages, latestUserMessage)
+        }
+      ]
+    });
+    return parseRouterResult(content2);
+  }
+  if (config.providerKind !== "ollama") {
+    throw new Error(`Router 当前只支持 ollama 或 openai-compatible，实际配置为：${config.providerKind}`);
+  }
   const requestBody = {
-    model: OLLAMA_INTENT_MODEL,
+    model: config.model,
     stream: false,
     messages: [
       {
@@ -6371,17 +7429,17 @@ async function recognizeIntent(messages, latestUserMessage) {
       }
     ],
     options: {
-      temperature: 0.2,
-      num_predict: 512
+      temperature: config.temperature,
+      num_predict: config.maxTokens
     }
   };
   const debugLog = createDebugLogBase({
     providerId: "ollama-intent",
-    model: OLLAMA_INTENT_MODEL,
-    baseURL: OLLAMA_BASE_URL,
+    model: config.model,
+    baseURL: config.baseURL,
     request: {
       method: "POST",
-      endpoint: `${OLLAMA_BASE_URL}/api/chat`,
+      endpoint: `${config.baseURL}/api/chat`,
       headers: {
         "content-type": "application/json"
       },
@@ -6390,7 +7448,7 @@ async function recognizeIntent(messages, latestUserMessage) {
       latestUserMessage
     }
   });
-  const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+  const response = await fetch(`${config.baseURL}/api/chat`, {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -6401,30 +7459,41 @@ async function recognizeIntent(messages, latestUserMessage) {
     throw new Error(`Ollama HTTP ${response.status}: ${await response.text()}`);
   }
   const data = await response.json();
-  const summary = (((_a2 = data.message) == null ? void 0 : _a2.content) ?? data.response ?? "").trim();
-  const intentResult = parseIntentResult(summary);
+  const content = (((_a2 = data.message) == null ? void 0 : _a2.content) ?? data.response ?? "").trim();
+  const routerResult = parseRouterResult(content);
   addProviderDebugLog({
     ...debugLog,
     status: "succeeded",
     completedAt: (/* @__PURE__ */ new Date()).toISOString(),
     durationMs: Date.now() - startedAtMs,
     response: {
-      content: summary
+      content
     }
   });
-  return JSON.stringify(intentResult, null, 2);
+  return routerResult;
 }
-function parseIntentResult(content) {
+function parseRouterResult(content) {
   const parsed = JSON.parse(content);
   const allowedIntents = ["code", "chat", "search", "debug", "analysis"];
   const intent = normalizeIntent(parsed.intent, allowedIntents);
   if (!intent) {
     throw new Error(`意图识别结果无效：intent 必须是 ${allowedIntents.join(" | ")} 之一。实际返回：${content}`);
   }
+  const taskType = normalizeTaskType(parsed.task_type) ?? defaultTaskTypeForIntent(intent);
+  const needsTools = toBoolean(parsed.needs_tools);
+  const suggestedTools = normalizeSuggestedTools(parsed.suggested_tools, needsTools);
   return {
-    rewritten_input: parsed.rewritten_input ?? "",
     intent,
-    keywords: Array.isArray(parsed.keywords) ? parsed.keywords : []
+    rewritten_input: toStringValue(parsed.rewritten_input),
+    keywords: toStringArray(parsed.keywords),
+    is_task: toBoolean(parsed.is_task),
+    task_goal: toStringValue(parsed.task_goal),
+    task_type: taskType,
+    requires_project_context: toBoolean(parsed.requires_project_context),
+    needs_tools: needsTools,
+    suggested_tools: suggestedTools,
+    tool_reason: toStringValue(parsed.tool_reason),
+    confidence: clampConfidence(parsed.confidence)
   };
 }
 function normalizeIntent(intent, allowedIntents) {
@@ -6439,14 +7508,209 @@ function normalizeIntent(intent, allowedIntents) {
   const firstAllowedIntent = candidates.find((item) => allowedIntents.includes(item));
   return firstAllowedIntent;
 }
+function normalizeTaskType(taskType) {
+  const allowedTaskTypes = [
+    "chat",
+    "analysis",
+    "design",
+    "implementation",
+    "debugging",
+    "verification"
+  ];
+  if (typeof taskType !== "string") {
+    return void 0;
+  }
+  const exactTaskType = taskType.trim();
+  if (allowedTaskTypes.includes(exactTaskType)) {
+    return exactTaskType;
+  }
+  const candidates = exactTaskType.split("|").map((item) => item.trim());
+  return candidates.find((item) => allowedTaskTypes.includes(item));
+}
+function defaultTaskTypeForIntent(intent) {
+  if (intent === "code") {
+    return "implementation";
+  }
+  if (intent === "debug") {
+    return "debugging";
+  }
+  if (intent === "chat") {
+    return "chat";
+  }
+  return "analysis";
+}
+function toBoolean(value) {
+  return value === true;
+}
+function toStringValue(value) {
+  return typeof value === "string" ? value : "";
+}
+function toStringArray(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+function normalizeSuggestedTools(value, needsTools) {
+  const tools = toStringArray(value).filter((tool) => tool === "command.run");
+  if (needsTools && tools.length === 0) {
+    return ["command.run"];
+  }
+  return tools;
+}
+function clampConfidence(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(1, value));
+}
+const JSON_FENCE_PATTERN = /```(?:json)?\s*([\s\S]*?)```/gi;
+function parseCommandRunRequests(content) {
+  const candidates = collectJsonCandidates(content);
+  const requests = [];
+  for (const candidate of candidates) {
+    const parsed = parseJson(candidate);
+    collectRequests(parsed, requests);
+  }
+  return requests.slice(0, 8);
+}
+function removeCommandRunRequestBlocks(content) {
+  const withoutFencedRequests = content.replace(JSON_FENCE_PATTERN, (block, jsonContent) => {
+    const parsed2 = parseJson((jsonContent ?? "").trim());
+    const requests2 = [];
+    collectRequests(parsed2, requests2);
+    return requests2.length > 0 ? "" : block;
+  });
+  const trimmed = withoutFencedRequests.trim();
+  const parsed = parseJson(trimmed);
+  const requests = [];
+  collectRequests(parsed, requests);
+  if (requests.length > 0) {
+    return "";
+  }
+  return withoutFencedRequests.trim();
+}
+function collectJsonCandidates(content) {
+  var _a2;
+  const candidates = [];
+  let match;
+  while (match = JSON_FENCE_PATTERN.exec(content)) {
+    candidates.push(((_a2 = match[1]) == null ? void 0 : _a2.trim()) ?? "");
+  }
+  const trimmed = content.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    candidates.push(trimmed);
+  }
+  return candidates.filter((candidate) => candidate.length > 0);
+}
+function parseJson(content) {
+  try {
+    return JSON.parse(content);
+  } catch {
+    return void 0;
+  }
+}
+function collectRequests(value, requests) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectRequests(item, requests));
+    return;
+  }
+  if (!isObject(value)) {
+    return;
+  }
+  if (value.type === "command.run") {
+    const request = toCommandRunRequest(value);
+    if (request) {
+      requests.push(request);
+    }
+  }
+  for (const item of Object.values(value)) {
+    collectRequests(item, requests);
+  }
+}
+function toCommandRunRequest(value) {
+  if (typeof value.command !== "string" || value.command.trim().length === 0) {
+    return void 0;
+  }
+  return {
+    type: "command.run",
+    reason: typeof value.reason === "string" ? value.reason : "",
+    shell: "powershell",
+    cwd: typeof value.cwd === "string" && value.cwd.trim().length > 0 ? value.cwd : resolveProjectPath(),
+    command: value.command
+  };
+}
+function isObject(value) {
+  return typeof value === "object" && value !== null;
+}
+const ROUTER_CONFIDENCE_THRESHOLD = 0.7;
+const COMMAND_RUN = "command.run";
+function selectToolsForRouter(routerResult) {
+  const routerConfidence = routerResult.confidence;
+  if (routerConfidence < ROUTER_CONFIDENCE_THRESHOLD) {
+    return noTools(routerResult, "Router 置信度低于阈值，Core 保守处理，不自动开放工具。");
+  }
+  if (routerResult.intent === "chat") {
+    return noTools(routerResult, "普通聊天不需要开放工具。");
+  }
+  if (routerResult.intent === "search") {
+    return noTools(routerResult, "当前阶段尚未实现 web.search，因此不开放搜索工具。");
+  }
+  if (!routerResult.needs_tools && routerResult.suggested_tools.length === 0) {
+    return noTools(routerResult, "Router 判断本轮不需要工具。");
+  }
+  if (!routerResult.needs_tools && routerResult.intent === "analysis" && !routerResult.requires_project_context) {
+    return noTools(routerResult, "普通分析不需要读取项目上下文。");
+  }
+  if (!routerResult.suggested_tools.includes(COMMAND_RUN) && !routerResult.needs_tools) {
+    return noTools(routerResult, "Router 没有建议当前可用工具。");
+  }
+  return {
+    selected_tools: [COMMAND_RUN],
+    access_mode: resolveAccessMode(routerResult),
+    reason: buildReason(routerResult),
+    confidence_threshold: ROUTER_CONFIDENCE_THRESHOLD,
+    router_confidence: routerConfidence,
+    auto_allowed: true
+  };
+}
+function noTools(routerResult, reason) {
+  return {
+    selected_tools: [],
+    access_mode: "none",
+    reason,
+    confidence_threshold: ROUTER_CONFIDENCE_THRESHOLD,
+    router_confidence: routerResult.confidence,
+    auto_allowed: false
+  };
+}
+function resolveAccessMode(routerResult) {
+  if (routerResult.intent === "code" || routerResult.task_type === "implementation") {
+    return "project_write";
+  }
+  if (routerResult.intent === "debug" || routerResult.task_type === "debugging" || routerResult.task_type === "verification") {
+    return "project_verify";
+  }
+  return "project_read";
+}
+function buildReason(routerResult) {
+  if (routerResult.tool_reason) {
+    return routerResult.tool_reason;
+  }
+  if (routerResult.intent === "code") {
+    return "本轮需要推进代码实现，允许后续 Command Gateway 在项目范围内处理读写和验证命令。";
+  }
+  if (routerResult.intent === "debug") {
+    return "本轮需要定位问题，允许后续 Command Gateway 在项目范围内读取文件并执行验证命令。";
+  }
+  return "本轮需要项目上下文，允许后续 Command Gateway 进行项目只读检查。";
+}
 function listModelProfiles() {
+  const mainConfig = getModelRuntimeConfig("main");
   return [
     {
       id: "mimo-v2-5-pro",
-      providerId: "mimo-anthropic",
-      label: "MiMo v2.5 Pro",
-      model: MIMO_MODEL,
-      status: getMimoApiKey() ? "configured" : "missing-config",
+      providerId: mainConfig.providerKind,
+      label: mainConfig.label || "Main Model",
+      model: mainConfig.model || MIMO_MODEL,
+      status: mainConfig.providerKind === "ollama" || mainConfig.apiKey ? "configured" : "missing-config",
       capabilities: {
         chat: true,
         streamChat: true,
@@ -6477,31 +7741,70 @@ async function sendChatMessage(request) {
 async function streamChatMessage(request, onEvent) {
   const now = (/* @__PURE__ */ new Date()).toISOString();
   const session = getOrCreateSession(request, now);
-  const userMessage = createUserMessage(request.message, now);
-  const messages = [...session.messages, userMessage];
-  const assistantMessageId = `msg-assistant-${Date.now()}`;
-  onEvent({
-    type: "stage",
-    label: "意图识别",
-    detail: `正在调用本地 Ollama 小模型 ${OLLAMA_INTENT_MODEL}`
-  });
-  const intentSummary = await recognizeIntent(messages, request.message);
-  onEvent({
-    type: "stage",
-    label: "大模型对话",
-    detail: "正在将意图识别结果组装进 MiMo 上下文"
-  });
-  onEvent({
-    type: "start",
-    sessionId: session.id,
-    messageId: assistantMessageId,
-    roleLabel: "MiMo"
-  });
+  let currentStage = "会话压缩";
   try {
-    const content = await streamMimoChat({
+    onEvent({
+      type: "stage",
+      label: "会话压缩",
+      detail: "正在检查是否需要压缩较早对话"
+    });
+    const conversationSummary = await maybeCompressConversation({
+      projectId: session.projectId,
+      sessionId: session.id,
+      messages: session.messages
+    });
+    const userMessage = createUserMessage(request.message, now);
+    const messages = [...session.messages, userMessage];
+    const assistantMessageId = `msg-assistant-${Date.now()}`;
+    const routerConfig = getModelRuntimeConfig("router");
+    saveChatMessageEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      message: userMessage
+    });
+    currentStage = "意图识别";
+    onEvent({
+      type: "stage",
+      label: currentStage,
+      detail: `正在调用 ${routerConfig.label} (${routerConfig.model})`
+    });
+    const routerResult = await recognizeIntent(messages, request.message);
+    saveRouterResultEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      content: JSON.stringify(routerResult, null, 2)
+    });
+    const toolSelection = selectToolsForRouter(routerResult);
+    saveToolSelectionEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      result: toolSelection
+    });
+    const runtimeContext = JSON.stringify(
+      {
+        router: routerResult,
+        tool_selection: toolSelection
+      },
+      null,
+      2
+    );
+    currentStage = "大模型对话";
+    onEvent({
+      type: "stage",
+      label: currentStage,
+      detail: `Router: ${routerResult.intent} / ${routerResult.task_type} / tools ${toolSelection.selected_tools.join(", ") || "none"}`
+    });
+    onEvent({
+      type: "start",
+      sessionId: session.id,
+      messageId: assistantMessageId,
+      roleLabel: "MiMo"
+    });
+    const modelResponse = await streamMimoChat({
       messages,
       latestUserMessage: request.message,
-      intentSummary,
+      intentSummary: runtimeContext,
+      conversationSummary,
       onDelta: (delta) => {
         onEvent({
           type: "delta",
@@ -6511,18 +7814,202 @@ async function streamChatMessage(request, onEvent) {
         });
       }
     });
+    saveModelReturnEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      stopReason: modelResponse.stopReason,
+      usage: modelResponse.usage
+    });
+    const visibleModelContent = removeCommandRunRequestBlocks(modelResponse.content);
+    const shouldReplaceVisibleContent = visibleModelContent !== modelResponse.content;
+    if (shouldReplaceVisibleContent) {
+      onEvent({
+        type: "replace",
+        sessionId: session.id,
+        messageId: assistantMessageId,
+        content: visibleModelContent
+      });
+    }
+    const toolResults = await runRequestedCommands({
+      content: modelResponse.content,
+      projectId: session.projectId,
+      sessionId: session.id,
+      toolSelection,
+      onEvent,
+      assistantMessageId
+    });
+    const followupResponse = toolResults.length > 0 ? await streamToolResultFollowup({
+      baseMessages: messages,
+      assistantMessageId,
+      firstAssistantContent: visibleModelContent,
+      projectId: session.projectId,
+      sessionId: session.id,
+      runtimeContext,
+      toolResults,
+      onEvent
+    }) : void 0;
+    const followupContent = followupResponse ? `
+
+【工具结果整理】
+${followupResponse.content}` : "";
+    const content = appendModelReturnNotice(
+      `${visibleModelContent}${followupContent}`,
+      (followupResponse == null ? void 0 : followupResponse.stopReason) ?? modelResponse.stopReason
+    );
     const result = appendAssistantMessage(session, messages, assistantMessageId, "MiMo", content);
+    saveChatMessageEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      message: result.assistantMessage
+    });
     onEvent({
       type: "done",
       session: result.session,
       assistantMessage: result.assistantMessage
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    saveErrorEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      message,
+      stage: currentStage
+    });
     onEvent({
       type: "error",
-      error: error instanceof Error ? error.message : String(error)
+      error: message
     });
   }
+}
+function appendModelReturnNotice(content, stopReason) {
+  if (stopReason !== "max_tokens") {
+    return content;
+  }
+  return [
+    content.trimEnd(),
+    "",
+    "[系统提示：本次回复达到 max_tokens 输出上限，内容可能被截断。可以输入“继续”让我接着补完。]"
+  ].join("\n");
+}
+async function streamToolResultFollowup(input) {
+  const toolReport = formatToolResults(input.toolResults);
+  const followupMessages = [
+    ...input.baseMessages,
+    {
+      id: `msg-tool-request-${Date.now()}`,
+      sender: "assistant",
+      roleLabel: "MiMo",
+      content: input.firstAssistantContent,
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    },
+    {
+      id: `msg-tool-result-${Date.now()}`,
+      sender: "user",
+      roleLabel: "系统工具结果",
+      content: [
+        "以下是本轮工具执行结果。这不是用户的新输入，而是本地 Command Gateway 返回的观察结果。",
+        "",
+        "请基于这些结果给用户一个简洁的最终回应。",
+        "不要继续请求工具，不要重复前面的 command.run JSON。",
+        "",
+        toolReport
+      ].join("\n"),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    }
+  ];
+  input.onEvent({
+    type: "stage",
+    label: "工具结果整理",
+    detail: "正在让 MiMo 基于工具结果生成最终回应"
+  });
+  input.onEvent({
+    type: "delta",
+    sessionId: input.sessionId,
+    messageId: input.assistantMessageId,
+    delta: "\n\n【工具结果整理】\n"
+  });
+  const response = await streamMimoChat({
+    messages: followupMessages,
+    latestUserMessage: "系统工具结果",
+    intentSummary: JSON.stringify(
+      {
+        phase: "tool_result_followup",
+        previous_runtime_context: JSON.parse(input.runtimeContext),
+        tool_results: input.toolResults
+      },
+      null,
+      2
+    ),
+    onDelta: (delta) => {
+      input.onEvent({
+        type: "delta",
+        sessionId: input.sessionId,
+        messageId: input.assistantMessageId,
+        delta
+      });
+    }
+  });
+  saveModelReturnEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    stopReason: response.stopReason,
+    usage: response.usage
+  });
+  return response;
+}
+async function runRequestedCommands(input) {
+  const requests = parseCommandRunRequests(input.content);
+  const results = [];
+  if (requests.length === 0) {
+    return results;
+  }
+  input.onEvent({
+    type: "stage",
+    label: "工具执行",
+    detail: `检测到 ${requests.length} 个 command.run 请求，正在交给 Command Gateway`
+  });
+  for (const request of requests) {
+    saveToolCallEvent({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      request
+    });
+    const result = await runCommandThroughGateway({
+      request,
+      toolSelection: input.toolSelection
+    });
+    saveToolResultEvent({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      result
+    });
+    results.push(result);
+  }
+  return results;
+}
+function formatToolResults(results) {
+  if (results.length === 0) {
+    return "";
+  }
+  return [
+    "",
+    "",
+    "【系统工具执行结果】",
+    ...results.map((result, index) => {
+      return [
+        "",
+        `#${index + 1} ${result.request.command}`,
+        `decision: ${result.decision}`,
+        `status: ${result.status}`,
+        `reason: ${result.reason}`,
+        typeof result.exitCode === "number" ? `exitCode: ${result.exitCode}` : "",
+        result.stdout ? `stdout:
+${result.stdout}` : "",
+        result.stderr ? `stderr:
+${result.stderr}` : ""
+      ].filter((line) => line.length > 0).join("\n");
+    })
+  ].join("\n");
 }
 function createUserMessage(content, createdAt) {
   return {
@@ -6534,11 +8021,11 @@ function createUserMessage(content, createdAt) {
   };
 }
 const currentFile = fileURLToPath(import.meta.url);
-const currentDir = path.dirname(currentFile);
-process.env.APP_ROOT = path.join(currentDir, "..");
+const currentDir = path$1.dirname(currentFile);
+process.env.APP_ROOT = path$1.join(currentDir, "..");
 const viteDevServerUrl = process.env.VITE_DEV_SERVER_URL;
-const rendererDist = path.join(process.env.APP_ROOT, "dist");
-const preloadPath = path.join(currentDir, "preload.cjs");
+const rendererDist = path$1.join(process.env.APP_ROOT, "dist");
+const preloadPath = path$1.join(currentDir, "preload.cjs");
 let mainWindow = null;
 async function createWindow() {
   mainWindow = new BrowserWindow({
@@ -6547,7 +8034,7 @@ async function createWindow() {
     height: 880,
     minWidth: 1120,
     minHeight: 720,
-    backgroundColor: "#f6f3ee",
+    backgroundColor: "#0f1316",
     webPreferences: {
       preload: preloadPath,
       nodeIntegration: false,
@@ -6559,7 +8046,7 @@ async function createWindow() {
     await mainWindow.loadURL(viteDevServerUrl);
     mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
-    await mainWindow.loadFile(path.join(rendererDist, "index.html"));
+    await mainWindow.loadFile(path$1.join(rendererDist, "index.html"));
   }
 }
 app.whenReady().then(async () => {
@@ -6585,10 +8072,26 @@ function registerIpcHandlers() {
   });
   ipcMain.handle("workbench:stream-chat-message", async (event, request) => {
     await streamChatMessage(request, (streamEvent) => {
-      event.sender.send("workbench:chat-stream-event", streamEvent);
+      if (!event.sender.isDestroyed()) {
+        event.sender.send("workbench:chat-stream-event", streamEvent);
+      }
     });
+    return { ok: true };
   });
   ipcMain.handle("workbench:list-provider-debug-logs", () => {
     return listProviderDebugLogs();
+  });
+  ipcMain.handle("workbench:list-session-events", (_event, request) => {
+    return listSessionEvents({
+      projectId: request.projectId,
+      sessionId: request.sessionId,
+      limit: 100
+    });
+  });
+  ipcMain.handle("workbench:get-model-runtime-settings", () => {
+    return getModelRuntimeSettings();
+  });
+  ipcMain.handle("workbench:save-model-runtime-settings", (_event, settings) => {
+    return saveModelRuntimeSettings(settings);
   });
 }

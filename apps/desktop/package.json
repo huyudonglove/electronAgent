@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build --emptyOutDir",
+    "rebuild:native": "electron-rebuild -f -w better-sqlite3",
     "preview": "vite preview --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit"
@@ -15,6 +16,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "@xiaomi/core": "workspace:*",
     "@xiaomi/shared": "workspace:*",
+    "better-sqlite3": "^12.10.0",
     "electron": "^33.2.1",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
@@ -23,6 +25,7 @@
     "vite-plugin-electron": "^0.29.0"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.0.4",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "typescript": "^5.7.2"

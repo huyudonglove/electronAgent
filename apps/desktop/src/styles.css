@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   font-family:
     Inter,
     "Microsoft YaHei",
@@ -8,8 +9,26 @@
     BlinkMacSystemFont,
     "Segoe UI",
     sans-serif;
-  color: #252a2e;
-  background: #fbfaf7;
+  color: #e7ecef;
+  background: #0f1316;
+  --bg: #0f1316;
+  --panel: #151a1f;
+  --panel-strong: #1b2229;
+  --panel-soft: #12171b;
+  --surface: #1a2026;
+  --surface-raised: #202832;
+  --surface-code: #0b0f12;
+  --border: #2d3742;
+  --border-strong: #3b4854;
+  --text: #e7ecef;
+  --text-muted: #9aa7b2;
+  --text-soft: #75828d;
+  --accent: #49b7a8;
+  --accent-strong: #63d3c4;
+  --accent-soft: #14352f;
+  --danger: #ff8a7a;
+  --danger-soft: #361b1d;
+  --shadow: rgb(0 0 0 / 36%);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -39,26 +58,33 @@ textarea {
   width: 100%;
   height: 100%;
   min-height: 520px;
-  background: #fbfaf7;
+  background:
+    radial-gradient(circle at top left, rgb(73 183 168 / 10%), transparent 34%),
+    var(--bg);
 }
 
-.debug-toggle {
+.top-actions {
   position: absolute;
   top: 16px;
   right: 18px;
   z-index: 4;
+  display: flex;
+  gap: 8px;
+}
+
+.debug-toggle {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  border: 1px solid #d8d1c7;
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 11px;
-  background: #ffffff;
-  color: #4b5658;
+  background: var(--surface-raised);
+  color: var(--text);
   cursor: pointer;
   font-size: 13px;
   font-weight: 800;
-  box-shadow: 0 8px 24px rgb(44 39 32 / 8%);
+  box-shadow: 0 10px 26px var(--shadow);
 }
 
 .minimal-chat__messages {
@@ -81,46 +107,46 @@ textarea {
 
 .minimal-message__meta {
   margin-bottom: 6px;
-  color: #7a746c;
+  color: var(--text-muted);
   font-size: 12px;
 }
 
 .minimal-message p {
   margin: 0;
-  border: 1px solid #ded8ce;
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 13px 15px;
-  background: #ffffff;
-  color: #292f31;
+  background: var(--surface);
+  color: var(--text);
   font-size: 14px;
   line-height: 1.7;
   white-space: pre-wrap;
 }
 
 .minimal-message--user p {
-  background: #eaf6f3;
-  border-color: #c9e2dc;
+  background: var(--accent-soft);
+  border-color: #236b61;
 }
 
 .minimal-chat__error {
   justify-self: center;
   width: min(760px, 100%);
-  border: 1px solid #efb5aa;
+  border: 1px solid #8f3d37;
   border-radius: 8px;
   padding: 11px 13px;
-  background: #fde9e4;
-  color: #9a2d1f;
+  background: var(--danger-soft);
+  color: var(--danger);
   font-size: 13px;
 }
 
 .minimal-chat__stage {
   justify-self: center;
   width: min(760px, 100%);
-  border: 1px solid #cbded8;
+  border: 1px solid #286e65;
   border-radius: 8px;
   padding: 10px 12px;
-  background: #edf7f4;
-  color: #1f5e57;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
   font-size: 13px;
   font-weight: 750;
 }
@@ -138,13 +164,17 @@ textarea {
   min-height: 54px;
   max-height: 180px;
   resize: vertical;
-  border: 1px solid #d8d1c7;
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 14px;
-  background: #ffffff;
-  color: #232b2d;
+  background: var(--surface);
+  color: var(--text);
   line-height: 1.55;
-  box-shadow: 0 8px 24px rgb(44 39 32 / 8%);
+  box-shadow: 0 10px 30px var(--shadow);
+}
+
+.minimal-composer textarea::placeholder {
+  color: var(--text-soft);
 }
 
 .minimal-composer button {
@@ -156,8 +186,8 @@ textarea {
   align-self: end;
   border: 0;
   border-radius: 8px;
-  background: #1f6f68;
-  color: #ffffff;
+  background: var(--accent);
+  color: #07100f;
   cursor: pointer;
 }
 
@@ -175,9 +205,9 @@ textarea {
   grid-template-rows: auto minmax(0, 1fr);
   width: min(520px, 100%);
   height: 100%;
-  border-left: 1px solid #d8d1c7;
-  background: #fffdf8;
-  box-shadow: -16px 0 36px rgb(44 39 32 / 16%);
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+  box-shadow: -18px 0 40px rgb(0 0 0 / 42%);
 }
 
 .debug-drawer header {
@@ -186,7 +216,7 @@ textarea {
   justify-content: space-between;
   gap: 12px;
   padding: 16px;
-  border-bottom: 1px solid #ded8ce;
+  border-bottom: 1px solid var(--border);
 }
 
 .debug-drawer h2,
@@ -195,13 +225,13 @@ textarea {
 }
 
 .debug-drawer h2 {
-  color: #252a2e;
+  color: var(--text);
   font-size: 17px;
 }
 
 .debug-drawer p {
   margin-top: 5px;
-  color: #746c62;
+  color: var(--text-muted);
   font-size: 12px;
 }
 
@@ -218,9 +248,33 @@ textarea {
   height: 34px;
   border: 0;
   border-radius: 7px;
-  background: #ede7dc;
-  color: #384244;
+  background: var(--surface-raised);
+  color: var(--text);
   cursor: pointer;
+}
+
+.debug-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 12px 14px 0;
+}
+
+.debug-tabs button {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px 10px;
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.debug-tabs button[data-active="true"] {
+  border-color: #2a8175;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
 }
 
 .debug-log-list {
@@ -230,10 +284,10 @@ textarea {
 }
 
 .debug-log {
-  border: 1px solid #ded8ce;
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px;
-  background: #fffaf3;
+  background: var(--surface);
 }
 
 .debug-log + .debug-log {
@@ -250,15 +304,15 @@ textarea {
 .debug-log__top span {
   border-radius: 999px;
   padding: 3px 8px;
-  background: #e8ece7;
-  color: #476057;
+  background: #20312e;
+  color: var(--accent-strong);
   font-size: 11px;
   font-weight: 800;
 }
 
 .debug-log__top span[data-status="failed"] {
-  background: #fde9e4;
-  color: #9a2d1f;
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .debug-log dl {
@@ -281,12 +335,12 @@ textarea {
 }
 
 .debug-log dt {
-  color: #7d746b;
+  color: var(--text-muted);
 }
 
 .debug-log dd {
   overflow-wrap: anywhere;
-  color: #333c3e;
+  color: var(--text);
 }
 
 .debug-details {
@@ -295,7 +349,7 @@ textarea {
 
 .debug-details summary {
   cursor: pointer;
-  color: #1f6f68;
+  color: var(--accent-strong);
   font-size: 12px;
   font-weight: 850;
 }
@@ -306,8 +360,8 @@ textarea {
   overflow: auto;
   border-radius: 7px;
   padding: 10px;
-  background: #222728;
-  color: #f7f4ec;
+  background: var(--surface-code);
+  color: #d7e4e5;
   font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
   white-space: pre-wrap;
 }
@@ -318,9 +372,93 @@ textarea {
 
 .debug-empty {
   margin: 0;
-  border: 1px dashed #d8d1c7;
+  border: 1px dashed var(--border-strong);
   border-radius: 8px;
   padding: 16px;
-  color: #746c62;
+  color: var(--text-muted);
   font-size: 13px;
+}
+
+.model-settings {
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+}
+
+.model-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--surface);
+}
+
+.model-card + .model-card {
+  margin-top: 12px;
+}
+
+.model-card h3 {
+  margin: 0 0 12px;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.model-card label {
+  display: grid;
+  gap: 5px;
+  margin-top: 10px;
+}
+
+.model-card label span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.model-card input,
+.model-card select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px 9px;
+  background: var(--panel-soft);
+  color: var(--text);
+}
+
+.model-card input::placeholder {
+  color: var(--text-soft);
+}
+
+.model-card__grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.model-settings__actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.model-settings__actions button {
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--accent);
+  color: #07100f;
+  cursor: pointer;
+  font-weight: 850;
+}
+
+.model-settings__actions button + button {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.model-settings__status {
+  margin: 12px 0 0;
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 800;
 }

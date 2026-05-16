@@ -500,6 +500,1513 @@
 
 - `corepack pnpm build` 成功。
 
+## 2026-05-16 记忆系统方向记录
+
+用户希望先记录当前关于记忆系统存储方式的讨论，不急于实现。
+
+设计判断：
+
+- 如果记忆主要给 Agent 自己使用，而不是给人类直接阅读编辑，则不应只依赖 Markdown/文件。
+- 重度 AI 用户会产生大量对话、工具调用、项目决策、偏好、代码上下文和任务轨迹。
+- Agent 记忆系统的核心能力是查询和召回，而不是保存文档：
+  - 按项目 scope 过滤。
+  - 按记忆类型过滤。
+  - 按重要性、置信度、时间衰减排序。
+  - 按来源事件追溯。
+  - 未来按语义相似度召回。
+
+长期方向：
+
+- SQLite 作为本地记忆主存储。
+- 表层可包含：
+  - `events`
+  - `memories`
+  - `sessions`
+  - `memory_embeddings`
+- 后续可叠加 `sqlite-vec` / `sqlite-vss` 做本地向量检索。
+- 文件系统用于：
+  - 大文本。
+  - 附件。
+  - 项目快照。
+  - 导出。
+  - 人类可读备份。
+
+当前状态：
+
+- 只记录设计方向，暂不实现数据库记忆系统。
+
+## 2026-05-16 记忆关联模型记录
+
+用户进一步询问：如何关联“关于当前项目的短期记忆对话”和“关于当前项目的整体长期规划”。
+
+设计判断：
+
+- 短期记忆和长期规划不应只是两类文件或两段文本。
+- 它们需要共享结构化字段，形成可追溯关系。
+- 核心关系：
+  - `project_id`：最大作用域，表示属于哪个项目。
+  - `session_id`：表示哪一段短期会话。
+  - `event_id`：表示原始事件，如用户消息、助手回复、工具调用、意图识别。
+  - `memory_id`：表示从事件中提炼出的长期记忆。
+  - `source_event_ids`：长期记忆追溯到哪些原始事件。
+
+建议模型：
+
+- `projects`：项目。
+- `sessions`：项目下的会话。
+- `events`：原始交互和工具事件。
+- `memories`：从事件提炼出来的长期事实、偏好、决策、规划。
+
+长期记忆字段建议：
+
+- `project_id`
+- `source_session_id`
+- `source_event_ids`
+- `type`
+- `content`
+- `tags_json`
+- `importance`
+- `confidence`
+- `created_at`
+- `updated_at`
+- `last_used_at`
+
+召回策略：
+
+- 先按当前 `project_id` 过滤。
+- 再按 `type/tags/importance/time` 查询。
+- 数据量增大后叠加 embedding 语义召回。
+- 大模型上下文中同时放入：
+  - 最近短期事件。
+  - 与当前问题相关的长期规划/决策/偏好。
+  - 必要的来源摘要。
+
+当前状态：
+
+- 只记录设计方向，暂不实现数据库 schema。
+
+## 2026-05-16 大模型上下文组织格式
+
+用户确认：意图识别是否可以汇总在一起发给模型，并要求记录该格式。
+
+推荐格式：
+
+- `system`：
+  - 稳定角色规则。
+  - 项目级行为约束。
+- `messages[0]`：
+  - 使用 `user` role 承载内部上下文。
+  - 内容包括最近 intent history、项目记忆、任务状态等。
+  - 必须明确说明这不是用户真实输入，而是系统整理的内部上下文。
+- 后续 `messages`：
+  - 真实对话历史。
+  - 必须保持时间顺序。
+  - 形如 `user -> assistant -> user -> assistant`。
+- 最后一条：
+  - 当前用户输入。
+
+不推荐：
+
+- 不要把多轮用户消息、意图识别、助手回复分别分组为：
+  - `user1, user2, intent1, intent2, assistant1, assistant2`
+- 不要把 intent 作为真实对话每轮穿插：
+  - `user1, intent1, assistant1, user2, intent2, assistant2`
+
+原因：
+
+- intent 不是用户真实输入，穿插进真实对话会污染对话因果。
+- 汇总为内部上下文更像工作记忆，方便控制长度。
+- 真实对话保持时间线，模型更容易理解问答关系。
+- 内部上下文集中前置，也更利于后续缓存和裁剪策略。
+
+当前状态：
+
+- 只记录格式，后续实现短期 intent history 和 memory context 时遵循该结构。
+
+## 2026-05-16 max_tokens 后续策略
+
+用户询问：如果模型返回因为达到最大长度而结束，后续应该如何设计。
+
+阶段策略：
+
+- 第一阶段：
+  - 不自动续写。
+  - 当 `stopReason === "max_tokens"` 时，在最终回复末尾追加提示。
+  - 引导用户输入“继续”。
+- 第二阶段：
+  - UI 显示“继续生成”按钮。
+  - 用户点击后再发起续写请求。
+  - 保持用户可控，避免无感额外消耗。
+- 第三阶段：
+  - 可考虑受控自动续写。
+  - 必须限制最大续写次数，如 1-2 次。
+  - 每次续写仍检查 `stopReason`。
+  - 避免无限循环、重复内容、跑偏和成本失控。
+
+续写上下文建议：
+
+- `system`：原稳定系统提示。
+- 内部上下文：原项目记忆/任务状态/intent history。
+- 对话上下文：
+  - 原用户问题。
+  - 已生成的截断助手内容。
+  - 新用户指令：请从上一条回复中断处继续，不要重复前文。
+
+当前状态：
+
+- 只记录设计策略。当前代码已完成第一阶段的提示策略，不做自动续写。
+
+## 2026-05-16 模型返回异常分类记录
+
+用户询问：处理了 `max_tokens` 结束异常后，还有哪些情况需要考虑，并要求按当前讨论记录。
+
+模型返回后应区分以下状态：
+
+- `complete`
+  - 正常结束。
+  - 常见 `stopReason`：`end_turn` / `stop` / `stop_sequence`。
+  - 正常保存和展示。
+- `truncated`
+  - 达到最大输出。
+  - 常见 `stopReason`：`max_tokens` / `length`。
+  - 当前已实现提示策略。
+- `empty`
+  - 请求没有明显错误，但 `content` 为空。
+  - 应提示模型返回为空，不应当作正常助手回复。
+- `api_error`
+  - API 或网络错误。
+  - 包括 401、429、500、超时、baseURL 错误等。
+  - 应分类展示清晰错误。
+- `structured_output_error`
+  - 结构化输出失败。
+  - 例如意图识别 JSON 解析失败、字段缺失、intent 不合法。
+- `stream_interrupted`
+  - 流式输出已经产生部分内容，但连接中断或没有 final message。
+  - 应提示内容可能不完整。
+- `user_abort`
+  - 用户主动停止生成。
+  - 不是系统错误，后续加停止按钮时处理。
+- `refusal/safety`
+  - 模型拒答或安全拦截。
+  - 当前阶段暂不优先处理。
+
+建议实现优先级：
+
+1. 已处理：`truncated/max_tokens`。
+2. 下一步：`empty response`。
+3. 再下一步：`api_error` 分类。
+4. 再下一步：`stream_interrupted`。
+5. 后续：`user_abort`、`refusal/safety`。
+
+## 2026-05-16 上下文构建模块化记录
+
+用户询问“上下文构建模块化”是什么意思，并确认可理解为将对话信息拆成更多层，最后统一组装。
+
+设计解释：
+
+- 不应把所有内容都当成普通聊天记录直接发给模型。
+- 应先拆分成语义层，再由专门模块按固定顺序组装模型请求。
+
+建议上下文层次：
+
+- `system prompt`
+  - 稳定角色规则。
+  - 项目级行为约束。
+- `internal context`
+  - 内部上下文，不是用户真实输入。
+  - 可包含最近 intent、项目记忆、任务状态、工具结果、当前约束。
+- `conversation history`
+  - 真实对话历史。
+  - 保持 `user -> assistant -> user -> assistant` 时间顺序。
+- `current user input`
+  - 当前用户输入。
+
+建议模块：
+
+- 后续新增 `modelContextBuilder.ts`。
+- 该模块只负责组装：
+  - `system`
+  - `messages`
+- Provider 不再负责业务上下文拼接，只负责调用模型 API。
+
+目标：
+
+- 降低 `mimoProvider.ts` 和 `chatService.ts` 的复杂度。
+- 方便后续加入短期 intent history、长期记忆、任务状态、工具结果。
+- 方便调试最终发给模型的上下文。
+
+## 2026-05-16 缓存友好的上下文顺序修正
+
+用户指出：如果动态内部上下文直接放在第一条 user message，会导致每轮前缀变化，降低 KV cache / prompt cache 命中。
+
+修正后的顺序：
+
+- `system`
+  - 稳定角色规则。
+- 稳定上下文
+  - 长期项目规则、工具规则、长期偏好等，尽量靠前且少变。
+- 真实历史对话
+  - 保持时间顺序。
+- 本轮动态上下文
+  - 当前 taskState。
+  - 最近 intent。
+  - 最近 toolResult。
+  - 当前约束。
+- 当前用户输入
+  - 放在最后。
+
+代码调整：
+
+- `mimoProvider` 中 MiMo messages 组装顺序从：
+  - `runtimeContext -> conversationMessages`
+- 调整为：
+  - `historyMessages -> runtimeContextMessage -> latestUserMessage`
+
+原因：
+
+- 动态上下文靠近当前输入，可以增强本轮相关性。
+- 稳定前缀尽量不变，更有利于缓存命中。
+- 真实历史对话仍保持时间顺序。
+- 动态上下文需要明确标注不是用户真实输入，避免模型复述或误解。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 会话压缩规则记录
+
+用户提醒：上下文链路里还需要明确“会话压缩”规则。
+
+设计判断：
+
+- 会话压缩不是每轮都做。
+- 会话压缩也不是 KV cache / prompt cache 本身。
+- KV cache / prompt cache 依赖尽量稳定的请求前缀；如果每轮都把历史重新压缩成不同文本，反而会降低缓存命中。
+- 因此第一版采用“多轮累积后再压缩”的策略。
+
+第一版触发条件：
+
+- 当前会话真实历史超过固定轮数，例如 12-20 轮。
+- 或预计上下文 token 超过预算阈值，例如达到模型上下文预算的 60%-70%。
+- 或任务阶段发生明显切换，例如从需求讨论进入实现、从实现进入验证。
+- 或用户显式要求“总结一下/记录一下/压缩上下文”。
+
+第一版不触发压缩的情况：
+
+- 普通短对话。
+- 当前任务还在快速来回确认细节，且历史不长。
+- 工具调用刚执行完，还需要保留原始输出用于下一步判断。
+
+压缩对象：
+
+- 只压缩较早的真实对话历史。
+- 不压缩最近 3-5 轮真实对话。
+- 不压缩当前用户输入。
+- 不压缩本轮动态上下文，例如当前 Router 结果、toolResult、focused task。
+- 不把长期记忆和会话摘要混为一类。
+
+压缩产物：
+
+- `session_summary`
+  - 当前会话到目前为止的摘要。
+  - 用于替代被裁剪掉的早期对话。
+- `decisions`
+  - 明确的项目决策。
+  - 可进一步沉淀为长期记忆。
+- `open_questions`
+  - 尚未确认的问题。
+- `constraints`
+  - 用户偏好、技术边界、权限边界。
+- `task_progress`
+  - 当前任务进度、已完成事项、下一步。
+- `source_range`
+  - 摘要覆盖的消息范围，便于追溯。
+
+传给模型时的建议顺序：
+
+1. `system`：稳定角色和项目规则。
+2. 稳定项目上下文：长期偏好、工具规则、长期项目决策。
+3. `session_summary`：被压缩的较早会话摘要。
+4. 最近 3-5 轮真实对话：保持 `user -> assistant` 时间顺序。
+5. 本轮动态上下文：Router 结果、focused task、toolResult、临时约束。
+6. 当前用户输入。
+
+存储策略：
+
+- 第一版会话压缩结果写入 SQLite，而不是只放内存。
+- 建议表：
+  - `conversation_summaries`
+  - 字段包括：`id`、`project_id`、`session_id`、`source_start_event_id`、`source_end_event_id`、`summary`、`decisions_json`、`open_questions_json`、`constraints_json`、`task_progress_json`、`created_at`、`updated_at`。
+- 原始 events 不删除，只是在上下文构建时被 summary 替代。
+- 后续可将高价值 decisions/constraints 再提升到 `memories` 表。
+
+压缩模型：
+
+- 第一版可以继续使用本地小模型或主模型。
+- 如果要求质量稳定，优先用主模型做压缩。
+- 如果考虑成本和速度，可先用小模型做草稿，再由 Core 做结构校验。
+
+实现位置建议：
+
+- `conversationCompressor.ts`
+  - 判断是否需要压缩。
+  - 调用模型生成压缩结果。
+  - 校验结构化结果。
+- `modelContextBuilder.ts`
+  - 读取会话摘要和最近对话。
+  - 按固定顺序组装最终上下文。
+
+当前状态：
+
+- 已记录明确规则。
+- 尚未实现会话压缩代码和 SQLite 表。
+
+## 2026-05-16 会话压缩第一版实现
+
+用户要求开始操作后，已将会话压缩从设计推进到第一版代码。
+
+已完成：
+
+- 安装 `better-sqlite3` 和类型依赖。
+- `pnpm-workspace.yaml` 放行 `better-sqlite3` build script。
+- `.gitignore` 忽略本地 SQLite 数据文件：
+  - `data/*.db`
+  - `data/*.db-shm`
+  - `data/*.db-wal`
+- 新增 SQLite 初始化：
+  - `packages/core/src/storage/database.ts`
+  - 默认数据库路径：`data/agent.db`
+- 新增会话摘要存取：
+  - `packages/core/src/conversationSummaries.ts`
+  - 表：`conversation_summaries`
+- 新增会话压缩判断：
+  - `packages/core/src/conversationCompressor.ts`
+  - 当前阈值：消息数达到 24 条后才考虑压缩。
+  - 默认保留最近 10 条消息。
+  - 每次至少有 6 条新消息才触发增量压缩。
+- 新增 Ollama 压缩 Provider：
+  - `packages/core/src/providers/ollamaCompressionProvider.ts`
+  - 继续使用本地 `qwen2.5:1.5b`。
+  - 使用 `format: "json"` 要求返回结构化摘要。
+- 新增压缩 Prompt 模块：
+  - `packages/memorizes/compression/01-system.md`
+  - `packages/memorizes/compression/02-input.md`
+- ChatService 每轮流程新增：
+  1. 检查会话压缩。
+  2. 意图识别。
+  3. 大模型对话。
+- MiMo 上下文组装新增会话摘要支持：
+  - 如果存在摘要，会用摘要替代较早历史消息。
+  - 保留摘要之后的真实对话。
+  - 本轮 intent 动态上下文仍放在当前用户输入前。
+
+当前限制：
+
+- 原始 messages 目前仍主要存在内存 ChatSession 中，尚未完整写入 `events` 表。
+- 会话压缩结果已写入 SQLite，但还没有 UI 专门展示。
+- 当前触发规则按消息数实现，token 预算触发还未实现。
+- 当前使用小模型做压缩，后续可改为主模型或“小模型草稿 + 主模型校正”。
+- 当前没有自动把高价值 `decisions/constraints` 提升为长期 `memories`。
+
+验证：
+
+- `better-sqlite3` native binding 已实际加载成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 Events 原始事件链第一版实现
+
+在会话压缩第一版之后，继续补齐 SQLite 原始事件链。
+
+设计目的：
+
+- 会话摘要不应成为唯一历史来源。
+- 原始用户消息、助手消息、Router 结果、模型返回状态和压缩摘要都需要可追溯。
+- 后续记忆系统、任务状态、多 Agent 编排、Agent Trace 都可以基于 events 扩展。
+
+已完成：
+
+- SQLite 新增 `events` 表。
+- 字段包括：
+  - `id`
+  - `project_id`
+  - `session_id`
+  - `message_id`
+  - `type`
+  - `actor`
+  - `role_label`
+  - `content`
+  - `payload_json`
+  - `created_at`
+- 新增索引：
+  - `idx_events_session`
+  - `idx_events_message_id`
+- 新增事件模块：
+  - `packages/core/src/events.ts`
+- 当前事件类型：
+  - `chat_message`
+  - `router_result`
+  - `conversation_summary`
+  - `model_return`
+  - `error`
+- ChatService 已接入事件写入：
+  - 用户消息创建后写入 `chat_message`。
+  - Router 结果写入 `router_result`。
+  - MiMo 返回 stopReason/usage 写入 `model_return`。
+  - 助手消息写入 `chat_message`。
+- 会话压缩完成后写入 `conversation_summary` 事件。
+- Core 导出 `listSessionEvents`，后续 UI/Trace 可以直接读取。
+
+当前限制：
+
+- events 已写入 SQLite，但 UI 还没有展示。
+- 错误事件类型已预留，当前 catch 链路还未统一写入 `error`。
+- 当前 ChatSession 仍是内存会话，events 还没有反向恢复会话能力。
+- 工具调用、任务状态、多 Agent run 尚未接入 events。
+
+验证：
+
+- `better-sqlite3` 内存表读写验证成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 Events GUI 可观测性第一版
+
+在原始事件链写入 SQLite 后，继续将 events 接入 GUI 调试面板。
+
+已完成：
+
+- 共享类型新增：
+  - `AgentEventType`
+  - `AgentEventRecord`
+- Electron Main 新增 IPC：
+  - `workbench:list-session-events`
+- Preload 新增 API：
+  - `window.workbench.listSessionEvents`
+- Core 已导出的 `listSessionEvents` 接入 Electron。
+- 极简 Chat 调试抽屉新增两个 Tab：
+  - `模型请求`
+  - `事件链`
+- `事件链` 视图展示：
+  - event type
+  - actor
+  - roleLabel
+  - messageId
+  - createdAt
+  - content
+  - payload JSON
+- 每轮对话 done 后自动刷新当前 session events。
+- 手动点击刷新按钮也会同时刷新模型请求日志和事件链。
+
+当前效果：
+
+- 用户可以在 GUI 里看到一轮对话背后的原始事件：
+  - 用户消息。
+  - Router 结果。
+  - MiMo stopReason/usage。
+  - 助手消息。
+  - 会话压缩摘要事件。
+- 这一步是 Agent Trace 的前置可视化版本。
+
+当前限制：
+
+- 还不是完整 Agent Trace 时间线。
+- 没有事件过滤、搜索、导出。
+- 事件链只显示当前 session 最近 100 条。
+- 当前还没有工具调用和任务状态事件。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 Router 完整 Schema 第一版实现
+
+在 Events GUI 可观测性之后，继续补齐此前确认过的 Router 完整结构。
+
+已完成：
+
+- 共享类型新增：
+  - `RouterIntent`
+  - `RouterTaskType`
+  - `RouterResult`
+- `packages/memorizes/intent/01-parser.md` 从旧版 intent parser 升级为 Router parser。
+- Router 输出字段升级为：
+  - `intent`
+  - `rewritten_input`
+  - `keywords`
+  - `is_task`
+  - `task_goal`
+  - `task_type`
+  - `requires_project_context`
+  - `needs_tools`
+  - `suggested_tools`
+  - `tool_reason`
+  - `confidence`
+- `ollamaIntentProvider.ts` 改为返回结构化 `RouterResult`，不再只返回字符串。
+- Core 对 Router 结果做基础归一化：
+  - `intent` 必须合法，否则报错。
+  - `task_type` 非法时按 intent 推导默认值。
+  - `suggested_tools` 第一版只允许 `command.run`。
+  - `confidence` 被限制在 0-1。
+  - `needs_tools=true` 但没有工具时，默认补 `command.run`。
+- ChatService 将 RouterResult 格式化后注入 MiMo 内部上下文。
+- `router_result` event 现在保存完整 Router JSON payload。
+- 阶段提示会显示 Router 判断：
+  - `intent`
+  - `task_type`
+  - `confidence`
+
+同时补齐：
+
+- 新增 `saveErrorEvent`。
+- ChatService 外层错误统一写入 `error` event。
+- Router 失败、会话压缩失败、MiMo 失败都能进入 GUI 事件链。
+
+当前限制：
+
+- Router 结果还没有驱动真实 tool selection。
+- Router 结果还没有自动创建/更新任务状态。
+- `confidence >= 0.7` 的策略尚未接入 Core Policy。
+- `suggested_tools` 目前只允许 `command.run`，但 Command Gateway 尚未实现。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 Tool Selection Policy 第一版实现
+
+在 Router 完整 Schema 之后，继续让 Router 结果驱动 Core 的工具选择策略。
+
+已完成：
+
+- 共享类型新增：
+  - `ToolAccessMode`
+  - `ToolSelectionResult`
+- 新增 Core 模块：
+  - `packages/core/src/toolSelectionPolicy.ts`
+- 新增事件类型：
+  - `tool_selection`
+- 新增事件写入：
+  - `saveToolSelectionEvent`
+- ChatService 在 Router 之后立即执行工具选择。
+- 工具选择结果写入 SQLite events。
+- 工具选择结果和 Router 结果一起注入 MiMo 内部运行上下文。
+- GUI 的 `事件链` Tab 会展示 `tool_selection` 事件。
+
+第一版规则：
+
+- Router 置信度阈值使用 `0.7`。
+- `confidence < 0.7` 时不自动开放工具。
+- `chat` 不开放工具。
+- `search` 暂不开放工具，因为 `web.search` 尚未实现。
+- `analysis` 且不需要项目上下文时不开放工具。
+- 第一版可选工具只有 `command.run`。
+- `code` / `implementation` 对应 `project_write`。
+- `debug` / `debugging` / `verification` 对应 `project_verify`。
+- 普通项目分析对应 `project_read`。
+
+当前限制：
+
+- 这里只是“选择工具”，还不会执行工具。
+- `Command Gateway` 尚未实现。
+- `access_mode` 只是传递给后续 Gateway 的策略信号。
+- 还没有 UI 专门高亮展示 selected tools，只能在事件链里看 JSON。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 Command Gateway 第一版实现
+
+在 Tool Selection Policy 之后，继续实现 `command.run` 的本地执行入口。
+
+已完成：
+
+- 共享类型新增：
+  - `CommandRunRequest`
+  - `CommandDecision`
+  - `CommandRunResult`
+- 新增工具调用解析模块：
+  - `packages/core/src/toolCallParser.ts`
+- 新增 Command Gateway：
+  - `packages/core/src/commandGateway.ts`
+- 事件类型新增：
+  - `tool_call`
+  - `tool_result`
+- 事件写入新增：
+  - `saveToolCallEvent`
+  - `saveToolResultEvent`
+- MiMo 内部运行上下文新增工具请求协议说明。
+- ChatService 在 MiMo 回复结束后：
+  1. 解析回复中的 `command.run` JSON 请求。
+  2. 最多处理 8 条。
+  3. 写入 `tool_call` event。
+  4. 交给 Command Gateway 判断并执行/拒绝/跳过。
+  5. 写入 `tool_result` event。
+  6. 将工具执行结果追加到当前助手消息。
+
+第一版执行边界：
+
+- 只支持 PowerShell。
+- `cwd` 必须位于当前工作区内。
+- 默认超时 30 秒。
+- build/test 类命令超时 120 秒。
+- stdout/stderr 默认截断到约 20,000 字符。
+- 危险命令直接拒绝：
+  - `Invoke-Expression`
+  - `iex`
+  - `curl |`
+  - `irm`
+  - `iwr`
+  - `format`
+  - `diskpart`
+  - `shutdown`
+  - `restart-computer`
+  - `remove-item -recurse`
+  - `rm -r`
+  - `rmdir /s`
+  - `del /s`
+  - `set-executionpolicy`
+
+access mode 策略：
+
+- `project_read`
+  - 只允许读类命令，如 `Get-ChildItem`、`Get-Content`、`Select-String`、`Test-Path`、`Resolve-Path`、`git status/diff/log`。
+- `project_verify`
+  - 允许读类命令和 build/test 类验证命令。
+- `project_write`
+  - 允许读、验证和未命中危险/确认规则的项目内命令。
+- 需要确认但当前没有确认 UI 的命令会返回 `confirm/skipped`，不会执行：
+  - `git add`
+  - `git commit`
+  - `git push`
+  - `pnpm add`
+  - `npm install`
+  - `corepack pnpm add`
+
+当前限制：
+
+- 这是“一步工具执行”，不是完整多轮 ReAct 循环。
+- 工具执行后暂时不会自动再调用 MiMo 总结结果。
+- 还没有用户确认 UI，因此 `confirm` 命令会跳过。
+- 还没有专门的 Tool 面板，只能在事件链和助手消息里查看结果。
+- 还没有任务状态联动。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 一步 ReAct 工具结果整理
+
+在 Command Gateway 第一版之后，继续补齐工具执行后的模型整理步骤。
+
+已完成：
+
+- ChatService 在执行 `command.run` 后，如果存在工具结果，会追加一次 MiMo 调用。
+- 第二次 MiMo 调用只负责读取工具结果并生成最终回应。
+- 第二次调用不会继续解析工具请求，避免无限工具循环。
+- UI 会显示阶段：
+  - `工具执行`
+  - `工具结果整理`
+- 最终助手消息结构：
+  - 保留第一次 MiMo 的工具请求/说明。
+  - 追加 `【工具结果整理】`。
+  - 流式展示第二次 MiMo 基于工具结果生成的最终回应。
+- 事件链顺序调整：
+  - 第一次 MiMo `model_return`。
+  - `tool_call`。
+  - `tool_result`。
+  - 第二次 MiMo `model_return`。
+  - 最终 `chat_message`。
+
+当前限制：
+
+- 仍然只允许一次工具后续整理。
+- 第二次 MiMo 结果不会再次触发工具解析。
+- 第一次 MiMo 生成的 `command.run` JSON 仍会在消息里可见，后续可优化为隐藏工具请求块。
+- 还没有用户确认 UI。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 工具请求块隐藏
+
+在一步 ReAct 工具结果整理之后，继续优化用户可见消息体验。
+
+问题：
+
+- MiMo 为了请求工具会输出 `command.run` JSON。
+- 这段 JSON 对系统有用，但不应该长期作为普通回答展示给用户。
+- 调试和追溯应放在事件链，而不是污染对话正文。
+
+已完成：
+
+- `ChatStreamEvent` 新增：
+  - `replace`
+- Renderer 支持 `replace` 事件，用于替换当前助手消息内容。
+- `toolCallParser.ts` 新增：
+  - `removeCommandRunRequestBlocks`
+- ChatService 在第一次 MiMo 返回后：
+  1. 保留原始内容用于解析 `command.run`。
+  2. 清理用户可见内容中的工具请求 JSON 代码块。
+  3. 如果清理结果不同，发送 `replace` 事件更新聊天气泡。
+  4. `tool_call` event 仍保存完整工具请求。
+  5. 最终 `chat_message` 只保存清理后的可见文本和工具结果整理。
+
+当前效果：
+
+- 聊天气泡不再长期展示 `command.run` JSON。
+- 事件链仍可查看完整 `tool_call` 和 `tool_result`。
+- 工具结果整理仍会流式显示。
+
+当前限制：
+
+- 如果模型输出非 JSON 代码块形式的工具请求，第一版可能无法隐藏。
+- 流式过程中 JSON 可能短暂出现，等第一次 MiMo 完成并解析后会被替换。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 模型调用抽离与可视化配置
+
+用户希望把大模型和小模型 API 调用抽离出来，改成可视化可配置的方式，例如可以使用 DeepSeek 作为前置 Router 和主实现模型。
+
+已完成：
+
+- 新增模型运行时配置类型：
+  - `ModelRuntimeRole`
+  - `ModelProviderKind`
+  - `ModelRuntimeConfig`
+  - `ModelRuntimeSettings`
+- 新增本地配置文件模板：
+  - `config/model-runtime.example.json`
+- 新增本地真实配置路径：
+  - `config/model-runtime.local.json`
+- `.gitignore` 已忽略：
+  - `config/model-runtime.local.json`
+- 新增 Core 配置模块：
+  - `packages/core/src/modelRuntimeConfig.ts`
+- Electron IPC 新增：
+  - `workbench:get-model-runtime-settings`
+  - `workbench:save-model-runtime-settings`
+- Preload 新增：
+  - `window.workbench.getModelRuntimeSettings`
+  - `window.workbench.saveModelRuntimeSettings`
+- GUI 右上角新增 `模型` 按钮。
+- 模型配置抽屉支持配置三类模型：
+  - `router`：前置意图识别 / Router。
+  - `main`：主对话 / 实现模型。
+  - `compression`：会话压缩模型。
+- 每类模型可配置：
+  - 名称。
+  - Provider 类型。
+  - Base URL。
+  - Model。
+  - API Key。
+  - Temperature。
+  - Max Tokens。
+- GUI 新增 `使用 DeepSeek 预设`：
+  - Router：`openai-compatible` + `https://api.deepseek.com` + `deepseek-v4-flash`
+  - Main：`openai-compatible` + `https://api.deepseek.com` + `deepseek-v4-pro`
+  - Compression：`openai-compatible` + `https://api.deepseek.com` + `deepseek-v4-flash`
+
+Provider 抽离：
+
+- 新增 OpenAI-compatible Provider：
+  - `packages/core/src/providers/openAiCompatibleProvider.ts`
+- 支持：
+  - 非流式 JSON 调用，用于 Router / Compression。
+  - 流式 Chat Completions，用于 Main。
+- Router 调用支持：
+  - `ollama`
+  - `openai-compatible`
+- Compression 调用支持：
+  - `ollama`
+  - `openai-compatible`
+- Main 调用支持：
+  - `anthropic-compatible`
+  - `openai-compatible`
+- 默认配置保持兼容：
+  - Router：本地 Ollama `qwen2.5:1.5b`
+  - Main：MiMo Anthropic-compatible `mimo-v2.5-pro`
+  - Compression：本地 Ollama `qwen2.5:1.5b`
+
+上下文顺序修正：
+
+- OpenAI-compatible 主模型也保持缓存友好的上下文顺序：
+  - system
+  - 历史对话
+  - 内部运行上下文
+  - 当前用户输入
+
+当前限制：
+
+- Router / Compression 暂不支持 Anthropic-compatible。
+- OpenAI-compatible Provider 使用 fetch 实现基础 Chat Completions，不依赖 SDK。
+- 还没有模型连通性测试按钮。
+- API Key 当前保存到本地 `config/model-runtime.local.json`，不会提交，但还没有做系统级加密存储。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 GUI 暗色模式
+
+用户希望 GUI 改成暗色模式。
+
+已完成：
+
+- `apps/desktop/src/styles.css` 改为默认暗色主题。
+- 使用 CSS variables 统一管理背景、面板、边框、文本、强调色和危险色。
+- 覆盖极简对话入口：
+  - 页面背景。
+  - 消息气泡。
+  - 输入框。
+  - 发送按钮。
+  - 阶段提示。
+- 覆盖右侧调试抽屉：
+  - 模型请求日志。
+  - 事件链。
+  - JSON/Pre 输出。
+  - Tab 和操作按钮。
+- 覆盖模型配置抽屉：
+  - Provider 卡片。
+  - 输入项。
+  - 预设按钮。
+  - 保存状态。
+
+当前状态：
+
+- GUI 默认进入暗色模式。
+- 暂未实现亮色/暗色切换开关。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 流式 IPC 返回修复
+
+用户发送消息时遇到：
+
+```text
+Error invoking remote method 'workbench:stream-chat-message': reply was never sent
+```
+
+原因判断：
+
+- `workbench:stream-chat-message` 是 `ipcRenderer.invoke` / `ipcMain.handle` 链路。
+- 主进程 handler 在流式发送完成后没有显式返回值，某些异常、热更新或窗口状态变化路径下可能导致 renderer 侧认为这次 invoke 没有收到回复。
+- 前端在 invoke 失败时没有保证移除 `workbench:chat-stream-event` 监听器，后续可能出现重复监听。
+
+修复：
+
+- `apps/desktop/electron/main.ts` 中 `workbench:stream-chat-message` 完成后显式返回 `{ ok: true }`。
+- 发送流式事件前检查 `event.sender.isDestroyed()`，避免窗口刷新或关闭时继续向失效 sender 发送事件。
+- `apps/desktop/src/ui/MinimalChatPage.tsx` 将流式监听器清理移动到 `finally`，确保成功和失败路径都会移除监听。
+- Electron 窗口 `backgroundColor` 同步改为暗色，避免暗色模式启动时闪白。
+
+验证：
+
+- `corepack pnpm build` 成功。
+
+## 2026-05-16 better-sqlite3 打包修复
+
+用户运行时遇到：
+
+```text
+UnhandledPromiseRejectionWarning: ReferenceError: __filename is not defined
+```
+
+原因判断：
+
+- 项目是 ESM 环境，主进程源码本身没有直接使用 `__filename`。
+- 报错来自 `better-sqlite3` 依赖链中的 CommonJS/native 加载逻辑。
+- Vite 将 `better-sqlite3` 打进 Electron main 的 ESM bundle 后，依赖内部仍引用 CommonJS 变量 `__filename`，运行时无法解析。
+
+修复：
+
+- `apps/desktop/vite.config.ts` 中 Electron main 构建增加 external：
+  - `better-sqlite3`
+- 让 `better-sqlite3` 在运行时按 Node 原生 CommonJS 包加载，避免被打包进 ESM 产物。
+
+验证：
+
+- `corepack pnpm build` 成功。
+- 构建后的 `apps/desktop/dist-electron/main.js` 中已搜不到 bundled `bindings` / `__filename` 触发代码。
+- `corepack pnpm --filter @xiaomi/desktop dev` 未立即抛出 `__filename` 错误，进程保持运行直到调试超时被中断。
+
+## 2026-05-16 better-sqlite3 运行时解析修复
+
+用户继续遇到：
+
+```text
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'better-sqlite3' imported from D:\AICode\XiaoMiCode\apps\desktop\dist-electron\main.js
+```
+
+原因判断：
+
+- 上一步将 `better-sqlite3` external 掉是正确的，因为它不能被 Vite 打进 ESM bundle。
+- 但 external 后，运行时 `apps/desktop/dist-electron/main.js` 会从 `apps/desktop` 的依赖树解析 `better-sqlite3`。
+- 当时 `better-sqlite3` 只声明在 `packages/core/package.json`，没有声明在 `apps/desktop/package.json`，所以 Electron main 运行时找不到包。
+
+修复：
+
+- `apps/desktop/package.json` 增加运行时依赖：
+  - `better-sqlite3`
+- 执行 `corepack pnpm install`，让 pnpm 在 `apps/desktop/node_modules` 下创建正确链接。
+
+验证：
+
+- `Test-Path apps/desktop/node_modules/better-sqlite3` 返回 `True`。
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+- 从 `apps/desktop` 目录执行 Node ESM 导入 `better-sqlite3` 并创建内存 SQLite 表成功，输出 `ok`。
+- 受控启动 `corepack pnpm --filter @xiaomi/desktop dev` 成功：
+  - Vite ready。
+  - main/preload development build 完成。
+  - Electron 主进程启动。
+  - 未再出现 `ERR_MODULE_NOT_FOUND` 或 `__filename is not defined`。
+
+## 2026-05-16 better-sqlite3 Electron ABI 修复
+
+用户发送消息时继续遇到：
+
+```text
+The module 'better_sqlite3.node' was compiled against a different Node.js version using NODE_MODULE_VERSION 127.
+This version of Node.js requires NODE_MODULE_VERSION 130.
+```
+
+原因判断：
+
+- 普通 Node 当前 ABI 是 `127`。
+- Electron 33.4.11 内置 Node 运行时需要 ABI `130`。
+- `better-sqlite3` 是 native module，不能只按普通 Node 编译；Electron main 进程加载时必须使用 Electron ABI 编译后的 `.node` 文件。
+
+修复：
+
+- `apps/desktop/package.json` 新增开发依赖：
+  - `@electron/rebuild`
+- 新增脚本：
+  - `rebuild:native`: `electron-rebuild -f -w better-sqlite3`
+- 根目录 `package.json` 新增：
+  - `postinstall`: `pnpm --filter @xiaomi/desktop rebuild:native`
+- 保持 `dev/build` 不自动强制 rebuild，避免 Electron 应用运行时 Windows 锁住 `.node` 文件导致 `EPERM unlink`。
+- 正确使用方式：
+  - 安装依赖后会自动 rebuild。
+  - 如果手动遇到 ABI mismatch，先关闭 Electron 应用，再运行 `corepack pnpm --filter @xiaomi/desktop rebuild:native`。
+
+验证：
+
+- 关闭残留项目 Electron/Vite 进程后，`corepack pnpm --filter @xiaomi/desktop rebuild:native` 成功。
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+- 使用 Electron 自带 Node 运行时验证 SQLite：
+  - 设置 `ELECTRON_RUN_AS_NODE=1`。
+  - 从 `apps/desktop` 导入 `better-sqlite3`。
+  - 创建内存 SQLite 表并查询成功，输出 `electron-ok`。
+- 受控启动 `corepack pnpm --filter @xiaomi/desktop dev` 成功：
+  - Vite ready。
+  - main/preload development build 完成。
+  - Electron 主进程启动。
+  - 未出现 `NODE_MODULE_VERSION`、`ERR_MODULE_NOT_FOUND` 或 `__filename is not defined`。
+
+## 2026-05-16 工具系统方向记录
+
+用户希望尽快跑起来，并明确不想第一版为所有能力都封装独立工具函数，而是希望通过 CLI/Shell 放行大量安全操作。
+
+设计判断：
+
+- 第一版不优先做 `file.read`、`file.write`、`workspace.listFiles` 等大量专用工具函数。
+- 优先做一个通用 `command.run`。
+- `command.run` 可作为模型侧 function call 协议。
+- `command.run` 内部走 `Command Gateway`。
+
+Function Call 与 Command Gateway 的区别：
+
+- Function Call：
+  - 模型到系统的结构化调用协议。
+  - 负责让模型以 JSON/schema 方式表达“我要调用什么”。
+- Command Gateway：
+  - 本地执行模式。
+  - 负责解析命令、判断风险、执行命令、返回结果。
+
+建议第一版链路：
+
+1. 模型输出 `command.run` 请求。
+2. Core 解析 `shell/cwd/command`。
+3. Command Gateway 按策略分类：
+   - `allow`
+   - `confirm`
+   - `deny`
+4. `allow` 自动执行。
+5. `confirm` 交给 UI 请求用户确认。
+6. `deny` 直接拒绝。
+7. 执行结果返回模型并展示到调试面板。
+
+初步自动放行：
+
+- `Get-ChildItem`
+- `Get-Content`
+- `Select-String`
+- `Test-Path`
+- `Resolve-Path`
+- `git status`
+- `git diff`
+- `git log`
+- `pnpm build`
+- `pnpm test`
+
+需要确认：
+
+- 写文件。
+- 删除、移动、复制。
+- 新建文件。
+- `git add`
+- `git commit`
+- `git push`
+- 安装依赖。
+- 未知命令。
+
+禁止：
+
+- 系统目录递归删除。
+- 格式化磁盘。
+- `curl | iex`
+- `Invoke-Expression`
+- 越出工作区的破坏性操作。
+
+后续演进：
+
+- 先用 `command.run` 获得开发灵活性。
+- 高频且需要更强安全边界的能力，再抽成专用工具：
+  - `memory.search`
+  - `project.updateTask`
+  - `file.applyPatch`
+
+用户确认的第一版默认策略：
+
+- `pnpm build` 可以自动执行。
+- `pnpm test` 可以自动执行。
+- 工作区内写文件无需确认。
+- 每轮最多执行 8 个命令。
+- 仍需保留工作区边界和危险命令禁止策略。
+
+## 2026-05-16 Command Gateway 收口方案
+
+用户表示：如果已有主意就按当前方案推进，不能确认的再询问，希望把工具系统设计收尾。
+
+第一版固定边界：
+
+- 只支持 PowerShell。
+- 不支持 cmd/bash 多 shell。
+- 默认工作区为当前项目：`D:\AICode\XiaoMiCode`。
+- `cwd` 必须位于工作区内。
+- 每轮最多执行 8 个命令。
+- 默认 timeout：30 秒。
+- `pnpm build` / `pnpm test` timeout：120 秒。
+- stdout/stderr 默认各截断到约 20,000 字符。
+
+命令请求协议：
+
+```json
+{
+  "type": "command.run",
+  "reason": "说明为什么要执行这条命令",
+  "shell": "powershell",
+  "cwd": "D:\\AICode\\XiaoMiCode",
+  "command": "Get-Content -LiteralPath 'package.json' -Raw"
+}
+```
+
+执行流程：
+
+1. 模型产生 `command.run` 请求。
+2. Core 生成 command plan，不直接执行。
+3. Command Policy 判断为 `allow` / `confirm` / `deny`。
+4. `allow` 自动执行。
+5. `confirm` 第一版可先暂停并提示用户，复杂确认 UI 后续再做。
+6. `deny` 直接拒绝并返回原因。
+7. 执行结果回传模型，作为内部上下文。
+8. 记录审计日志。
+
+审计日志字段：
+
+- `sessionId`
+- `turnId`
+- `reason`
+- `shell`
+- `cwd`
+- `command`
+- `decision`
+- `status`
+- `exitCode`
+- `stdout`
+- `stderr`
+- `durationMs`
+- `createdAt`
+
+第一版暂不做：
+
+- 多 shell。
+- 后台长任务。
+- 自动安装依赖。
+- 自动 git commit / push。
+- 无限工具循环。
+- 完整数据库审计日志。
+- 复杂确认 UI。
+
+## 2026-05-16 工具选择策略记录
+
+用户确认：Core 的作用可以理解为通过代码识别意图，不是每次一次性把所有工具都传给 LLM。随后询问如何判断工具类型。
+
+设计原则：
+
+- 工具选择和命令安全分两层：
+  - `toolSelectionPolicy`：Core 根据 intent 决定本轮给大模型哪些工具。
+  - `commandPolicy`：Command Gateway 判断具体命令是否 `allow/confirm/deny`。
+- 第一版不需要复杂工具类型判断，用 intent 到工具的规则映射即可。
+
+第一版映射：
+
+- `chat`
+  - 不暴露工具。
+- `analysis`
+  - 默认不暴露工具。
+  - 如果输入提到项目、文件、代码、当前实现，则暴露 `command.run` 的项目只读/验证能力。
+- `debug`
+  - 暴露 `command.run`。
+  - 允许读文件、跑 build/test。
+- `code`
+  - 暴露 `command.run`。
+  - 允许读写工作区文件、跑 build/test。
+- `search`
+  - 后续暴露 `web.search`。
+  - 当前阶段可暂不实现。
+
+关键边界：
+
+- 给模型 `command.run` 不代表所有命令都能执行。
+- 所有具体命令仍必须经过 Command Gateway 的 allow/confirm/deny。
+- 这样可以减少上下文长度、模型困惑、token 成本、工具误用和安全风险。
+
+## 2026-05-16 任务状态系统方向记录
+
+用户希望继续设计任务状态系统，并进一步说明未来会有多个 Agent 反复调用执行，因此不应按“只允许一个 active task”的简化模型设计。
+
+核心修正：
+
+- 不限制一个项目只能有一个 `active task`。
+- 一个项目可以有多个 `active tasks`。
+- 当前对话回合或当前 agent run 只聚焦一个 `focusedTaskId`。
+
+概念区分：
+
+- `active task`
+  - 项目中正在进行的任务。
+  - 可以有多个。
+- `focused task`
+  - 当前对话/当前 agent run 正在处理的任务。
+  - 每次上下文默认只展开一个。
+- `agent run`
+  - 某个 Agent 角色围绕某个任务的一次执行。
+  - 未来可支持产品、技术、开发、测试等多个角色反复处理不同任务。
+
+第一版存储方向：
+
+- 用户希望第一次就上 SQLite。
+- 因此任务状态不走内存临时版。
+- 任务系统与未来记忆系统一样，优先采用本地 SQLite。
+
+建议 SQLite 表：
+
+- `tasks`
+  - 任务主体。
+  - 字段建议：`id`、`project_id`、`title`、`goal`、`type`、`status`、`phase`、`created_at`、`updated_at`、`completed_at`。
+- `task_steps`
+  - 子步骤。
+  - 字段建议：`id`、`task_id`、`title`、`status`、`order_index`、`created_at`、`updated_at`。
+- `task_blockers`
+  - 阻塞点。
+  - 字段建议：`id`、`task_id`、`content`、`status`、`created_at`、`resolved_at`。
+- `task_focus`
+  - 当前项目的聚焦任务。
+  - 字段建议：`project_id`、`focused_task_id`、`updated_at`。
+- `agent_runs`
+  - 某个 Agent 对某个 task 的一次执行。
+  - 字段建议：`id`、`project_id`、`task_id`、`agent_role`、`status`、`input_json`、`output_json`、`started_at`、`completed_at`。
+- `task_dependencies`
+  - 任务之间的依赖关系。
+  - 字段建议：`task_id`、`depends_on_task_id`。
+
+TaskState 字段方向：
+
+- `id`
+- `projectId`
+- `title`
+- `goal`
+- `type`
+  - `chat`
+  - `analysis`
+  - `design`
+  - `implementation`
+  - `debugging`
+  - `verification`
+- `status`
+  - `active`
+  - `paused`
+  - `completed`
+  - `blocked`
+- `phase`
+  - `understanding`
+  - `planning`
+  - `executing`
+  - `verifying`
+  - `summarizing`
+- `steps`
+- `blockers`
+- `createdAt`
+- `updatedAt`
+
+传给模型的上下文策略：
+
+- 不把所有 active tasks 全量传给模型。
+- 只传：
+  - focused task 详情。
+  - 相关依赖任务摘要。
+  - 其他 active tasks 简短列表。
+- 放在本轮动态上下文中，位置靠近当前用户输入。
+
+示例：
+
+```md
+【当前任务状态】
+
+当前聚焦任务：
+- id: task-impl-command-gateway
+- 类型: implementation
+- 状态: active
+- 阶段: executing
+- 目标: 实现 Command Gateway 第一版
+
+依赖任务：
+- task-design-command-gateway: completed
+
+其他进行中任务：
+- task-memory-system: planning
+- task-model-return-policy: verifying
+```
+
+当前状态：
+
+- 已记录设计方向。
+- 尚未实现 SQLite schema 和任务状态读写。
+
+## 2026-05-16 Router Schema 确认
+
+用户确认：小模型 Router 按当前 schema 继续推进。
+
+Router 定位：
+
+- Router 是前置小模型输出给 Core 的“路由报告”。
+- Router 不回答用户。
+- Router 不直接执行工具。
+- Router 不直接创建任务。
+- Router 只提供结构化建议，Core 负责校验、修正和执行策略。
+
+第一版字段：
+
+```json
+{
+  "intent": "chat | analysis | code | debug | search",
+  "rewritten_input": "",
+  "keywords": [],
+  "is_task": false,
+  "task_goal": "",
+  "task_type": "chat | analysis | design | implementation | debugging | verification",
+  "requires_project_context": false,
+  "needs_tools": false,
+  "suggested_tools": ["command.run"],
+  "tool_reason": "",
+  "confidence": 0.0
+}
+```
+
+字段含义：
+
+- `intent`
+  - 当前输入的大类意图。
+- `rewritten_input`
+  - 保持原意的清晰重写。
+- `keywords`
+  - 核心关键词。
+- `is_task`
+  - 是否是需要持续推进的任务。
+- `task_goal`
+  - 如果是任务，任务目标是什么。
+- `task_type`
+  - 当前任务类型。
+- `requires_project_context`
+  - 是否需要当前项目/代码/文件上下文。
+- `needs_tools`
+  - 是否可能需要工具。
+- `suggested_tools`
+  - Router 建议开放的工具。
+- `tool_reason`
+  - 为什么需要工具。
+- `confidence`
+  - Router 对判断的置信度。
+
+后续实现方向：
+
+- 修改 `packages/memorizes/intent/01-parser.md`，让 Ollama 输出完整 Router schema。
+- 修改 `ollamaIntentProvider.ts` 的解析和校验逻辑。
+- Core 根据 Router 输出做 tool selection、task state 更新和上下文构建。
+
+## 2026-05-16 Router 与 SQLite 关键决策
+
+用户确认三个关键决策：
+
+1. Router 置信度阈值
+   - 使用 `0.7`。
+   - `confidence >= 0.7` 时，Core 可以按 Router 建议进行较自动化的工具开放和任务创建。
+   - `confidence < 0.7` 时，Core 采取保守策略。
+2. `suggested_tools`
+   - 保留扩展设计。
+   - 第一版主要支持 `command.run`。
+   - 未来可扩展：
+     - `web.search`
+     - `memory.search`
+     - `project.updateTask`
+3. SQLite 依赖选型
+   - Node/Electron 使用 `better-sqlite3`。
+   - 适合本地桌面应用、同步 API 简单、性能好。
+
+## 2026-05-16 Agent Trace 观察层方向
+
+用户希望整个项目对人类友好，能够很好地观察各个环节、提示词和返回。
+
+设计目标：
+
+- 不只是查看模型 API 请求和返回。
+- 要能观察每轮 agent 的完整链路。
+- 让用户能知道：
+  - Router 为什么这么判断。
+  - Core 为什么开放这些工具。
+  - 上下文最终是怎么组装的。
+  - 模型请求和返回是什么。
+  - 工具调用和工具结果是什么。
+  - 任务状态如何变化。
+
+建议调试面板视图：
+
+- `Trace`
+  - 时间线展示完整 agent 步骤。
+- `Prompts`
+  - 展示 System Prompt modules、Router Prompt modules、Tool Prompt modules、Runtime Context、最终 messages。
+- `Models`
+  - 展示 Ollama Router、MiMo Main 的请求、响应、stopReason、usage、duration。
+- `Tools`
+  - 展示 command.run、decision、cwd、command、stdout/stderr、exitCode、duration。
+- `State`
+  - 展示 focusedTask、activeTasks、turnState、toolStepCount、routerResult、selectedTools。
+- `Raw`
+  - 展示完整 JSON，便于开发调试。
+
+建议数据结构：
+
+```ts
+interface AgentTrace {
+  id: string
+  sessionId: string
+  turnId: string
+  projectId: string
+  startedAt: string
+  completedAt?: string
+  steps: TraceStep[]
+}
+
+interface TraceStep {
+  id: string
+  type: string
+  label: string
+  status: "pending" | "running" | "succeeded" | "failed"
+  input?: unknown
+  output?: unknown
+  startedAt: string
+  completedAt?: string
+  durationMs?: number
+}
+```
+
+Step 类型建议：
+
+- `user_input`
+- `router_request`
+- `router_response`
+- `core_policy`
+- `context_build`
+- `model_request`
+- `model_response`
+- `tool_call`
+- `tool_result`
+- `task_update`
+- `final_response`
+- `error`
+
+实现策略：
+
+- 第一版可先内存保存最近 20 条 trace。
+- 后续写入 SQLite：
+  - `agent_traces`
+  - `trace_steps`
+
+## 2026-05-16 多 Agent 协作第一版确认
+
+用户确认多 Agent 协作第一版按当前建议推进。
+
+核心角色：
+
+- `project`
+  - 项目协调者。
+  - 用户输入/输出口。
+  - 拆任务、分配角色、收集结果、决定下一步、最终汇总。
+- `product`
+  - 产品视角。
+  - 负责需求、用户目标、边界、验收标准。
+- `tech`
+  - 技术方案视角。
+  - 负责架构、模块、风险、技术选型。
+- `developer`
+  - 开发实现视角。
+  - 负责代码实现、修改、运行验证。
+- `tester`
+  - 测试验证视角。
+  - 负责测试策略、构建验证、问题复现。
+
+协作规则：
+
+- `project agent` 作为 coordinator。
+- 其他 agent 第一版不直接对用户说话。
+- 其他 agent 第一版不互相自由对话。
+- agent 之间通过 `agent_runs` 针对 task 交付结构化结果。
+- coordinator 收集并汇总 agent run 结果。
+
+执行方式：
+
+- 第一版串行执行。
+- 暂不做并行 agent runs。
+- 每个 agent 使用独立 prompt。
+- 第一版共用 MiMo 模型。
+- 工具调用由 Core / Command Gateway 控制。
+- UI 通过 Agent Trace 展示各 agent run。
+
+后续扩展：
+
+- 支持设计、视频、音频、研究、运维等更多角色。
+- 支持并行 agent runs。
+- 支持不同 agent 绑定不同模型。
+- 支持 agent 间受控通信。
+
 ### 下一步建议
 
 1. 接入真实模型 Provider 抽象。

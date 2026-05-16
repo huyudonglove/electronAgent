@@ -18,6 +18,14 @@ const INTENT_USER_MODULES = [
 
 const INTENT_CONTEXT_TEMPLATE = "packages/memorizes/context/intent-result.md";
 
+const COMPRESSION_PROMPT_MODULES = [
+  "packages/memorizes/compression/01-system.md"
+] as const;
+
+const COMPRESSION_USER_MODULES = [
+  "packages/memorizes/compression/02-input.md"
+] as const;
+
 export function buildIntentSystemPrompt(): string {
   return readMarkdownFiles(INTENT_PROMPT_MODULES);
 }
@@ -39,12 +47,42 @@ export function buildIntentContextMessage(intentSummary: string): string {
   });
 }
 
+export function buildCompressionSystemPrompt(): string {
+  return readMarkdownFiles(COMPRESSION_PROMPT_MODULES);
+}
+
+export function buildCompressionUserPrompt(input: {
+  readonly previousSummary: string;
+  readonly messages: readonly ChatMessage[];
+}): string {
+  return renderTemplate(readMarkdownFiles(COMPRESSION_USER_MODULES), {
+    previous_summary: input.previousSummary || "无",
+    messages: formatMessages(input.messages)
+  });
+}
+
 function formatRecentMessages(messages: readonly ChatMessage[]): string {
   return (
     messages
       .slice(-8)
       .map((message) => `${message.roleLabel}: ${message.content}`)
       .join("\n\n") || "无"
+  );
+}
+
+function formatMessages(messages: readonly ChatMessage[]): string {
+  return (
+    messages
+      .map((message) => {
+        return [
+          `id: ${message.id}`,
+          `role: ${message.sender}`,
+          `label: ${message.roleLabel}`,
+          `time: ${message.createdAt}`,
+          `content: ${message.content}`
+        ].join("\n");
+      })
+      .join("\n\n---\n\n") || "无"
   );
 }
 

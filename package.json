@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "pnpm --filter @xiaomi/desktop dev",
     "build": "pnpm --filter @xiaomi/desktop build",
+    "postinstall": "pnpm --filter @xiaomi/desktop rebuild:native",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint"
   },

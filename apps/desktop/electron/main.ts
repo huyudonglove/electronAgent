@@ -2,12 +2,15 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  getModelRuntimeSettings,
   listModelProfiles,
   listProviderDebugLogs,
+  listSessionEvents,
+  saveModelRuntimeSettings,
   sendChatMessage,
   streamChatMessage
 } from "@xiaomi/core";
-import type { ChatRequest } from "@xiaomi/shared";
+import type { ChatRequest, ModelRuntimeSettings } from "@xiaomi/shared";
 
 const currentFile = fileURLToPath(import.meta.url);
 const currentDir = path.dirname(currentFile);
@@ -27,7 +30,7 @@ async function createWindow(): Promise<void> {
     height: 880,
     minWidth: 1120,
     minHeight: 720,
-    backgroundColor: "#f6f3ee",
+    backgroundColor: "#0f1316",
     webPreferences: {
       preload: preloadPath,
       nodeIntegration: false,
@@ -72,11 +75,30 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle("workbench:stream-chat-message", async (event, request: ChatRequest) => {
     await streamChatMessage(request, (streamEvent) => {
-      event.sender.send("workbench:chat-stream-event", streamEvent);
+      if (!event.sender.isDestroyed()) {
+        event.sender.send("workbench:chat-stream-event", streamEvent);
+      }
     });
+    return { ok: true };
   });
 
   ipcMain.handle("workbench:list-provider-debug-logs", () => {
     return listProviderDebugLogs();
+  });
+
+  ipcMain.handle("workbench:list-session-events", (_event, request: { projectId: string; sessionId: string }) => {
+    return listSessionEvents({
+      projectId: request.projectId,
+      sessionId: request.sessionId,
+      limit: 100
+    });
+  });
+
+  ipcMain.handle("workbench:get-model-runtime-settings", () => {
+    return getModelRuntimeSettings();
+  });
+
+  ipcMain.handle("workbench:save-model-runtime-settings", (_event, settings: ModelRuntimeSettings) => {
+    return saveModelRuntimeSettings(settings);
   });
 }

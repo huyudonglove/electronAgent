@@ -1,12 +1,19 @@
 import { useState } from "react";
-import { Bug, RefreshCw, Send, X } from "lucide-react";
+import { Bug, RefreshCw, Send, SlidersHorizontal, X } from "lucide-react";
 import type {
+  AgentEventRecord,
   ChatMessage,
   ChatSessionId,
   ChatStreamEvent,
+  ModelProviderKind,
+  ModelRuntimeConfig,
+  ModelRuntimeRole,
+  ModelRuntimeSettings,
   ModelProfile,
   ProviderDebugLog,
 } from "@xiaomi/shared";
+
+const PROJECT_ID = "local-project";
 
 const initialMessage: ChatMessage = {
   id: "minimal-welcome",
@@ -29,6 +36,11 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
   const [stageLabel, setStageLabel] = useState<string | null>(null);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugLogs, setDebugLogs] = useState<readonly ProviderDebugLog[]>([]);
+  const [eventLogs, setEventLogs] = useState<readonly AgentEventRecord[]>([]);
+  const [debugTab, setDebugTab] = useState<"models" | "events">("models");
+  const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
+  const [modelSettings, setModelSettings] = useState<ModelRuntimeSettings | null>(null);
+  const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
 
   async function sendMessage(): Promise<void> {
     const content = draft.trim();
@@ -50,22 +62,23 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
     setError(null);
     setStageLabel(null);
 
+    let removeListener: (() => void) | undefined;
     try {
-      const removeListener = window.workbench.onChatStreamEvent((event) => {
+      removeListener = window.workbench.onChatStreamEvent((event) => {
         handleStreamEvent(event);
       });
       await window.workbench.streamChatMessage({
         sessionId,
-        projectId: "local-project",
+        projectId: PROJECT_ID,
         modelProfileId: modelProfiles.find((profile) => profile.id === "mimo-v2-5-pro")?.id ?? "mimo-v2-5-pro",
         message: content,
       });
-      removeListener();
-      await refreshDebugLogs();
+      await refreshDebugData();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      await refreshDebugLogs();
+      await refreshDebugData();
     } finally {
+      removeListener?.();
       setIsSending(false);
       setStageLabel(null);
     }
@@ -107,10 +120,25 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
       return;
     }
 
+    if (event.type === "replace") {
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === event.messageId
+            ? {
+                ...message,
+                content: event.content
+              }
+            : message
+        )
+      );
+      return;
+    }
+
     if (event.type === "done") {
       setStageLabel(null);
       setSessionId(event.session.id);
       setMessages(event.session.messages);
+      void refreshSessionEvents(event.session.id);
       return;
     }
 
@@ -118,27 +146,57 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
     setError(event.error);
   }
 
-  async function refreshDebugLogs(): Promise<void> {
+  async function refreshDebugData(): Promise<void> {
     const logs = await window.workbench.listProviderDebugLogs();
     setDebugLogs(logs);
+
+    if (sessionId) {
+      await refreshSessionEvents(sessionId);
+    }
+  }
+
+  async function refreshSessionEvents(targetSessionId: ChatSessionId): Promise<void> {
+    const events = await window.workbench.listSessionEvents({
+      projectId: PROJECT_ID,
+      sessionId: targetSessionId
+    });
+    setEventLogs(events);
   }
 
   return (
     <main className="minimal-chat">
-      <button
-        className="debug-toggle"
-        type="button"
-        onClick={async () => {
-          const nextOpen = !debugOpen;
-          setDebugOpen(nextOpen);
-          if (nextOpen) {
-            await refreshDebugLogs();
-          }
-        }}
-      >
-        <Bug size={16} />
-        调试
-      </button>
+      <div className="top-actions">
+        <button
+          className="debug-toggle"
+          type="button"
+          onClick={async () => {
+            const nextOpen = !modelSettingsOpen;
+            setModelSettingsOpen(nextOpen);
+            setDebugOpen(false);
+            if (nextOpen) {
+              await refreshModelSettings();
+            }
+          }}
+        >
+          <SlidersHorizontal size={16} />
+          模型
+        </button>
+        <button
+          className="debug-toggle"
+          type="button"
+          onClick={async () => {
+            const nextOpen = !debugOpen;
+            setDebugOpen(nextOpen);
+            setModelSettingsOpen(false);
+            if (nextOpen) {
+              await refreshDebugData();
+            }
+          }}
+        >
+          <Bug size={16} />
+          调试
+        </button>
+      </div>
 
       <section className="minimal-chat__messages" aria-label="对话消息">
         {messages.map((message) => (
@@ -175,10 +233,10 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
           <header>
             <div>
               <h2>接口调试</h2>
-              <p>最近模型请求与返回，不展示 API Key。</p>
+              <p>模型请求、返回和当前会话事件链。</p>
             </div>
             <div className="debug-drawer__actions">
-              <button type="button" onClick={() => void refreshDebugLogs()} title="刷新">
+              <button type="button" onClick={() => void refreshDebugData()} title="刷新">
                 <RefreshCw size={16} />
               </button>
               <button type="button" onClick={() => setDebugOpen(false)} title="关闭">
@@ -187,8 +245,26 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
             </div>
           </header>
 
+          <nav className="debug-tabs" aria-label="调试视图">
+            <button
+              type="button"
+              data-active={debugTab === "models"}
+              onClick={() => setDebugTab("models")}
+            >
+              模型请求
+            </button>
+            <button
+              type="button"
+              data-active={debugTab === "events"}
+              onClick={() => setDebugTab("events")}
+            >
+              事件链
+            </button>
+          </nav>
+
           <section className="debug-log-list">
-            {debugLogs.length > 0 ? (
+            {debugTab === "models" ? (
+              debugLogs.length > 0 ? (
               debugLogs.map((log) => (
                 <article className="debug-log" key={log.id}>
                   <div className="debug-log__top">
@@ -248,11 +324,229 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
               ))
             ) : (
               <p className="debug-empty">还没有模型请求记录。</p>
+              )
+            ) : eventLogs.length > 0 ? (
+              eventLogs.map((event) => (
+                <article className="debug-log" key={event.id}>
+                  <div className="debug-log__top">
+                    <strong>{event.type}</strong>
+                    <span>{event.actor}</span>
+                  </div>
+                  <dl>
+                    <div>
+                      <dt>Time</dt>
+                      <dd>{formatTime(event.createdAt)}</dd>
+                    </div>
+                    <div>
+                      <dt>Role</dt>
+                      <dd>{event.roleLabel ?? "-"}</dd>
+                    </div>
+                    <div>
+                      <dt>Message</dt>
+                      <dd>{event.messageId ?? "-"}</dd>
+                    </div>
+                  </dl>
+                  {event.content ? (
+                    <details className="debug-details" open>
+                      <summary>内容</summary>
+                      <pre>{event.content}</pre>
+                    </details>
+                  ) : null}
+                  <details className="debug-details">
+                    <summary>Payload</summary>
+                    <pre>{formatJson(event.payload ?? {})}</pre>
+                  </details>
+                </article>
+              ))
+            ) : (
+              <p className="debug-empty">
+                {sessionId ? "当前会话还没有事件记录。" : "发送第一条消息后会显示当前会话事件链。"}
+              </p>
+            )}
+          </section>
+        </aside>
+      ) : null}
+
+      {modelSettingsOpen ? (
+        <aside className="debug-drawer model-drawer" aria-label="模型配置面板">
+          <header>
+            <div>
+              <h2>模型配置</h2>
+              <p>配置前置 Router、主模型和会话压缩模型，保存到本地文件。</p>
+            </div>
+            <div className="debug-drawer__actions">
+              <button type="button" onClick={() => void refreshModelSettings()} title="刷新">
+                <RefreshCw size={16} />
+              </button>
+              <button type="button" onClick={() => setModelSettingsOpen(false)} title="关闭">
+                <X size={16} />
+              </button>
+            </div>
+          </header>
+
+          <section className="model-settings">
+            {modelSettings ? (
+              <>
+                {(["router", "main", "compression"] as const).map((role) => (
+                  <ModelConfigEditor
+                    config={modelSettings[role]}
+                    key={role}
+                    onChange={(config) => {
+                      setModelSettings((current) => current ? { ...current, [role]: config } : current);
+                    }}
+                  />
+                ))}
+                <div className="model-settings__actions">
+                  <button type="button" onClick={() => void saveModelSettings()}>
+                    保存模型配置
+                  </button>
+                  <button type="button" onClick={() => applyDeepSeekPreset()}>
+                    使用 DeepSeek 预设
+                  </button>
+                </div>
+                {settingsStatus ? <p className="model-settings__status">{settingsStatus}</p> : null}
+              </>
+            ) : (
+              <p className="debug-empty">正在读取模型配置...</p>
             )}
           </section>
         </aside>
       ) : null}
     </main>
+  );
+
+  async function refreshModelSettings(): Promise<void> {
+    const settings = await window.workbench.getModelRuntimeSettings();
+    setModelSettings(settings);
+    setSettingsStatus(null);
+  }
+
+  async function saveModelSettings(): Promise<void> {
+    if (!modelSettings) {
+      return;
+    }
+
+    const saved = await window.workbench.saveModelRuntimeSettings(modelSettings);
+    setModelSettings(saved);
+    setSettingsStatus("已保存到 config/model-runtime.local.json");
+  }
+
+  function applyDeepSeekPreset(): void {
+    setModelSettings((current) => {
+      if (!current) {
+        return current;
+      }
+
+      return {
+        router: {
+          ...current.router,
+          label: "DeepSeek Router",
+          providerKind: "openai-compatible",
+          baseURL: "https://api.deepseek.com",
+          model: "deepseek-v4-flash",
+          temperature: 0.2,
+          maxTokens: 768
+        },
+        main: {
+          ...current.main,
+          label: "DeepSeek Main",
+          providerKind: "openai-compatible",
+          baseURL: "https://api.deepseek.com",
+          model: "deepseek-v4-pro",
+          temperature: 0.7,
+          maxTokens: 8192
+        },
+        compression: {
+          ...current.compression,
+          label: "DeepSeek Compression",
+          providerKind: "openai-compatible",
+          baseURL: "https://api.deepseek.com",
+          model: "deepseek-v4-flash",
+          temperature: 0.2,
+          maxTokens: 1024
+        }
+      };
+    });
+    setSettingsStatus("已套用 DeepSeek 预设，请填写 API Key 后保存。");
+  }
+}
+
+function ModelConfigEditor(props: {
+  readonly config: ModelRuntimeConfig;
+  readonly onChange: (config: ModelRuntimeConfig) => void;
+}): JSX.Element {
+  const roleLabels: Record<ModelRuntimeRole, string> = {
+    router: "前置 Router",
+    main: "主对话模型",
+    compression: "会话压缩模型"
+  };
+
+  function update(patch: Partial<ModelRuntimeConfig>): void {
+    props.onChange({
+      ...props.config,
+      ...patch
+    });
+  }
+
+  return (
+    <article className="model-card">
+      <h3>{roleLabels[props.config.role]}</h3>
+      <label>
+        <span>名称</span>
+        <input value={props.config.label} onChange={(event) => update({ label: event.target.value })} />
+      </label>
+      <label>
+        <span>Provider</span>
+        <select
+          value={props.config.providerKind}
+          onChange={(event) => update({ providerKind: event.target.value as ModelProviderKind })}
+        >
+          <option value="ollama">Ollama</option>
+          <option value="openai-compatible">OpenAI Compatible</option>
+          <option value="anthropic-compatible">Anthropic Compatible</option>
+        </select>
+      </label>
+      <label>
+        <span>Base URL</span>
+        <input value={props.config.baseURL} onChange={(event) => update({ baseURL: event.target.value })} />
+      </label>
+      <label>
+        <span>Model</span>
+        <input value={props.config.model} onChange={(event) => update({ model: event.target.value })} />
+      </label>
+      <label>
+        <span>API Key</span>
+        <input
+          type="password"
+          value={props.config.apiKey}
+          onChange={(event) => update({ apiKey: event.target.value })}
+          placeholder={props.config.providerKind === "ollama" ? "Ollama 可留空" : "本地保存，不提交"}
+        />
+      </label>
+      <div className="model-card__grid">
+        <label>
+          <span>Temperature</span>
+          <input
+            type="number"
+            min="0"
+            max="2"
+            step="0.1"
+            value={props.config.temperature}
+            onChange={(event) => update({ temperature: Number(event.target.value) })}
+          />
+        </label>
+        <label>
+          <span>Max Tokens</span>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            value={props.config.maxTokens}
+            onChange={(event) => update({ maxTokens: Number(event.target.value) })}
+          />
+        </label>
+      </div>
+    </article>
   );
 }
 
@@ -271,4 +565,10 @@ function formatResponse(response: ProviderDebugLog["response"]): string {
     "",
     response.content
   ].join("\n");
+}
+
+function formatTime(value: string): string {
+  return new Date(value).toLocaleString("zh-CN", {
+    hour12: false
+  });
 }

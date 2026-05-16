@@ -12,7 +12,9 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.92.0",
-    "@xiaomi/shared": "workspace:*"
+    "@types/better-sqlite3": "^7.6.13",
+    "@xiaomi/shared": "workspace:*",
+    "better-sqlite3": "^12.10.0"
   },
   "devDependencies": {
     "typescript": "^5.7.2"
