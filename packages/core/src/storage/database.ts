@@ -59,5 +59,40 @@ function migrate(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_conversation_summaries_session
       ON conversation_summaries (project_id, session_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS memories (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      importance REAL NOT NULL DEFAULT 0.5,
+      confidence REAL NOT NULL DEFAULT 0.7,
+      source_session_id TEXT,
+      source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memories_project
+      ON memories (project_id, status, updated_at);
+
+    CREATE TABLE IF NOT EXISTS prompt_iterations (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      target_template TEXT NOT NULL,
+      trigger TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      suggested_change TEXT NOT NULL,
+      source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'proposed',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_prompt_iterations_project
+      ON prompt_iterations (project_id, status, updated_at);
   `);
 }

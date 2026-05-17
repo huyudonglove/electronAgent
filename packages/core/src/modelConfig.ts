@@ -1,4 +1,5 @@
 export const MIMO_BASE_URL = "https://token-plan-cn.xiaomimimo.com/anthropic";
+export const MIMO_OPENAI_BASE_URL = "https://api.xiaomimimo.com/v1";
 export const MIMO_MODEL = "mimo-v2.5-pro";
 export const MIMO_MAX_TOKENS = 8192;
 

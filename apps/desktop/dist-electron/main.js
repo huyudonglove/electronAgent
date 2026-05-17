@@ -1,11 +1,11 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path$1 from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import fs from "node:fs";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 const sessions = /* @__PURE__ */ new Map();
 function getOrCreateSession(request, now) {
   if (request.sessionId && sessions.has(request.sessionId)) {
@@ -23,13 +23,14 @@ function getOrCreateSession(request, now) {
   sessions.set(session.id, session);
   return session;
 }
-function appendAssistantMessage(session, messages, assistantMessageId, roleLabel, content) {
+function appendAssistantMessage(session, messages, assistantMessageId, roleLabel, content, metadata) {
   const assistantMessage = {
     id: assistantMessageId,
     sender: "assistant",
     roleLabel,
     content,
-    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+    ...metadata ? { metadata } : {}
   };
   const updatedSession = {
     ...session,
@@ -58,175 +59,6 @@ function findProjectRoot$1() {
 }
 function resolveProjectPath(...parts) {
   return path$1.resolve(findProjectRoot$1() ?? process.cwd(), ...parts);
-}
-const execFileAsync = promisify(execFile);
-const MAX_OUTPUT_LENGTH = 2e4;
-const DEFAULT_TIMEOUT_MS = 3e4;
-const BUILD_TIMEOUT_MS = 12e4;
-async function runCommandThroughGateway(input) {
-  const startedAt = Date.now();
-  const policy = decideCommand(input.request, input.toolSelection);
-  if (policy.decision !== "allow") {
-    return {
-      request: input.request,
-      decision: policy.decision,
-      status: "skipped",
-      reason: policy.reason,
-      durationMs: Date.now() - startedAt
-    };
-  }
-  try {
-    const result = await execFileAsync(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", input.request.command],
-      {
-        cwd: path$1.resolve(input.request.cwd),
-        timeout: getTimeout(input.request.command),
-        windowsHide: true,
-        maxBuffer: MAX_OUTPUT_LENGTH * 2
-      }
-    );
-    return {
-      request: input.request,
-      decision: "allow",
-      status: "executed",
-      reason: policy.reason,
-      exitCode: 0,
-      stdout: truncateOutput(result.stdout),
-      stderr: truncateOutput(result.stderr),
-      durationMs: Date.now() - startedAt
-    };
-  } catch (error) {
-    const execError = error;
-    return {
-      request: input.request,
-      decision: "allow",
-      status: "failed",
-      reason: policy.reason,
-      exitCode: typeof execError.code === "number" ? execError.code : void 0,
-      stdout: truncateOutput(execError.stdout ?? ""),
-      stderr: truncateOutput(execError.stderr ?? execError.message ?? ""),
-      durationMs: Date.now() - startedAt
-    };
-  }
-}
-function decideCommand(request, toolSelection) {
-  if (!toolSelection.selected_tools.includes("command.run") || toolSelection.access_mode === "none") {
-    return {
-      decision: "deny",
-      reason: "本轮 Core 未开放 command.run。"
-    };
-  }
-  if (request.shell !== "powershell") {
-    return {
-      decision: "deny",
-      reason: "第一版 Command Gateway 只允许 PowerShell。"
-    };
-  }
-  const cwdCheck = checkWorkspaceCwd(request.cwd);
-  if (!cwdCheck.allowed) {
-    return {
-      decision: "deny",
-      reason: cwdCheck.reason
-    };
-  }
-  const command = request.command.trim();
-  if (isDangerousCommand(command)) {
-    return {
-      decision: "deny",
-      reason: "命令命中危险模式，已拒绝执行。"
-    };
-  }
-  if (toolSelection.access_mode === "project_read" && !isReadCommand(command)) {
-    return {
-      decision: "confirm",
-      reason: "当前只开放项目只读工具能力，这条命令需要更高权限。"
-    };
-  }
-  if (toolSelection.access_mode === "project_verify" && !isReadCommand(command) && !isVerifyCommand(command)) {
-    return {
-      decision: "confirm",
-      reason: "当前只开放项目读取和验证能力，这条命令需要写权限。"
-    };
-  }
-  if (requiresConfirm(command)) {
-    return {
-      decision: "confirm",
-      reason: "该命令需要用户确认，第一版暂不自动执行。"
-    };
-  }
-  return {
-    decision: "allow",
-    reason: "命令通过 Command Gateway 第一版策略。"
-  };
-}
-function checkWorkspaceCwd(cwd) {
-  const workspaceRoot = path$1.resolve(resolveProjectPath());
-  const resolvedCwd = path$1.resolve(cwd);
-  const relative = path$1.relative(workspaceRoot, resolvedCwd);
-  const isInsideWorkspace = relative === "" || !relative.startsWith("..") && !path$1.isAbsolute(relative);
-  return isInsideWorkspace ? { allowed: true, reason: "cwd 位于工作区内。" } : { allowed: false, reason: `cwd 不在工作区内：${resolvedCwd}` };
-}
-function isDangerousCommand(command) {
-  const lowerCommand = command.toLowerCase();
-  const dangerousPatterns = [
-    "invoke-expression",
-    "iex",
-    "curl |",
-    "irm ",
-    "iwr ",
-    "format-volume",
-    "format ",
-    "diskpart",
-    "shutdown",
-    "restart-computer",
-    "remove-item -recurse",
-    "rm -r",
-    "rmdir /s",
-    "del /s",
-    "set-executionpolicy"
-  ];
-  return dangerousPatterns.some((pattern) => lowerCommand.includes(pattern));
-}
-function isReadCommand(command) {
-  const normalized = command.trim().toLowerCase();
-  const readPrefixes = [
-    "get-childitem",
-    "dir",
-    "ls",
-    "get-content",
-    "select-string",
-    "test-path",
-    "resolve-path",
-    "git status",
-    "git diff",
-    "git log"
-  ];
-  return readPrefixes.some((prefix) => normalized.startsWith(prefix));
-}
-function isVerifyCommand(command) {
-  const normalized = command.trim().toLowerCase();
-  const verifyCommands = [
-    "corepack pnpm build",
-    "corepack pnpm test",
-    "pnpm build",
-    "pnpm test",
-    "npm run build",
-    "npm test"
-  ];
-  return verifyCommands.some((prefix) => normalized.startsWith(prefix));
-}
-function requiresConfirm(command) {
-  const normalized = command.trim().toLowerCase();
-  const confirmPatterns = ["git add", "git commit", "git push", "pnpm add", "npm install", "corepack pnpm add"];
-  return confirmPatterns.some((pattern) => normalized.startsWith(pattern));
-}
-function getTimeout(command) {
-  return isVerifyCommand(command) ? BUILD_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
-}
-function truncateOutput(output) {
-  return output.length > MAX_OUTPUT_LENGTH ? `${output.slice(0, MAX_OUTPUT_LENGTH)}
-[output truncated]` : output;
 }
 let database;
 function getDatabase() {
@@ -279,6 +111,41 @@ function migrate(db) {
 
     CREATE INDEX IF NOT EXISTS idx_conversation_summaries_session
       ON conversation_summaries (project_id, session_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS memories (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      importance REAL NOT NULL DEFAULT 0.5,
+      confidence REAL NOT NULL DEFAULT 0.7,
+      source_session_id TEXT,
+      source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memories_project
+      ON memories (project_id, status, updated_at);
+
+    CREATE TABLE IF NOT EXISTS prompt_iterations (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      target_template TEXT NOT NULL,
+      trigger TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      suggested_change TEXT NOT NULL,
+      source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'proposed',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_prompt_iterations_project
+      ON prompt_iterations (project_id, status, updated_at);
   `);
 }
 function getLatestConversationSummary(projectId, sessionId) {
@@ -356,15 +223,15 @@ function toConversationSummary(row) {
     sourceStartMessageId: row.source_start_message_id,
     sourceEndMessageId: row.source_end_message_id,
     summary: row.summary,
-    decisions: parseStringArray(row.decisions_json),
-    openQuestions: parseStringArray(row.open_questions_json),
-    constraints: parseStringArray(row.constraints_json),
-    taskProgress: parseStringArray(row.task_progress_json),
+    decisions: parseStringArray$1(row.decisions_json),
+    openQuestions: parseStringArray$1(row.open_questions_json),
+    constraints: parseStringArray$1(row.constraints_json),
+    taskProgress: parseStringArray$1(row.task_progress_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
 }
-function parseStringArray(value) {
+function parseStringArray$1(value) {
   const parsed = JSON.parse(value);
   return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
 }
@@ -378,7 +245,8 @@ function saveChatMessageEvent(input) {
     roleLabel: input.message.roleLabel,
     content: input.message.content,
     payload: {
-      createdAt: input.message.createdAt
+      createdAt: input.message.createdAt,
+      metadata: input.message.metadata
     },
     createdAt: input.message.createdAt
   });
@@ -415,7 +283,7 @@ function saveToolCallEvent(input) {
     sessionId: input.sessionId,
     type: "tool_call",
     actor: "model",
-    roleLabel: "command.run",
+    roleLabel: input.request.type,
     content,
     payload: input.request,
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
@@ -438,7 +306,7 @@ function saveToolResultEvent(input) {
     sessionId: input.sessionId,
     type: "tool_result",
     actor: "tool",
-    roleLabel: "Command Gateway",
+    roleLabel: "Tool Gateway",
     content,
     payload: input.result,
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
@@ -470,6 +338,65 @@ function saveModelReturnEvent(input) {
       stopReason: input.stopReason,
       usage: input.usage
     },
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveOutputEvaluationEvent(input) {
+  const content = JSON.stringify(input.result, null, 2);
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "output_evaluation",
+    actor: "evaluator",
+    roleLabel: "Output Evaluator",
+    content,
+    payload: input.result,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveMemoryWriteEvent(input) {
+  if (input.memories.length === 0) {
+    return void 0;
+  }
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "memory_write",
+    actor: "memory",
+    roleLabel: "Long Term Memory",
+    content: input.memories.map((memory) => `- ${memory.type}: ${memory.content}`).join("\n"),
+    payload: {
+      memories: input.memories
+    },
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function saveMemoryRecallEvent(input) {
+  if (input.memories.length === 0) {
+    return void 0;
+  }
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "memory_recall",
+    actor: "memory",
+    roleLabel: "Long Term Memory Recall",
+    content: input.memories.map((memory) => `- ${memory.type}: ${memory.content}`).join("\n"),
+    payload: {
+      memories: input.memories
+    },
+    createdAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+function savePromptIterationEvent(input) {
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "prompt_iteration",
+    actor: "prompt",
+    roleLabel: "Prompt Iteration Candidate",
+    content: input.record.suggestedChange,
+    payload: input.record,
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
   });
 }
@@ -555,7 +482,7 @@ function parseJsonPayload(content) {
     return {};
   }
 }
-const MIMO_BASE_URL = "https://token-plan-cn.xiaomimimo.com/anthropic";
+const MIMO_OPENAI_BASE_URL = "https://api.xiaomimimo.com/v1";
 const MIMO_MODEL = "mimo-v2.5-pro";
 const MIMO_MAX_TOKENS = 8192;
 const OLLAMA_BASE_URL = "http://127.0.0.1:11434";
@@ -622,15 +549,20 @@ function normalizeSettings(settings) {
   };
 }
 function normalizeConfig(value, fallback) {
+  const providerKind = (value == null ? void 0 : value.providerKind) === "openai-compatible" || (value == null ? void 0 : value.providerKind) === "anthropic-compatible" || (value == null ? void 0 : value.providerKind) === "ollama" ? value.providerKind : fallback.providerKind;
+  const requestedToolMode = (value == null ? void 0 : value.toolCallingMode) === "native-openai" || (value == null ? void 0 : value.toolCallingMode) === "text-json" ? value.toolCallingMode : fallback.toolCallingMode;
+  const toolCallingMode = providerKind === "openai-compatible" ? requestedToolMode : "text-json";
   return {
     role: fallback.role,
     label: stringOr(value == null ? void 0 : value.label, fallback.label),
-    providerKind: (value == null ? void 0 : value.providerKind) === "openai-compatible" || (value == null ? void 0 : value.providerKind) === "anthropic-compatible" || (value == null ? void 0 : value.providerKind) === "ollama" ? value.providerKind : fallback.providerKind,
+    providerKind,
     baseURL: stringOr(value == null ? void 0 : value.baseURL, fallback.baseURL),
     model: stringOr(value == null ? void 0 : value.model, fallback.model),
     apiKey: stringOr(value == null ? void 0 : value.apiKey, fallback.apiKey),
     temperature: numberOr(value == null ? void 0 : value.temperature, fallback.temperature),
-    maxTokens: numberOr(value == null ? void 0 : value.maxTokens, fallback.maxTokens)
+    maxTokens: numberOr(value == null ? void 0 : value.maxTokens, fallback.maxTokens),
+    toolCallingMode,
+    thinkingEnabled: toolCallingMode === "native-openai" ? true : providerKind === "openai-compatible" && typeof (value == null ? void 0 : value.thinkingEnabled) === "boolean" ? value.thinkingEnabled : false
   };
 }
 function defaultRouterConfig() {
@@ -642,19 +574,23 @@ function defaultRouterConfig() {
     model: OLLAMA_INTENT_MODEL,
     apiKey: "",
     temperature: 0.2,
-    maxTokens: 768
+    maxTokens: 768,
+    toolCallingMode: "text-json",
+    thinkingEnabled: false
   };
 }
 function defaultMainConfig() {
   return {
     role: "main",
-    label: "MiMo Main",
-    providerKind: "anthropic-compatible",
-    baseURL: MIMO_BASE_URL,
+    label: "MiMo Native Main",
+    providerKind: "openai-compatible",
+    baseURL: MIMO_OPENAI_BASE_URL,
     model: MIMO_MODEL,
     apiKey: getMimoApiKey() ?? "",
     temperature: 1,
-    maxTokens: MIMO_MAX_TOKENS
+    maxTokens: MIMO_MAX_TOKENS,
+    toolCallingMode: "native-openai",
+    thinkingEnabled: true
   };
 }
 function defaultCompressionConfig() {
@@ -666,7 +602,9 @@ function defaultCompressionConfig() {
     model: OLLAMA_INTENT_MODEL,
     apiKey: "",
     temperature: 0.2,
-    maxTokens: 1024
+    maxTokens: 1024,
+    toolCallingMode: "text-json",
+    thinkingEnabled: false
   };
 }
 function stringOr(value, fallback) {
@@ -761,6 +699,12 @@ const COMPRESSION_PROMPT_MODULES = [
 const COMPRESSION_USER_MODULES = [
   "packages/memorizes/compression/02-input.md"
 ];
+const EVALUATOR_PROMPT_MODULES = [
+  "packages/memorizes/evaluator/01-system.md"
+];
+const EVALUATOR_USER_MODULES = [
+  "packages/memorizes/evaluator/02-input.md"
+];
 function buildIntentSystemPrompt() {
   return readMarkdownFiles(INTENT_PROMPT_MODULES);
 }
@@ -785,6 +729,16 @@ function buildCompressionUserPrompt(input) {
   return renderTemplate(readMarkdownFiles(COMPRESSION_USER_MODULES), {
     previous_summary: input.previousSummary || "无",
     messages: formatMessages(input.messages)
+  });
+}
+function buildEvaluatorSystemPrompt() {
+  return readMarkdownFiles(EVALUATOR_PROMPT_MODULES);
+}
+function buildEvaluatorUserPrompt(input) {
+  return renderTemplate(readMarkdownFiles(EVALUATOR_USER_MODULES), {
+    user_input: input.userInput,
+    router_result: input.routerResult,
+    assistant_answer: input.assistantAnswer
   });
 }
 function formatRecentMessages(messages) {
@@ -956,11 +910,154 @@ async function streamOpenAiChat(input) {
     stopReason
   };
 }
+async function streamOpenAiChatWithNativeTools(input) {
+  const baseMessages = buildOpenAiMessages(input);
+  const tools = buildOpenAiTools(input.toolSelection.selected_tools);
+  if (tools.length === 0) {
+    return streamOpenAiChat(input);
+  }
+  const messages = [...baseMessages];
+  const nativeMessages = [];
+  const nativeToolResults = [];
+  let content = "";
+  let stopReason;
+  let usage;
+  let toolRequestCount = 0;
+  for (let requestIndex = 0; requestIndex < 8; requestIndex += 1) {
+    const response = await createOpenAiNativeToolChat({
+      config: input.config,
+      messages,
+      tools,
+      latestUserMessage: input.latestUserMessage
+    });
+    const assistantMessage = normalizeAssistantMessage(response.message);
+    messages.push(assistantMessage);
+    nativeMessages.push(assistantMessage);
+    stopReason = response.stopReason;
+    usage = response.usage;
+    if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+      content = assistantMessage.content ?? "";
+      if (content) {
+        input.onDelta(content);
+      }
+      break;
+    }
+    for (const toolCall of assistantMessage.tool_calls) {
+      if (toolRequestCount >= 8) {
+        break;
+      }
+      toolRequestCount += 1;
+      const request = toolRequestToLocalRequest(toolCall);
+      const result = request ? await input.executeToolRequest(request) : unsupportedNativeToolResult(toolCall);
+      const toolMessage = {
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: formatNativeToolResult(result)
+      };
+      messages.push(toolMessage);
+      nativeMessages.push(toolMessage);
+      nativeToolResults.push(result);
+    }
+    if (toolRequestCount >= 8) {
+      break;
+    }
+  }
+  if (!content && toolRequestCount >= 8) {
+    content = "[系统提示：本轮原生工具调用已达到 8 次上限，已停止继续请求工具。]";
+    input.onDelta(content);
+  }
+  return {
+    content,
+    stopReason,
+    usage,
+    nativeMessages,
+    nativeToolResults
+  };
+}
+async function createOpenAiNativeToolChat(input) {
+  var _a2;
+  const startedAtMs = Date.now();
+  const requestBody = {
+    model: input.config.model,
+    messages: input.messages,
+    tools: input.tools,
+    tool_choice: "auto",
+    temperature: input.config.temperature,
+    max_tokens: input.config.maxTokens,
+    stream: false,
+    ...input.config.thinkingEnabled ? { thinking: { type: "enabled" } } : {}
+  };
+  const endpoint = `${trimTrailingSlash(input.config.baseURL)}/chat/completions`;
+  const debugLog = createDebugLogBase({
+    providerId: `${input.config.role}-${input.config.providerKind}-native-tools`,
+    model: input.config.model,
+    baseURL: input.config.baseURL,
+    request: {
+      method: "POST",
+      endpoint,
+      headers: buildDebugHeaders(input.config),
+      body: requestBody,
+      messageCount: input.messages.length,
+      latestUserMessage: input.latestUserMessage
+    }
+  });
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: buildHeaders$1(input.config),
+    body: JSON.stringify(requestBody)
+  });
+  if (!response.ok) {
+    const message2 = `${response.status}: ${await response.text()}`;
+    addProviderDebugLog({
+      ...debugLog,
+      status: "failed",
+      completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      error: message2
+    });
+    throw new Error(`OpenAI-compatible 原生工具调用失败：${message2}`);
+  }
+  const data = await response.json();
+  const choice = (_a2 = data.choices) == null ? void 0 : _a2[0];
+  const message = choice == null ? void 0 : choice.message;
+  addProviderDebugLog({
+    ...debugLog,
+    status: "succeeded",
+    completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    durationMs: Date.now() - startedAtMs,
+    response: {
+      content: JSON.stringify({
+        reasoning_content: message == null ? void 0 : message.reasoning_content,
+        content: message == null ? void 0 : message.content,
+        tool_calls: message == null ? void 0 : message.tool_calls
+      }, null, 2),
+      stopReason: choice == null ? void 0 : choice.finish_reason,
+      usage: data.usage
+    }
+  });
+  return {
+    message,
+    stopReason: choice == null ? void 0 : choice.finish_reason,
+    usage: data.usage
+  };
+}
 function buildOpenAiMessages(input) {
-  const conversationMessages = input.messages.filter((message) => message.sender === "user" || message.sender === "assistant").map((message) => ({
-    role: message.sender === "assistant" ? "assistant" : "user",
-    content: message.content
-  }));
+  const conversationMessages = input.messages.filter((message) => message.sender === "user" || message.sender === "assistant").flatMap((message) => {
+    if (message.sender === "assistant") {
+      const nativeMessages = extractNativeOpenAiMessages(message);
+      if (nativeMessages.length > 0) {
+        return nativeMessages;
+      }
+      return [{
+        role: "assistant",
+        content: message.content
+      }];
+    }
+    return [{
+      role: "user",
+      content: message.content
+    }];
+  });
   const latestUserMessage = conversationMessages.at(-1);
   const historyMessages = latestUserMessage ? conversationMessages.slice(0, -1) : conversationMessages;
   return [
@@ -975,6 +1072,244 @@ function buildOpenAiMessages(input) {
     },
     ...latestUserMessage ? [latestUserMessage] : []
   ];
+}
+function buildOpenAiTools(selectedTools) {
+  const selected = new Set(selectedTools);
+  const tools = [];
+  if (selected.has("file.read")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "file_read",
+        description: "Read a text file inside the current workspace.",
+        parameters: objectSchema({
+          reason: stringSchema("Why this file needs to be read."),
+          path: stringSchema("Workspace-relative or absolute path inside the workspace."),
+          maxBytes: numberSchema("Maximum number of bytes to read.")
+        }, ["path"])
+      }
+    });
+  }
+  if (selected.has("file.list")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "file_list",
+        description: "List files or directories inside the current workspace.",
+        parameters: objectSchema({
+          reason: stringSchema("Why this directory needs to be listed."),
+          path: stringSchema("Workspace-relative or absolute directory path inside the workspace."),
+          recursive: { type: "boolean", description: "Whether to list recursively." },
+          maxEntries: numberSchema("Maximum number of entries to return.")
+        }, ["path"])
+      }
+    });
+  }
+  if (selected.has("file.search")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "file_search",
+        description: "Search text in files inside the current workspace.",
+        parameters: objectSchema({
+          reason: stringSchema("Why this search is needed."),
+          path: stringSchema("Workspace-relative search root. Optional."),
+          query: stringSchema("Text to search for."),
+          glob: stringSchema("Optional simple file suffix or glob hint."),
+          maxResults: numberSchema("Maximum number of results to return.")
+        }, ["query"])
+      }
+    });
+  }
+  if (selected.has("file.write")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "file_write",
+        description: "Write a text file inside the current workspace.",
+        parameters: objectSchema({
+          reason: stringSchema("Why this file needs to be written."),
+          path: stringSchema("Workspace-relative or absolute path inside the workspace."),
+          content: stringSchema("Full file content to write.")
+        }, ["path", "content"])
+      }
+    });
+  }
+  if (selected.has("memory.save")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "memory_save",
+        description: "Save a durable memory for future agent turns.",
+        parameters: objectSchema({
+          reason: stringSchema("Why this memory should be saved."),
+          content: stringSchema("Memory content."),
+          memoryType: {
+            type: "string",
+            enum: ["fact", "preference", "decision", "plan", "constraint"],
+            description: "Memory category."
+          },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "Short tags."
+          },
+          importance: numberSchema("Importance between 0 and 1.")
+        }, ["content"])
+      }
+    });
+  }
+  if (selected.has("command.run")) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "command_run",
+        description: "Run a PowerShell command in the current workspace when semantic tools are not enough.",
+        parameters: objectSchema({
+          reason: stringSchema("Why this command is needed."),
+          cwd: stringSchema("Working directory inside the workspace."),
+          command: stringSchema("PowerShell command to execute.")
+        }, ["command"])
+      }
+    });
+  }
+  return tools;
+}
+function toolRequestToLocalRequest(toolCall) {
+  const args = parseArguments(toolCall.function.arguments);
+  const reason = typeof args.reason === "string" ? args.reason : "";
+  if (toolCall.function.name === "file_read" && typeof args.path === "string") {
+    return {
+      type: "file.read",
+      reason,
+      path: args.path,
+      maxBytes: typeof args.maxBytes === "number" ? args.maxBytes : void 0
+    };
+  }
+  if (toolCall.function.name === "file_list" && typeof args.path === "string") {
+    return {
+      type: "file.list",
+      reason,
+      path: args.path,
+      recursive: args.recursive === true,
+      maxEntries: typeof args.maxEntries === "number" ? args.maxEntries : void 0
+    };
+  }
+  if (toolCall.function.name === "file_search" && typeof args.query === "string") {
+    return {
+      type: "file.search",
+      reason,
+      path: typeof args.path === "string" ? args.path : void 0,
+      query: args.query,
+      glob: typeof args.glob === "string" ? args.glob : void 0,
+      maxResults: typeof args.maxResults === "number" ? args.maxResults : void 0
+    };
+  }
+  if (toolCall.function.name === "file_write" && typeof args.path === "string" && typeof args.content === "string") {
+    return {
+      type: "file.write",
+      reason,
+      path: args.path,
+      content: args.content
+    };
+  }
+  if (toolCall.function.name === "memory_save" && typeof args.content === "string") {
+    return {
+      type: "memory.save",
+      reason,
+      content: args.content,
+      memoryType: toMemoryType$1(args.memoryType),
+      tags: Array.isArray(args.tags) ? args.tags.filter((item) => typeof item === "string") : void 0,
+      importance: typeof args.importance === "number" ? args.importance : void 0
+    };
+  }
+  if (toolCall.function.name === "command_run" && typeof args.command === "string") {
+    return {
+      type: "command.run",
+      reason,
+      shell: "powershell",
+      cwd: typeof args.cwd === "string" ? args.cwd : "",
+      command: args.command
+    };
+  }
+  return void 0;
+}
+function normalizeAssistantMessage(message) {
+  return {
+    role: "assistant",
+    content: (message == null ? void 0 : message.content) ?? "",
+    ...(message == null ? void 0 : message.reasoning_content) ? { reasoning_content: message.reasoning_content } : {},
+    ...(message == null ? void 0 : message.tool_calls) && message.tool_calls.length > 0 ? { tool_calls: message.tool_calls } : {}
+  };
+}
+function unsupportedNativeToolResult(toolCall) {
+  return {
+    request: {
+      type: "memory.save",
+      reason: "unsupported native tool call",
+      content: `Unsupported tool call: ${toolCall.function.name}`
+    },
+    decision: "deny",
+    status: "skipped",
+    reason: `不支持的原生工具：${toolCall.function.name}`,
+    stderr: toolCall.function.arguments
+  };
+}
+function formatNativeToolResult(result) {
+  return JSON.stringify({
+    type: result.request.type,
+    decision: result.decision,
+    status: result.status,
+    reason: result.reason,
+    exitCode: result.exitCode,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    output: result.output,
+    data: result.data
+  }, null, 2);
+}
+function extractNativeOpenAiMessages(message) {
+  var _a2;
+  const value = (_a2 = message.metadata) == null ? void 0 : _a2.openaiNativeMessages;
+  return Array.isArray(value) ? value.filter(isOpenAiMessage) : [];
+}
+function isOpenAiMessage(value) {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const role = value.role;
+  return role === "assistant" || role === "tool" || role === "user" || role === "system";
+}
+function parseArguments(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === "object" && parsed !== null ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function toMemoryType$1(value) {
+  const allowed = ["fact", "preference", "decision", "plan", "constraint"];
+  return typeof value === "string" && allowed.includes(value) ? value : void 0;
+}
+function objectSchema(properties, required) {
+  return {
+    type: "object",
+    properties,
+    required
+  };
+}
+function stringSchema(description) {
+  return {
+    type: "string",
+    description
+  };
+}
+function numberSchema(description) {
+  return {
+    type: "number",
+    description
+  };
 }
 function buildHeaders$1(config) {
   return {
@@ -1077,13 +1412,13 @@ function parseCompressionResult(content) {
   }
   return {
     summary: parsed.summary,
-    decisions: toStringArray$1(parsed.decisions),
-    openQuestions: toStringArray$1(parsed.open_questions),
-    constraints: toStringArray$1(parsed.constraints),
-    taskProgress: toStringArray$1(parsed.task_progress)
+    decisions: toStringArray$2(parsed.decisions),
+    openQuestions: toStringArray$2(parsed.open_questions),
+    constraints: toStringArray$2(parsed.constraints),
+    taskProgress: toStringArray$2(parsed.task_progress)
   };
 }
-function toStringArray$1(value) {
+function toStringArray$2(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
 }
 const MIN_MESSAGES_BEFORE_COMPRESSION = 24;
@@ -1140,6 +1475,599 @@ function selectSourceMessages(messages, latestSummary, compressionEndIndex) {
   const afterPreviousSummaryIndex = latestSummary ? messages.findIndex((message) => message.id === latestSummary.sourceEndMessageId) + 1 : 0;
   const startIndex = afterPreviousSummaryIndex > 0 ? afterPreviousSummaryIndex : 0;
   return messages.slice(startIndex, compressionEndIndex + 1);
+}
+function captureLongTermMemories(input) {
+  if (!shouldCaptureMemory(input.userContent, input.routerResult)) {
+    return [];
+  }
+  return [
+    saveMemory({
+      projectId: input.projectId,
+      type: inferMemoryType(input.userContent),
+      content: input.userContent,
+      tags: input.routerResult.keywords,
+      importance: inferImportance(input.userContent),
+      confidence: input.routerResult.confidence || 0.7,
+      sourceSessionId: input.sessionId,
+      sourceEventIds: [input.userMessageId]
+    })
+  ];
+}
+function saveMemory(input) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const memory = {
+    id: `memory-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    projectId: input.projectId,
+    type: input.type,
+    content: input.content.trim(),
+    tags: [...new Set(input.tags.filter((tag) => tag.trim().length > 0))],
+    importance: clamp01(input.importance),
+    confidence: clamp01(input.confidence),
+    sourceSessionId: input.sourceSessionId,
+    sourceEventIds: input.sourceEventIds,
+    status: "active",
+    createdAt: now,
+    updatedAt: now
+  };
+  getDatabase().prepare(
+    `
+        INSERT INTO memories (
+          id,
+          project_id,
+          type,
+          content,
+          tags_json,
+          importance,
+          confidence,
+          source_session_id,
+          source_event_ids_json,
+          status,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+  ).run(
+    memory.id,
+    memory.projectId,
+    memory.type,
+    memory.content,
+    JSON.stringify(memory.tags),
+    memory.importance,
+    memory.confidence,
+    memory.sourceSessionId ?? null,
+    JSON.stringify(memory.sourceEventIds),
+    memory.status,
+    memory.createdAt,
+    memory.updatedAt
+  );
+  return memory;
+}
+function listRelevantMemories(input) {
+  const rows = getDatabase().prepare(
+    `
+        SELECT *
+        FROM memories
+        WHERE project_id = ? AND status = 'active'
+        ORDER BY importance DESC, updated_at DESC
+        LIMIT 80
+      `
+  ).all(input.projectId);
+  const queryTerms = terms(input.query);
+  return rows.map(toMemoryRecord).map((memory) => ({
+    memory,
+    score: scoreMemory(memory, queryTerms)
+  })).filter((item) => item.score > 0 || item.memory.importance >= 0.8).sort((a, b) => b.score - a.score || b.memory.importance - a.memory.importance).slice(0, input.limit ?? 6).map((item) => item.memory);
+}
+function shouldCaptureMemory(content, routerResult) {
+  const normalized = content.toLowerCase();
+  const explicitSignals = [
+    "记住",
+    "记录",
+    "长期",
+    "以后",
+    "后续",
+    "我希望",
+    "我偏好",
+    "我不希望",
+    "不要",
+    "需要记录",
+    "规则",
+    "系统规则",
+    "决定",
+    "确认"
+  ];
+  return explicitSignals.some((signal) => normalized.includes(signal.toLowerCase())) || routerResult.task_type === "design" && routerResult.keywords.some((keyword) => ["记忆", "提示词", "架构", "规则"].includes(keyword));
+}
+function inferMemoryType(content) {
+  if (content.includes("不要") || content.includes("我希望") || content.includes("偏好")) {
+    return "preference";
+  }
+  if (content.includes("决定") || content.includes("确认")) {
+    return "decision";
+  }
+  if (content.includes("后续") || content.includes("规划") || content.includes("目标")) {
+    return "plan";
+  }
+  if (content.includes("规则") || content.includes("必须")) {
+    return "constraint";
+  }
+  return "fact";
+}
+function inferImportance(content) {
+  if (content.includes("系统规则") || content.includes("必须") || content.includes("长期")) {
+    return 0.9;
+  }
+  if (content.includes("我希望") || content.includes("决定") || content.includes("确认")) {
+    return 0.8;
+  }
+  return 0.65;
+}
+function scoreMemory(memory, queryTerms) {
+  const haystack = `${memory.content} ${memory.tags.join(" ")}`.toLowerCase();
+  const termScore = queryTerms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0);
+  return termScore + memory.importance * 0.5 + memory.confidence * 0.25;
+}
+function terms(value) {
+  return value.toLowerCase().split(/[\s,，。！？、:：;；"'`]+/).map((item) => item.trim()).filter((item) => item.length >= 2);
+}
+function toMemoryRecord(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    type: row.type,
+    content: row.content,
+    tags: parseStringArray(row.tags_json),
+    importance: row.importance,
+    confidence: row.confidence,
+    sourceSessionId: row.source_session_id,
+    sourceEventIds: parseStringArray(row.source_event_ids_json),
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+function parseStringArray(value) {
+  const parsed = JSON.parse(value);
+  return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
+}
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+const execFileAsync = promisify(execFile);
+const MAX_OUTPUT_LENGTH = 2e4;
+const DEFAULT_TIMEOUT_MS = 3e4;
+const BUILD_TIMEOUT_MS = 12e4;
+async function runCommandThroughGateway(input) {
+  const startedAt = Date.now();
+  const policy = decideCommand(input.request);
+  if (policy.decision !== "allow") {
+    return {
+      request: input.request,
+      decision: policy.decision,
+      status: "skipped",
+      reason: policy.reason,
+      durationMs: Date.now() - startedAt
+    };
+  }
+  try {
+    const result = await execFileAsync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", input.request.command],
+      {
+        cwd: path$1.resolve(input.request.cwd),
+        timeout: getTimeout(input.request.command),
+        windowsHide: true,
+        maxBuffer: MAX_OUTPUT_LENGTH * 2
+      }
+    );
+    return {
+      request: input.request,
+      decision: "allow",
+      status: "executed",
+      reason: policy.reason,
+      exitCode: 0,
+      stdout: truncateOutput(result.stdout),
+      stderr: truncateOutput(result.stderr),
+      durationMs: Date.now() - startedAt
+    };
+  } catch (error) {
+    const execError = error;
+    return {
+      request: input.request,
+      decision: "allow",
+      status: "failed",
+      reason: policy.reason,
+      exitCode: typeof execError.code === "number" ? execError.code : void 0,
+      stdout: truncateOutput(execError.stdout ?? ""),
+      stderr: truncateOutput(execError.stderr ?? execError.message ?? ""),
+      durationMs: Date.now() - startedAt
+    };
+  }
+}
+function decideCommand(request, _toolSelection) {
+  if (request.shell !== "powershell") {
+    return {
+      decision: "deny",
+      reason: "当前命令执行器只支持 PowerShell。"
+    };
+  }
+  const command = request.command.trim();
+  const deletionWarning = getDeletionWarning(command);
+  if (deletionWarning) {
+    return {
+      decision: "confirm",
+      reason: deletionWarning
+    };
+  }
+  return {
+    decision: "allow",
+    reason: "管理员 Agent 模式：PowerShell 命令默认放行。"
+  };
+}
+function isVerifyCommand(command) {
+  const normalized = command.trim().toLowerCase();
+  const verifyCommands = [
+    "corepack pnpm build",
+    "corepack pnpm test",
+    "pnpm build",
+    "pnpm test",
+    "npm run build",
+    "npm test"
+  ];
+  return verifyCommands.some((prefix) => normalized.startsWith(prefix));
+}
+function getDeletionWarning(command) {
+  const normalized = command.trim().toLowerCase();
+  const deletionPatterns = [
+    "remove-item",
+    " rm ",
+    "rm ",
+    "del ",
+    "erase ",
+    "rmdir ",
+    "rd ",
+    "git clean",
+    "rimraf"
+  ];
+  return deletionPatterns.some((pattern) => normalized.includes(pattern)) ? "删除确认：该 PowerShell 命令看起来包含删除/清理操作，需要用户确认后才能执行。" : void 0;
+}
+function getTimeout(command) {
+  return isVerifyCommand(command) ? BUILD_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+}
+function truncateOutput(output) {
+  return output.length > MAX_OUTPUT_LENGTH ? `${output.slice(0, MAX_OUTPUT_LENGTH)}
+[output truncated]` : output;
+}
+const DEFAULT_MAX_READ_BYTES = 8e4;
+const DEFAULT_MAX_LIST_ENTRIES = 200;
+const DEFAULT_MAX_SEARCH_RESULTS = 80;
+const MAX_WRITE_BYTES = 3e5;
+const SKIPPED_DIRECTORIES = /* @__PURE__ */ new Set([".git", "node_modules", "dist", "dist-electron", ".vite"]);
+const PROTECTED_WRITE_FILE_NAMES = /* @__PURE__ */ new Set([
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.production",
+  "secrets.local.json",
+  "model-runtime.local.json",
+  "agent.db",
+  "agent.db-shm",
+  "agent.db-wal"
+]);
+const PROTECTED_WRITE_EXTENSIONS = /* @__PURE__ */ new Set([".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".sqlite", ".db"]);
+const PROTECTED_WRITE_PATH_PARTS = /* @__PURE__ */ new Set([".ssh"]);
+async function runLocalToolThroughGateway(input) {
+  if (input.request.type === "command.run") {
+    return runCommandThroughGateway({
+      request: input.request,
+      toolSelection: input.toolSelection
+    });
+  }
+  const startedAt = Date.now();
+  const policy = decideLocalTool(input.request, input.toolSelection);
+  if (policy.decision !== "allow") {
+    return {
+      request: input.request,
+      decision: policy.decision,
+      status: "skipped",
+      reason: policy.reason,
+      durationMs: Date.now() - startedAt
+    };
+  }
+  try {
+    const result = await executeLocalTool({
+      request: input.request,
+      projectId: input.projectId,
+      sessionId: input.sessionId
+    });
+    return {
+      request: input.request,
+      decision: "allow",
+      status: "executed",
+      reason: policy.reason,
+      ...result,
+      durationMs: Date.now() - startedAt
+    };
+  } catch (error) {
+    return {
+      request: input.request,
+      decision: "allow",
+      status: "failed",
+      reason: policy.reason,
+      stderr: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt
+    };
+  }
+}
+function decideLocalTool(request, toolSelection) {
+  if (isReadTool(request)) {
+    return {
+      decision: "allow",
+      reason: `${request.type} 在管理员 Agent 模式下默认放行，包含敏感文件读取。`
+    };
+  }
+  return {
+    decision: "allow",
+    reason: `${request.type} 在管理员 Agent 模式下默认放行。`
+  };
+}
+async function executeLocalTool(input) {
+  if (input.request.type === "file.read") {
+    return readFileTool(input.request);
+  }
+  if (input.request.type === "file.list") {
+    return listFileTool(input.request);
+  }
+  if (input.request.type === "file.search") {
+    return searchFileTool(input.request);
+  }
+  if (input.request.type === "file.write") {
+    return writeFileTool(input.request);
+  }
+  return saveMemoryTool(input.request, input.projectId, input.sessionId);
+}
+function readFileTool(request) {
+  const filePath = resolveWorkspacePath(request.path);
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile()) {
+    throw new Error(`不是文件：${filePath}`);
+  }
+  const maxBytes = request.maxBytes ?? DEFAULT_MAX_READ_BYTES;
+  const content = fs.readFileSync(filePath, "utf8");
+  const truncated = Buffer.byteLength(content, "utf8") > maxBytes;
+  const output = truncated ? content.slice(0, maxBytes) : content;
+  return {
+    output,
+    data: {
+      path: filePath,
+      bytes: stat.size,
+      truncated
+    }
+  };
+}
+function listFileTool(request) {
+  const dirPath = resolveWorkspacePath(request.path);
+  const stat = fs.statSync(dirPath);
+  if (!stat.isDirectory()) {
+    throw new Error(`不是目录：${dirPath}`);
+  }
+  const maxEntries = request.maxEntries ?? DEFAULT_MAX_LIST_ENTRIES;
+  const entries = request.recursive ? listRecursive(dirPath, maxEntries) : fs.readdirSync(dirPath, { withFileTypes: true }).slice(0, maxEntries).map((entry) => {
+    return {
+      path: path$1.join(dirPath, entry.name),
+      type: entry.isDirectory() ? "directory" : "file"
+    };
+  });
+  return {
+    output: entries.map((entry) => `${entry.type === "directory" ? "[dir]" : "[file]"} ${relativeWorkspacePath(entry.path)}`).join("\n"),
+    data: {
+      path: dirPath,
+      entries,
+      truncated: entries.length >= maxEntries
+    }
+  };
+}
+function searchFileTool(request) {
+  const rootPath = resolveWorkspacePath(request.path ?? ".");
+  const stat = fs.statSync(rootPath);
+  const maxResults = request.maxResults ?? DEFAULT_MAX_SEARCH_RESULTS;
+  const files = stat.isDirectory() ? collectFiles(rootPath, maxResults * 20) : [rootPath];
+  const results = [];
+  const query = request.query.toLowerCase();
+  for (const filePath of files) {
+    if (results.length >= maxResults) {
+      break;
+    }
+    if (request.glob && !filePath.endsWith(request.glob.replace("*", ""))) {
+      continue;
+    }
+    const content = readTextFileIfPossible(filePath);
+    if (content === void 0) {
+      continue;
+    }
+    const lines = content.split(/\r?\n/);
+    for (let index = 0; index < lines.length && results.length < maxResults; index += 1) {
+      if (lines[index].toLowerCase().includes(query)) {
+        results.push({
+          path: filePath,
+          line: index + 1,
+          text: lines[index].trim()
+        });
+      }
+    }
+  }
+  return {
+    output: results.map((item) => `${relativeWorkspacePath(item.path)}:${item.line}: ${item.text}`).join("\n"),
+    data: {
+      query: request.query,
+      results,
+      truncated: results.length >= maxResults
+    }
+  };
+}
+function writeFileTool(request) {
+  const filePath = resolveWorkspacePath(request.path);
+  assertNotProtectedWritePath(filePath);
+  const bytes = Buffer.byteLength(request.content, "utf8");
+  if (bytes > MAX_WRITE_BYTES) {
+    throw new Error(`写入内容过大：${bytes} bytes`);
+  }
+  fs.mkdirSync(path$1.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, request.content, "utf8");
+  return {
+    output: `已写入 ${relativeWorkspacePath(filePath)} (${bytes} bytes)`,
+    data: {
+      path: filePath,
+      bytes
+    }
+  };
+}
+function saveMemoryTool(request, projectId, sessionId) {
+  const memory = saveMemory({
+    projectId,
+    type: request.memoryType ?? "fact",
+    content: request.content,
+    tags: request.tags ?? [],
+    importance: request.importance ?? 0.75,
+    confidence: 0.8,
+    sourceSessionId: sessionId,
+    sourceEventIds: []
+  });
+  return {
+    output: `已保存长期记忆：${memory.content}`,
+    data: memory
+  };
+}
+function resolveWorkspacePath(inputPath) {
+  const workspaceRoot = path$1.resolve(resolveProjectPath());
+  const resolved = path$1.isAbsolute(inputPath) ? path$1.resolve(inputPath) : path$1.resolve(workspaceRoot, inputPath);
+  const relative = path$1.relative(workspaceRoot, resolved);
+  if (relative.startsWith("..") || path$1.isAbsolute(relative)) {
+    throw new Error(`路径不在工作区内：${resolved}`);
+  }
+  return resolved;
+}
+function relativeWorkspacePath(inputPath) {
+  return path$1.relative(resolveProjectPath(), inputPath) || ".";
+}
+function isReadTool(request) {
+  return request.type === "file.read" || request.type === "file.list" || request.type === "file.search";
+}
+function assertNotProtectedWritePath(inputPath) {
+  if (isProtectedWritePath(inputPath)) {
+    throw new Error(`敏感文件写入受保护，已拒绝写入：${relativeWorkspacePath(inputPath)}`);
+  }
+}
+function isProtectedWritePath(inputPath) {
+  const workspaceRoot = path$1.resolve(resolveProjectPath());
+  const relative = path$1.relative(workspaceRoot, path$1.resolve(inputPath));
+  const normalizedParts = relative.split(path$1.sep).map((part) => part.toLowerCase());
+  const fileName = normalizedParts.at(-1) ?? "";
+  const ext = path$1.extname(fileName);
+  return normalizedParts.some((part) => PROTECTED_WRITE_PATH_PARTS.has(part)) || PROTECTED_WRITE_FILE_NAMES.has(fileName) || PROTECTED_WRITE_EXTENSIONS.has(ext) || fileName.includes("secret") || fileName.includes("token") || fileName.includes("apikey") || fileName.includes("api-key") || fileName.includes("credential");
+}
+function listRecursive(rootPath, maxEntries) {
+  const results = [];
+  const pending = [rootPath];
+  while (pending.length > 0 && results.length < maxEntries) {
+    const current = pending.shift() ?? rootPath;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (results.length >= maxEntries) {
+        break;
+      }
+      if (entry.isDirectory() && SKIPPED_DIRECTORIES.has(entry.name)) {
+        continue;
+      }
+      const entryPath = path$1.join(current, entry.name);
+      const type = entry.isDirectory() ? "directory" : "file";
+      results.push({ path: entryPath, type });
+      if (entry.isDirectory()) {
+        pending.push(entryPath);
+      }
+    }
+  }
+  return results;
+}
+function collectFiles(rootPath, maxFiles) {
+  const files = [];
+  const pending = [rootPath];
+  while (pending.length > 0 && files.length < maxFiles) {
+    const current = pending.shift() ?? rootPath;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (files.length >= maxFiles) {
+        break;
+      }
+      if (entry.isDirectory() && SKIPPED_DIRECTORIES.has(entry.name)) {
+        continue;
+      }
+      const entryPath = path$1.join(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(entryPath);
+      } else {
+        files.push(entryPath);
+      }
+    }
+  }
+  return files;
+}
+function readTextFileIfPossible(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > DEFAULT_MAX_READ_BYTES) {
+      return void 0;
+    }
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return void 0;
+  }
+}
+function savePromptIteration(input) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const record = {
+    id: `prompt-iteration-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    targetTemplate: input.targetTemplate,
+    trigger: input.trigger,
+    reason: input.reason,
+    suggestedChange: input.suggestedChange,
+    sourceEventIds: input.sourceEventIds,
+    status: "proposed",
+    createdAt: now,
+    updatedAt: now
+  };
+  getDatabase().prepare(
+    `
+        INSERT INTO prompt_iterations (
+          id,
+          project_id,
+          session_id,
+          target_template,
+          trigger,
+          reason,
+          suggested_change,
+          source_event_ids_json,
+          status,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+  ).run(
+    record.id,
+    record.projectId,
+    record.sessionId,
+    record.targetTemplate,
+    record.trigger,
+    record.reason,
+    record.suggestedChange,
+    JSON.stringify(record.sourceEventIds),
+    record.status,
+    record.createdAt,
+    record.updatedAt
+  );
+  return record;
 }
 function __classPrivateFieldSet(receiver, state, value, kind, f) {
   if (typeof state === "function" ? receiver !== state || true : !state.has(receiver))
@@ -7219,16 +8147,25 @@ async function streamMimoChat(input) {
   if (config.providerKind === "openai-compatible") {
     const runtimeContext = [
       input.conversationSummary ? formatConversationSummary(input.conversationSummary) : "",
+      input.memories && input.memories.length > 0 ? formatLongTermMemories(input.memories) : "",
       buildIntentContextMessage(input.intentSummary)
     ].filter((item) => item.trim().length > 0).join("\n\n---\n\n");
-    return streamOpenAiChat({
+    const openAiInput = {
       config,
       system: systemPrompt,
       messages: trimCompressedMessages(input.messages, input.conversationSummary),
       runtimeContext,
       latestUserMessage: input.latestUserMessage,
       onDelta: input.onDelta
-    });
+    };
+    if (config.toolCallingMode === "native-openai" && input.toolSelection && input.executeToolRequest) {
+      return streamOpenAiChatWithNativeTools({
+        ...openAiInput,
+        toolSelection: input.toolSelection,
+        executeToolRequest: input.executeToolRequest
+      });
+    }
+    return streamOpenAiChat(openAiInput);
   }
   if (config.providerKind !== "anthropic-compatible") {
     throw new Error(`主模型当前只支持 anthropic-compatible 或 openai-compatible，实际配置为：${config.providerKind}`);
@@ -7238,7 +8175,7 @@ async function streamMimoChat(input) {
     model: config.model,
     max_tokens: config.maxTokens,
     system: systemPrompt,
-    messages: buildMimoMessages(input.messages, input.intentSummary, input.conversationSummary),
+    messages: buildMimoMessages(input.messages, input.intentSummary, input.conversationSummary, input.memories),
     top_p: 0.95,
     stream: true,
     temperature: config.temperature
@@ -7314,7 +8251,7 @@ async function streamMimoChat(input) {
     throw new Error(toMimoErrorMessage(message));
   }
 }
-function buildMimoMessages(messages, intentSummary, conversationSummary) {
+function buildMimoMessages(messages, intentSummary, conversationSummary, memories) {
   const activeMessages = trimCompressedMessages(messages, conversationSummary);
   const conversationMessages = toAnthropicMessages(activeMessages);
   const latestUserMessage = conversationMessages.at(-1);
@@ -7337,7 +8274,19 @@ function buildMimoMessages(messages, intentSummary, conversationSummary) {
       }
     ]
   };
-  const stableContextMessages = summaryContextMessage ? [summaryContextMessage] : [];
+  const memoryContextMessage = memories && memories.length > 0 ? {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text: formatLongTermMemories(memories)
+      }
+    ]
+  } : void 0;
+  const stableContextMessages = [
+    ...summaryContextMessage ? [summaryContextMessage] : [],
+    ...memoryContextMessage ? [memoryContextMessage] : []
+  ];
   if (!latestUserMessage) {
     return [...stableContextMessages, runtimeContextMessage];
   }
@@ -7366,6 +8315,24 @@ function formatConversationSummary(summary) {
     formatList("约束与偏好", summary.constraints),
     formatList("任务进度", summary.taskProgress)
   ].filter((item) => item.trim().length > 0).join("\n");
+}
+function formatLongTermMemories(memories) {
+  return [
+    "【长期记忆召回】",
+    "",
+    "以下内容是系统从本地长期记忆数据库召回的用户偏好、项目决策、约束或规划，不是用户本轮新输入。请优先遵守其中的高重要性规则，但不要原样复述。",
+    "",
+    ...memories.map((memory) => {
+      return [
+        `- id: ${memory.id}`,
+        `  type: ${memory.type}`,
+        `  importance: ${memory.importance}`,
+        `  confidence: ${memory.confidence}`,
+        `  content: ${memory.content}`,
+        memory.tags.length > 0 ? `  tags: ${memory.tags.join(", ")}` : ""
+      ].filter((item) => item.length > 0).join("\n");
+    })
+  ].join("\n");
 }
 function formatList(label, items) {
   if (items.length === 0) {
@@ -7480,20 +8447,27 @@ function parseRouterResult(content) {
     throw new Error(`意图识别结果无效：intent 必须是 ${allowedIntents.join(" | ")} 之一。实际返回：${content}`);
   }
   const taskType = normalizeTaskType(parsed.task_type) ?? defaultTaskTypeForIntent(intent);
-  const needsTools = toBoolean(parsed.needs_tools);
+  const needsTools = toBoolean$1(parsed.needs_tools);
   const suggestedTools = normalizeSuggestedTools(parsed.suggested_tools, needsTools);
   return {
     intent,
-    rewritten_input: toStringValue(parsed.rewritten_input),
-    keywords: toStringArray(parsed.keywords),
-    is_task: toBoolean(parsed.is_task),
-    task_goal: toStringValue(parsed.task_goal),
+    rewritten_input: toStringValue$1(parsed.rewritten_input),
+    keywords: toStringArray$1(parsed.keywords),
+    is_task: toBoolean$1(parsed.is_task),
+    task_goal: toStringValue$1(parsed.task_goal),
     task_type: taskType,
-    requires_project_context: toBoolean(parsed.requires_project_context),
+    reasoning_brief: toStringValue$1(parsed.reasoning_brief),
+    planned_steps: toStringArray$1(parsed.planned_steps),
+    expected_output: toStringValue$1(parsed.expected_output),
+    verification_question: toStringValue$1(parsed.verification_question),
+    success_criteria: toStringArray$1(parsed.success_criteria),
+    needs_user_clarification: toBoolean$1(parsed.needs_user_clarification),
+    clarifying_questions: toStringArray$1(parsed.clarifying_questions),
+    requires_project_context: toBoolean$1(parsed.requires_project_context),
     needs_tools: needsTools,
     suggested_tools: suggestedTools,
-    tool_reason: toStringValue(parsed.tool_reason),
-    confidence: clampConfidence(parsed.confidence)
+    tool_reason: toStringValue$1(parsed.tool_reason),
+    confidence: clampConfidence$1(parsed.confidence)
   };
 }
 function normalizeIntent(intent, allowedIntents) {
@@ -7539,6 +8513,160 @@ function defaultTaskTypeForIntent(intent) {
   }
   return "analysis";
 }
+function toBoolean$1(value) {
+  return value === true;
+}
+function toStringValue$1(value) {
+  return typeof value === "string" ? value : "";
+}
+function toStringArray$1(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+function normalizeSuggestedTools(value, needsTools) {
+  const allowed = /* @__PURE__ */ new Set(["command.run", "file.read", "file.list", "file.search", "file.write", "memory.save"]);
+  const tools = toStringArray$1(value).filter((tool) => allowed.has(tool));
+  if (needsTools && tools.length === 0) {
+    return ["file.read", "file.search", "command.run"];
+  }
+  return tools;
+}
+function clampConfidence$1(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(1, value));
+}
+async function evaluateOutput(input) {
+  var _a2;
+  const config = getModelRuntimeConfig("router");
+  const routerResultText = JSON.stringify(input.routerResult, null, 2);
+  const userPrompt = buildEvaluatorUserPrompt({
+    userInput: input.userInput,
+    routerResult: routerResultText,
+    assistantAnswer: input.assistantAnswer
+  });
+  if (config.providerKind === "openai-compatible") {
+    const content2 = await createOpenAiJsonChat({
+      config,
+      providerId: "output-evaluator-openai-compatible",
+      latestUserMessage: input.userInput,
+      messages: [
+        {
+          role: "system",
+          content: buildEvaluatorSystemPrompt()
+        },
+        {
+          role: "user",
+          content: userPrompt
+        }
+      ]
+    });
+    return parseEvaluationResult(content2, input.routerResult);
+  }
+  if (config.providerKind !== "ollama") {
+    return defaultPassedEvaluation(input.routerResult, "Router Provider 不支持输出验收，跳过 evaluator。");
+  }
+  const startedAtMs = Date.now();
+  const requestBody = {
+    model: config.model,
+    stream: false,
+    messages: [
+      {
+        role: "system",
+        content: buildEvaluatorSystemPrompt()
+      },
+      {
+        role: "user",
+        content: userPrompt
+      }
+    ],
+    options: {
+      temperature: Math.min(config.temperature, 0.2),
+      num_predict: config.maxTokens
+    }
+  };
+  const debugLog = createDebugLogBase({
+    providerId: "output-evaluator-ollama",
+    model: config.model,
+    baseURL: config.baseURL,
+    request: {
+      method: "POST",
+      endpoint: `${config.baseURL}/api/chat`,
+      headers: {
+        "content-type": "application/json"
+      },
+      body: requestBody,
+      messageCount: input.messages.length,
+      latestUserMessage: input.userInput
+    }
+  });
+  const response = await fetch(`${config.baseURL}/api/chat`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(requestBody)
+  });
+  if (!response.ok) {
+    throw new Error(`Ollama Evaluator HTTP ${response.status}: ${await response.text()}`);
+  }
+  const data = await response.json();
+  const content = (((_a2 = data.message) == null ? void 0 : _a2.content) ?? data.response ?? "").trim();
+  const evaluation = parseEvaluationResult(content, input.routerResult);
+  addProviderDebugLog({
+    ...debugLog,
+    status: "succeeded",
+    completedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    durationMs: Date.now() - startedAtMs,
+    response: {
+      content
+    }
+  });
+  return evaluation;
+}
+function parseEvaluationResult(content, routerResult) {
+  const parsed = JSON.parse(content);
+  const nextAction = normalizeNextAction(parsed.next_action);
+  const shouldEvaluate = toBoolean(parsed.should_evaluate);
+  const missingCriteria = toStringArray(parsed.missing_criteria);
+  const passed = toBoolean(parsed.passed) && missingCriteria.length === 0;
+  return {
+    should_evaluate: shouldEvaluate,
+    passed,
+    verification_question: toStringValue(parsed.verification_question) || routerResult.verification_question,
+    satisfied_criteria: toStringArray(parsed.satisfied_criteria),
+    missing_criteria: missingCriteria,
+    issues: toStringArray(parsed.issues),
+    check_steps: toStringArray(parsed.check_steps),
+    decision_reason: toStringValue(parsed.decision_reason),
+    next_action: passed ? "final" : nextAction,
+    revision_instruction: toStringValue(parsed.revision_instruction),
+    confidence: clampConfidence(parsed.confidence)
+  };
+}
+function defaultPassedEvaluation(routerResult, reason) {
+  return {
+    should_evaluate: false,
+    passed: true,
+    verification_question: routerResult.verification_question,
+    satisfied_criteria: [],
+    missing_criteria: [],
+    issues: [reason],
+    check_steps: [],
+    decision_reason: reason,
+    next_action: "final",
+    revision_instruction: "",
+    confidence: 1
+  };
+}
+function normalizeNextAction(value) {
+  const allowed = ["final", "revise_answer", "ask_user", "use_tools"];
+  if (typeof value !== "string") {
+    return "revise_answer";
+  }
+  const nextAction = value.trim();
+  return allowed.includes(nextAction) ? nextAction : "revise_answer";
+}
 function toBoolean(value) {
   return value === true;
 }
@@ -7548,13 +8676,6 @@ function toStringValue(value) {
 function toStringArray(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
 }
-function normalizeSuggestedTools(value, needsTools) {
-  const tools = toStringArray(value).filter((tool) => tool === "command.run");
-  if (needsTools && tools.length === 0) {
-    return ["command.run"];
-  }
-  return tools;
-}
 function clampConfidence(value) {
   if (typeof value !== "number" || Number.isNaN(value)) {
     return 0;
@@ -7562,7 +8683,15 @@ function clampConfidence(value) {
   return Math.max(0, Math.min(1, value));
 }
 const JSON_FENCE_PATTERN = /```(?:json)?\s*([\s\S]*?)```/gi;
-function parseCommandRunRequests(content) {
+const TOOL_TYPES = /* @__PURE__ */ new Set([
+  "command.run",
+  "file.read",
+  "file.list",
+  "file.search",
+  "file.write",
+  "memory.save"
+]);
+function parseLocalToolRequests(content) {
   const candidates = collectJsonCandidates(content);
   const requests = [];
   for (const candidate of candidates) {
@@ -7571,7 +8700,7 @@ function parseCommandRunRequests(content) {
   }
   return requests.slice(0, 8);
 }
-function removeCommandRunRequestBlocks(content) {
+function removeLocalToolRequestBlocks(content) {
   const withoutFencedRequests = content.replace(JSON_FENCE_PATTERN, (block, jsonContent) => {
     const parsed2 = parseJson((jsonContent ?? "").trim());
     const requests2 = [];
@@ -7615,8 +8744,8 @@ function collectRequests(value, requests) {
   if (!isObject(value)) {
     return;
   }
-  if (value.type === "command.run") {
-    const request = toCommandRunRequest(value);
+  if (typeof value.type === "string" && TOOL_TYPES.has(value.type)) {
+    const request = toToolRequest(value);
     if (request) {
       requests.push(request);
     }
@@ -7624,6 +8753,27 @@ function collectRequests(value, requests) {
   for (const item of Object.values(value)) {
     collectRequests(item, requests);
   }
+}
+function toToolRequest(value) {
+  if (value.type === "command.run") {
+    return toCommandRunRequest(value);
+  }
+  if (value.type === "file.read") {
+    return toFileReadRequest(value);
+  }
+  if (value.type === "file.list") {
+    return toFileListRequest(value);
+  }
+  if (value.type === "file.search") {
+    return toFileSearchRequest(value);
+  }
+  if (value.type === "file.write") {
+    return toFileWriteRequest(value);
+  }
+  if (value.type === "memory.save") {
+    return toMemorySaveRequest(value);
+  }
+  return void 0;
 }
 function toCommandRunRequest(value) {
   if (typeof value.command !== "string" || value.command.trim().length === 0) {
@@ -7637,70 +8787,109 @@ function toCommandRunRequest(value) {
     command: value.command
   };
 }
+function toFileReadRequest(value) {
+  if (typeof value.path !== "string" || value.path.trim().length === 0) {
+    return void 0;
+  }
+  return {
+    type: "file.read",
+    reason: toReason(value),
+    path: value.path,
+    maxBytes: toPositiveInteger(value.maxBytes)
+  };
+}
+function toFileListRequest(value) {
+  if (typeof value.path !== "string" || value.path.trim().length === 0) {
+    return void 0;
+  }
+  return {
+    type: "file.list",
+    reason: toReason(value),
+    path: value.path,
+    recursive: value.recursive === true,
+    maxEntries: toPositiveInteger(value.maxEntries)
+  };
+}
+function toFileSearchRequest(value) {
+  if (typeof value.query !== "string" || value.query.trim().length === 0) {
+    return void 0;
+  }
+  return {
+    type: "file.search",
+    reason: toReason(value),
+    path: typeof value.path === "string" && value.path.trim().length > 0 ? value.path : void 0,
+    query: value.query,
+    glob: typeof value.glob === "string" && value.glob.trim().length > 0 ? value.glob : void 0,
+    maxResults: toPositiveInteger(value.maxResults)
+  };
+}
+function toFileWriteRequest(value) {
+  if (typeof value.path !== "string" || value.path.trim().length === 0 || typeof value.content !== "string") {
+    return void 0;
+  }
+  return {
+    type: "file.write",
+    reason: toReason(value),
+    path: value.path,
+    content: value.content
+  };
+}
+function toMemorySaveRequest(value) {
+  if (typeof value.content !== "string" || value.content.trim().length === 0) {
+    return void 0;
+  }
+  return {
+    type: "memory.save",
+    reason: toReason(value),
+    content: value.content,
+    memoryType: toMemoryType(value.memoryType),
+    tags: Array.isArray(value.tags) ? value.tags.filter((item) => typeof item === "string") : void 0,
+    importance: typeof value.importance === "number" ? value.importance : void 0
+  };
+}
+function toReason(value) {
+  return typeof value.reason === "string" ? value.reason : "";
+}
+function toPositiveInteger(value) {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : void 0;
+}
+function toMemoryType(value) {
+  const allowed = ["fact", "preference", "decision", "plan", "constraint"];
+  return typeof value === "string" && allowed.includes(value) ? value : void 0;
+}
 function isObject(value) {
   return typeof value === "object" && value !== null;
 }
 const ROUTER_CONFIDENCE_THRESHOLD = 0.7;
 const COMMAND_RUN = "command.run";
+const READ_TOOLS = ["file.read", "file.list", "file.search"];
+const WRITE_TOOLS = ["file.write"];
+const MEMORY_TOOLS = ["memory.save"];
 function selectToolsForRouter(routerResult) {
   const routerConfidence = routerResult.confidence;
-  if (routerConfidence < ROUTER_CONFIDENCE_THRESHOLD) {
-    return noTools(routerResult, "Router 置信度低于阈值，Core 保守处理，不自动开放工具。");
-  }
-  if (routerResult.intent === "chat") {
-    return noTools(routerResult, "普通聊天不需要开放工具。");
-  }
-  if (routerResult.intent === "search") {
-    return noTools(routerResult, "当前阶段尚未实现 web.search，因此不开放搜索工具。");
-  }
-  if (!routerResult.needs_tools && routerResult.suggested_tools.length === 0) {
-    return noTools(routerResult, "Router 判断本轮不需要工具。");
-  }
-  if (!routerResult.needs_tools && routerResult.intent === "analysis" && !routerResult.requires_project_context) {
-    return noTools(routerResult, "普通分析不需要读取项目上下文。");
-  }
-  if (!routerResult.suggested_tools.includes(COMMAND_RUN) && !routerResult.needs_tools) {
-    return noTools(routerResult, "Router 没有建议当前可用工具。");
-  }
   return {
-    selected_tools: [COMMAND_RUN],
-    access_mode: resolveAccessMode(routerResult),
+    selected_tools: allTools(),
+    access_mode: "project_write",
     reason: buildReason(routerResult),
     confidence_threshold: ROUTER_CONFIDENCE_THRESHOLD,
     router_confidence: routerConfidence,
     auto_allowed: true
   };
 }
-function noTools(routerResult, reason) {
-  return {
-    selected_tools: [],
-    access_mode: "none",
-    reason,
-    confidence_threshold: ROUTER_CONFIDENCE_THRESHOLD,
-    router_confidence: routerResult.confidence,
-    auto_allowed: false
-  };
-}
-function resolveAccessMode(routerResult) {
-  if (routerResult.intent === "code" || routerResult.task_type === "implementation") {
-    return "project_write";
-  }
-  if (routerResult.intent === "debug" || routerResult.task_type === "debugging" || routerResult.task_type === "verification") {
-    return "project_verify";
-  }
-  return "project_read";
+function allTools() {
+  return [...READ_TOOLS, ...WRITE_TOOLS, COMMAND_RUN, ...MEMORY_TOOLS];
 }
 function buildReason(routerResult) {
   if (routerResult.tool_reason) {
     return routerResult.tool_reason;
   }
   if (routerResult.intent === "code") {
-    return "本轮需要推进代码实现，允许后续 Command Gateway 在项目范围内处理读写和验证命令。";
+    return "管理员 Agent 模式：默认开放读取、写入、记忆和命令工具；删除类命令会在结果中提醒。";
   }
   if (routerResult.intent === "debug") {
-    return "本轮需要定位问题，允许后续 Command Gateway 在项目范围内读取文件并执行验证命令。";
+    return "管理员 Agent 模式：默认开放读取、写入、记忆和命令工具；删除类命令会在结果中提醒。";
   }
-  return "本轮需要项目上下文，允许后续 Command Gateway 进行项目只读检查。";
+  return "管理员 Agent 模式：默认开放读取、写入、记忆和命令工具；删除类命令会在结果中提醒。";
 }
 function listModelProfiles() {
   const mainConfig = getModelRuntimeConfig("main");
@@ -7715,7 +8904,7 @@ function listModelProfiles() {
         chat: true,
         streamChat: true,
         structuredOutput: false,
-        toolCalling: false
+        toolCalling: mainConfig.toolCallingMode === "native-openai"
       }
     }
   ];
@@ -7774,6 +8963,33 @@ async function streamChatMessage(request, onEvent) {
       sessionId: session.id,
       content: JSON.stringify(routerResult, null, 2)
     });
+    const capturedMemories = captureLongTermMemories({
+      projectId: session.projectId,
+      sessionId: session.id,
+      userMessageId: userMessage.id,
+      userContent: request.message,
+      routerResult
+    });
+    saveMemoryWriteEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      memories: capturedMemories
+    });
+    const recalledMemories = listRelevantMemories({
+      projectId: session.projectId,
+      query: [
+        request.message,
+        routerResult.rewritten_input,
+        routerResult.keywords.join(" "),
+        routerResult.task_goal
+      ].join(" "),
+      limit: 6
+    });
+    saveMemoryRecallEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      memories: recalledMemories
+    });
     const toolSelection = selectToolsForRouter(routerResult);
     saveToolSelectionEvent({
       projectId: session.projectId,
@@ -7805,6 +9021,32 @@ async function streamChatMessage(request, onEvent) {
       latestUserMessage: request.message,
       intentSummary: runtimeContext,
       conversationSummary,
+      memories: recalledMemories,
+      toolSelection,
+      executeToolRequest: async (toolRequest) => {
+        onEvent({
+          type: "stage",
+          label: "原生工具执行",
+          detail: `正在执行 ${toolRequest.type}`
+        });
+        saveToolCallEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          request: toolRequest
+        });
+        const result2 = await runLocalToolThroughGateway({
+          request: toolRequest,
+          toolSelection,
+          projectId: session.projectId,
+          sessionId: session.id
+        });
+        saveToolResultEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          result: result2
+        });
+        return result2;
+      },
       onDelta: (delta) => {
         onEvent({
           type: "delta",
@@ -7820,7 +9062,7 @@ async function streamChatMessage(request, onEvent) {
       stopReason: modelResponse.stopReason,
       usage: modelResponse.usage
     });
-    const visibleModelContent = removeCommandRunRequestBlocks(modelResponse.content);
+    const visibleModelContent = removeLocalToolRequestBlocks(modelResponse.content);
     const shouldReplaceVisibleContent = visibleModelContent !== modelResponse.content;
     if (shouldReplaceVisibleContent) {
       onEvent({
@@ -7830,7 +9072,7 @@ async function streamChatMessage(request, onEvent) {
         content: visibleModelContent
       });
     }
-    const toolResults = await runRequestedCommands({
+    const toolResults = await runRequestedTools({
       content: modelResponse.content,
       projectId: session.projectId,
       sessionId: session.id,
@@ -7852,11 +9094,30 @@ async function streamChatMessage(request, onEvent) {
 
 【工具结果整理】
 ${followupResponse.content}` : "";
+    const contentBeforeEvaluation = `${visibleModelContent}${followupContent}`;
+    const evaluationResult = await maybeEvaluateAndRevise({
+      messages,
+      userInput: request.message,
+      routerResult,
+      assistantMessageId,
+      projectId: session.projectId,
+      sessionId: session.id,
+      content: contentBeforeEvaluation,
+      runtimeContext,
+      onEvent
+    });
     const content = appendModelReturnNotice(
-      `${visibleModelContent}${followupContent}`,
+      evaluationResult.content,
       (followupResponse == null ? void 0 : followupResponse.stopReason) ?? modelResponse.stopReason
     );
-    const result = appendAssistantMessage(session, messages, assistantMessageId, "MiMo", content);
+    const result = appendAssistantMessage(
+      session,
+      messages,
+      assistantMessageId,
+      "MiMo",
+      content,
+      buildAssistantMetadata(modelResponse)
+    );
     saveChatMessageEvent({
       projectId: session.projectId,
       sessionId: session.id,
@@ -7880,6 +9141,147 @@ ${followupResponse.content}` : "";
       error: message
     });
   }
+}
+function buildAssistantMetadata(modelResponse) {
+  if (!modelResponse.nativeMessages || modelResponse.nativeMessages.length === 0) {
+    return void 0;
+  }
+  return {
+    openaiNativeMessages: modelResponse.nativeMessages,
+    nativeToolResults: modelResponse.nativeToolResults ?? []
+  };
+}
+async function maybeEvaluateAndRevise(input) {
+  if (!shouldEvaluateOutput(input.routerResult)) {
+    return {
+      content: input.content
+    };
+  }
+  input.onEvent({
+    type: "stage",
+    label: "输出验收",
+    detail: "正在检查大模型回复是否满足本轮成功条件"
+  });
+  let evaluation;
+  try {
+    evaluation = await evaluateOutput({
+      messages: input.messages,
+      userInput: input.userInput,
+      routerResult: input.routerResult,
+      assistantAnswer: input.content
+    });
+    saveOutputEvaluationEvent({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      result: evaluation
+    });
+    const promptIteration = maybeCreatePromptIteration({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      evaluation,
+      routerResult: input.routerResult
+    });
+    if (promptIteration) {
+      savePromptIterationEvent({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        record: promptIteration
+      });
+    }
+  } catch (error) {
+    saveErrorEvent({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      message: error instanceof Error ? error.message : String(error),
+      stage: "输出验收"
+    });
+    return {
+      content: input.content
+    };
+  }
+  if (evaluation.passed || evaluation.next_action === "final") {
+    return {
+      content: input.content,
+      evaluation
+    };
+  }
+  if (evaluation.next_action !== "revise_answer") {
+    return {
+      content: [
+        input.content.trimEnd(),
+        "",
+        formatEvaluationNotice(evaluation)
+      ].join("\n"),
+      evaluation
+    };
+  }
+  const revision = await streamEvaluationRevision({
+    baseMessages: input.messages,
+    assistantMessageId: input.assistantMessageId,
+    firstAssistantContent: input.content,
+    userInput: input.userInput,
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    runtimeContext: input.runtimeContext,
+    evaluation,
+    onEvent: input.onEvent
+  });
+  return {
+    content: `${input.content}
+
+【补充修正】
+${revision.content}`,
+    evaluation
+  };
+}
+function maybeCreatePromptIteration(input) {
+  if (input.evaluation.passed || input.evaluation.next_action === "final") {
+    return void 0;
+  }
+  const targetTemplate = input.evaluation.next_action === "use_tools" ? "main.agent.v1" : "output.evaluator.v1";
+  const reason = [
+    `Evaluator next_action=${input.evaluation.next_action}`,
+    input.evaluation.decision_reason,
+    input.evaluation.missing_criteria.length > 0 ? `missing=${input.evaluation.missing_criteria.join("；")}` : "",
+    input.evaluation.issues.length > 0 ? `issues=${input.evaluation.issues.join("；")}` : ""
+  ].filter((item) => item.trim().length > 0).join("；");
+  const suggestedChange = [
+    `建议检查模板 ${targetTemplate}。`,
+    `任务类型：${input.routerResult.task_type}，意图：${input.routerResult.intent}。`,
+    input.routerResult.expected_output ? `期望产出：${input.routerResult.expected_output}。` : "",
+    input.evaluation.revision_instruction ? `修正指令：${input.evaluation.revision_instruction}` : "",
+    input.evaluation.missing_criteria.length > 0 ? `需要补强的验收项：${input.evaluation.missing_criteria.join("；")}` : ""
+  ].filter((item) => item.trim().length > 0).join("\n");
+  return savePromptIteration({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    targetTemplate,
+    trigger: "evaluation_gap",
+    reason: reason || "输出验收认为当前回复仍需后续动作。",
+    suggestedChange,
+    sourceEventIds: []
+  });
+}
+function shouldEvaluateOutput(routerResult) {
+  if (!routerResult.is_task || routerResult.intent === "chat") {
+    return false;
+  }
+  return routerResult.verification_question.trim().length > 0 || routerResult.success_criteria.length > 0;
+}
+function formatEvaluationNotice(evaluation) {
+  if (evaluation.next_action === "ask_user") {
+    return [
+      "[系统提示：本轮输出验收认为还需要用户补充信息。]",
+      evaluation.revision_instruction || evaluation.issues.join("；")
+    ].filter((item) => item.trim().length > 0).join("\n");
+  }
+  if (evaluation.next_action === "use_tools") {
+    return [
+      "[系统提示：本轮输出验收认为还需要工具或项目上下文才能继续。]",
+      evaluation.revision_instruction || evaluation.issues.join("；")
+    ].filter((item) => item.trim().length > 0).join("\n");
+  }
+  return "";
 }
 function appendModelReturnNotice(content, stopReason) {
   if (stopReason !== "max_tokens") {
@@ -7907,10 +9309,10 @@ async function streamToolResultFollowup(input) {
       sender: "user",
       roleLabel: "系统工具结果",
       content: [
-        "以下是本轮工具执行结果。这不是用户的新输入，而是本地 Command Gateway 返回的观察结果。",
+        "以下是本轮工具执行结果。这不是用户的新输入，而是本地 Tool Gateway 返回的观察结果。",
         "",
         "请基于这些结果给用户一个简洁的最终回应。",
-        "不要继续请求工具，不要重复前面的 command.run JSON。",
+        "不要继续请求工具，不要重复前面的工具 JSON。",
         "",
         toolReport
       ].join("\n"),
@@ -7957,8 +9359,73 @@ async function streamToolResultFollowup(input) {
   });
   return response;
 }
-async function runRequestedCommands(input) {
-  const requests = parseCommandRunRequests(input.content);
+async function streamEvaluationRevision(input) {
+  const revisionMessages = [
+    ...input.baseMessages,
+    {
+      id: `msg-eval-answer-${Date.now()}`,
+      sender: "assistant",
+      roleLabel: "MiMo",
+      content: input.firstAssistantContent,
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    },
+    {
+      id: `msg-eval-result-${Date.now()}`,
+      sender: "user",
+      roleLabel: "系统输出验收",
+      content: [
+        "以下是本轮输出验收结果。这不是用户的新输入，而是系统 evaluator 对上一条助手回复的检查结果。",
+        "",
+        "请只补充或修正缺失部分，不要重复已有内容，不要请求工具。",
+        "",
+        JSON.stringify(input.evaluation, null, 2)
+      ].join("\n"),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    }
+  ];
+  input.onEvent({
+    type: "stage",
+    label: "补充修正",
+    detail: "输出验收未通过，正在让大模型补充缺失内容"
+  });
+  input.onEvent({
+    type: "delta",
+    sessionId: input.sessionId,
+    messageId: input.assistantMessageId,
+    delta: "\n\n【补充修正】\n"
+  });
+  const response = await streamMimoChat({
+    messages: revisionMessages,
+    latestUserMessage: "系统输出验收",
+    intentSummary: JSON.stringify(
+      {
+        phase: "output_evaluation_revision",
+        previous_runtime_context: input.runtimeContext,
+        original_user_input: input.userInput,
+        output_evaluation: input.evaluation
+      },
+      null,
+      2
+    ),
+    onDelta: (delta) => {
+      input.onEvent({
+        type: "delta",
+        sessionId: input.sessionId,
+        messageId: input.assistantMessageId,
+        delta
+      });
+    }
+  });
+  saveModelReturnEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    stopReason: response.stopReason,
+    usage: response.usage
+  });
+  return response;
+}
+async function runRequestedTools(input) {
+  const requests = parseLocalToolRequests(input.content);
   const results = [];
   if (requests.length === 0) {
     return results;
@@ -7966,7 +9433,7 @@ async function runRequestedCommands(input) {
   input.onEvent({
     type: "stage",
     label: "工具执行",
-    detail: `检测到 ${requests.length} 个 command.run 请求，正在交给 Command Gateway`
+    detail: `检测到 ${requests.length} 个本地工具请求，正在交给 Tool Gateway`
   });
   for (const request of requests) {
     saveToolCallEvent({
@@ -7974,9 +9441,11 @@ async function runRequestedCommands(input) {
       sessionId: input.sessionId,
       request
     });
-    const result = await runCommandThroughGateway({
+    const result = await runLocalToolThroughGateway({
       request,
-      toolSelection: input.toolSelection
+      toolSelection: input.toolSelection,
+      projectId: input.projectId,
+      sessionId: input.sessionId
     });
     saveToolResultEvent({
       projectId: input.projectId,
@@ -7998,18 +9467,34 @@ function formatToolResults(results) {
     ...results.map((result, index) => {
       return [
         "",
-        `#${index + 1} ${result.request.command}`,
+        `#${index + 1} ${formatToolTitle(result)}`,
         `decision: ${result.decision}`,
         `status: ${result.status}`,
         `reason: ${result.reason}`,
         typeof result.exitCode === "number" ? `exitCode: ${result.exitCode}` : "",
+        result.output ? `output:
+${result.output}` : "",
         result.stdout ? `stdout:
 ${result.stdout}` : "",
         result.stderr ? `stderr:
-${result.stderr}` : ""
+${result.stderr}` : "",
+        result.data ? `data:
+${JSON.stringify(result.data, null, 2)}` : ""
       ].filter((line) => line.length > 0).join("\n");
     })
   ].join("\n");
+}
+function formatToolTitle(result) {
+  if (result.request.type === "command.run") {
+    return `command.run ${result.request.command}`;
+  }
+  if (result.request.type === "file.read" || result.request.type === "file.list" || result.request.type === "file.write") {
+    return `${result.request.type} ${result.request.path}`;
+  }
+  if (result.request.type === "file.search") {
+    return `${result.request.type} ${result.request.query}`;
+  }
+  return `${result.request.type} ${result.request.content.slice(0, 60)}`;
 }
 function createUserMessage(content, createdAt) {
   return {

@@ -26,14 +26,16 @@ export function appendAssistantMessage(
   messages: readonly ChatMessage[],
   assistantMessageId: string,
   roleLabel: string,
-  content: string
+  content: string,
+  metadata?: Record<string, unknown>
 ): { session: ChatSession; assistantMessage: ChatMessage } {
   const assistantMessage: ChatMessage = {
     id: assistantMessageId,
     sender: "assistant",
     roleLabel,
     content,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    ...(metadata ? { metadata } : {})
   };
   const updatedSession: ChatSession = {
     ...session,

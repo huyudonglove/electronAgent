@@ -1,21 +1,37 @@
-import type { ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, CommandRunResult, ModelProfile } from "@xiaomi/shared";
+import type {
+  ChatMessage,
+  ChatRequest,
+  ChatResponse,
+  ChatStreamEvent,
+  ModelProfile,
+  OutputEvaluationResult,
+  RouterResult,
+  ToolResult
+} from "@xiaomi/shared";
 import { appendAssistantMessage, getOrCreateSession } from "./chatSessions";
-import { runCommandThroughGateway } from "./commandGateway";
 import { maybeCompressConversation } from "./conversationCompressor";
 import {
   saveChatMessageEvent,
   saveErrorEvent,
+  saveMemoryRecallEvent,
+  saveMemoryWriteEvent,
   saveModelReturnEvent,
+  saveOutputEvaluationEvent,
+  savePromptIterationEvent,
   saveRouterResultEvent,
   saveToolCallEvent,
   saveToolResultEvent,
   saveToolSelectionEvent
 } from "./events";
+import { captureLongTermMemories, listRelevantMemories } from "./longTermMemories";
+import { runLocalToolThroughGateway } from "./localToolGateway";
 import { getModelRuntimeConfig } from "./modelRuntimeConfig";
 import { MIMO_MODEL } from "./modelConfig";
+import { savePromptIteration } from "./promptIterations";
 import { streamMimoChat } from "./providers/mimoProvider";
 import { recognizeIntent } from "./providers/ollamaIntentProvider";
-import { parseCommandRunRequests, removeCommandRunRequestBlocks } from "./toolCallParser";
+import { evaluateOutput } from "./providers/outputEvaluatorProvider";
+import { parseLocalToolRequests, removeLocalToolRequestBlocks } from "./toolCallParser";
 import { selectToolsForRouter } from "./toolSelectionPolicy";
 
 export type ChatStreamHandler = (event: ChatStreamEvent) => void;
@@ -34,7 +50,7 @@ export function listModelProfiles(): readonly ModelProfile[] {
         chat: true,
         streamChat: true,
         structuredOutput: false,
-        toolCalling: false
+        toolCalling: mainConfig.toolCallingMode === "native-openai"
       }
     }
   ];
@@ -104,6 +120,33 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
       sessionId: session.id,
       content: JSON.stringify(routerResult, null, 2)
     });
+    const capturedMemories = captureLongTermMemories({
+      projectId: session.projectId,
+      sessionId: session.id,
+      userMessageId: userMessage.id,
+      userContent: request.message,
+      routerResult
+    });
+    saveMemoryWriteEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      memories: capturedMemories
+    });
+    const recalledMemories = listRelevantMemories({
+      projectId: session.projectId,
+      query: [
+        request.message,
+        routerResult.rewritten_input,
+        routerResult.keywords.join(" "),
+        routerResult.task_goal
+      ].join(" "),
+      limit: 6
+    });
+    saveMemoryRecallEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      memories: recalledMemories
+    });
 
     const toolSelection = selectToolsForRouter(routerResult);
     saveToolSelectionEvent({
@@ -140,6 +183,33 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
       latestUserMessage: request.message,
       intentSummary: runtimeContext,
       conversationSummary,
+      memories: recalledMemories,
+      toolSelection,
+      executeToolRequest: async (toolRequest) => {
+        onEvent({
+          type: "stage",
+          label: "原生工具执行",
+          detail: `正在执行 ${toolRequest.type}`
+        });
+        saveToolCallEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          request: toolRequest
+        });
+        const result = await runLocalToolThroughGateway({
+          request: toolRequest,
+          toolSelection,
+          projectId: session.projectId,
+          sessionId: session.id
+        });
+        saveToolResultEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          result
+        });
+
+        return result;
+      },
       onDelta: (delta) => {
         onEvent({
           type: "delta",
@@ -155,7 +225,7 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
       stopReason: modelResponse.stopReason,
       usage: modelResponse.usage
     });
-    const visibleModelContent = removeCommandRunRequestBlocks(modelResponse.content);
+    const visibleModelContent = removeLocalToolRequestBlocks(modelResponse.content);
     const shouldReplaceVisibleContent = visibleModelContent !== modelResponse.content;
 
     if (shouldReplaceVisibleContent) {
@@ -167,7 +237,7 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
       });
     }
 
-    const toolResults = await runRequestedCommands({
+    const toolResults = await runRequestedTools({
       content: modelResponse.content,
       projectId: session.projectId,
       sessionId: session.id,
@@ -189,11 +259,31 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
       : undefined;
     const followupContent = followupResponse ? `\n\n【工具结果整理】\n${followupResponse.content}` : "";
 
+    const contentBeforeEvaluation = `${visibleModelContent}${followupContent}`;
+    const evaluationResult = await maybeEvaluateAndRevise({
+      messages,
+      userInput: request.message,
+      routerResult,
+      assistantMessageId,
+      projectId: session.projectId,
+      sessionId: session.id,
+      content: contentBeforeEvaluation,
+      runtimeContext,
+      onEvent
+    });
+
     const content = appendModelReturnNotice(
-      `${visibleModelContent}${followupContent}`,
+      evaluationResult.content,
       followupResponse?.stopReason ?? modelResponse.stopReason
     );
-    const result = appendAssistantMessage(session, messages, assistantMessageId, "MiMo", content);
+    const result = appendAssistantMessage(
+      session,
+      messages,
+      assistantMessageId,
+      "MiMo",
+      content,
+      buildAssistantMetadata(modelResponse)
+    );
     saveChatMessageEvent({
       projectId: session.projectId,
       sessionId: session.id,
@@ -220,6 +310,188 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
   }
 }
 
+function buildAssistantMetadata(modelResponse: {
+  readonly nativeMessages?: readonly unknown[];
+  readonly nativeToolResults?: readonly ToolResult[];
+}): Record<string, unknown> | undefined {
+  if (!modelResponse.nativeMessages || modelResponse.nativeMessages.length === 0) {
+    return undefined;
+  }
+
+  return {
+    openaiNativeMessages: modelResponse.nativeMessages,
+    nativeToolResults: modelResponse.nativeToolResults ?? []
+  };
+}
+
+async function maybeEvaluateAndRevise(input: {
+  readonly messages: readonly ChatMessage[];
+  readonly userInput: string;
+  readonly routerResult: RouterResult;
+  readonly assistantMessageId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly content: string;
+  readonly runtimeContext: string;
+  readonly onEvent: ChatStreamHandler;
+}): Promise<{ readonly content: string; readonly evaluation?: OutputEvaluationResult }> {
+  if (!shouldEvaluateOutput(input.routerResult)) {
+    return {
+      content: input.content
+    };
+  }
+
+  input.onEvent({
+    type: "stage",
+    label: "输出验收",
+    detail: "正在检查大模型回复是否满足本轮成功条件"
+  });
+
+  let evaluation: OutputEvaluationResult;
+  try {
+    evaluation = await evaluateOutput({
+      messages: input.messages,
+      userInput: input.userInput,
+      routerResult: input.routerResult,
+      assistantAnswer: input.content
+    });
+    saveOutputEvaluationEvent({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      result: evaluation
+    });
+    const promptIteration = maybeCreatePromptIteration({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      evaluation,
+      routerResult: input.routerResult
+    });
+    if (promptIteration) {
+      savePromptIterationEvent({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        record: promptIteration
+      });
+    }
+  } catch (error) {
+    saveErrorEvent({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      message: error instanceof Error ? error.message : String(error),
+      stage: "输出验收"
+    });
+
+    return {
+      content: input.content
+    };
+  }
+
+  if (evaluation.passed || evaluation.next_action === "final") {
+    return {
+      content: input.content,
+      evaluation
+    };
+  }
+
+  if (evaluation.next_action !== "revise_answer") {
+    return {
+      content: [
+        input.content.trimEnd(),
+        "",
+        formatEvaluationNotice(evaluation)
+      ].join("\n"),
+      evaluation
+    };
+  }
+
+  const revision = await streamEvaluationRevision({
+    baseMessages: input.messages,
+    assistantMessageId: input.assistantMessageId,
+    firstAssistantContent: input.content,
+    userInput: input.userInput,
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    runtimeContext: input.runtimeContext,
+    evaluation,
+    onEvent: input.onEvent
+  });
+
+  return {
+    content: `${input.content}\n\n【补充修正】\n${revision.content}`,
+    evaluation
+  };
+}
+
+function maybeCreatePromptIteration(input: {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly evaluation: OutputEvaluationResult;
+  readonly routerResult: RouterResult;
+}) {
+  if (input.evaluation.passed || input.evaluation.next_action === "final") {
+    return undefined;
+  }
+
+  const targetTemplate = input.evaluation.next_action === "use_tools" ? "main.agent.v1" : "output.evaluator.v1";
+  const reason = [
+    `Evaluator next_action=${input.evaluation.next_action}`,
+    input.evaluation.decision_reason,
+    input.evaluation.missing_criteria.length > 0 ? `missing=${input.evaluation.missing_criteria.join("；")}` : "",
+    input.evaluation.issues.length > 0 ? `issues=${input.evaluation.issues.join("；")}` : ""
+  ]
+    .filter((item) => item.trim().length > 0)
+    .join("；");
+  const suggestedChange = [
+    `建议检查模板 ${targetTemplate}。`,
+    `任务类型：${input.routerResult.task_type}，意图：${input.routerResult.intent}。`,
+    input.routerResult.expected_output ? `期望产出：${input.routerResult.expected_output}。` : "",
+    input.evaluation.revision_instruction ? `修正指令：${input.evaluation.revision_instruction}` : "",
+    input.evaluation.missing_criteria.length > 0 ? `需要补强的验收项：${input.evaluation.missing_criteria.join("；")}` : ""
+  ]
+    .filter((item) => item.trim().length > 0)
+    .join("\n");
+
+  return savePromptIteration({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    targetTemplate,
+    trigger: "evaluation_gap",
+    reason: reason || "输出验收认为当前回复仍需后续动作。",
+    suggestedChange,
+    sourceEventIds: []
+  });
+}
+
+function shouldEvaluateOutput(routerResult: RouterResult): boolean {
+  if (!routerResult.is_task || routerResult.intent === "chat") {
+    return false;
+  }
+
+  return routerResult.verification_question.trim().length > 0 || routerResult.success_criteria.length > 0;
+}
+
+function formatEvaluationNotice(evaluation: OutputEvaluationResult): string {
+  if (evaluation.next_action === "ask_user") {
+    return [
+      "[系统提示：本轮输出验收认为还需要用户补充信息。]",
+      evaluation.revision_instruction || evaluation.issues.join("；")
+    ]
+      .filter((item) => item.trim().length > 0)
+      .join("\n");
+  }
+
+  if (evaluation.next_action === "use_tools") {
+    return [
+      "[系统提示：本轮输出验收认为还需要工具或项目上下文才能继续。]",
+      evaluation.revision_instruction || evaluation.issues.join("；")
+    ]
+      .filter((item) => item.trim().length > 0)
+      .join("\n");
+  }
+
+  return "";
+}
+
 function appendModelReturnNotice(content: string, stopReason?: string): string {
   if (stopReason !== "max_tokens") {
     return content;
@@ -239,7 +511,7 @@ async function streamToolResultFollowup(input: {
   readonly projectId: string;
   readonly sessionId: string;
   readonly runtimeContext: string;
-  readonly toolResults: readonly CommandRunResult[];
+  readonly toolResults: readonly ToolResult[];
   readonly onEvent: ChatStreamHandler;
 }): Promise<{ readonly content: string; readonly stopReason?: string; readonly usage?: unknown }> {
   const toolReport = formatToolResults(input.toolResults);
@@ -257,10 +529,10 @@ async function streamToolResultFollowup(input: {
       sender: "user",
       roleLabel: "系统工具结果",
       content: [
-        "以下是本轮工具执行结果。这不是用户的新输入，而是本地 Command Gateway 返回的观察结果。",
+        "以下是本轮工具执行结果。这不是用户的新输入，而是本地 Tool Gateway 返回的观察结果。",
         "",
         "请基于这些结果给用户一个简洁的最终回应。",
-        "不要继续请求工具，不要重复前面的 command.run JSON。",
+        "不要继续请求工具，不要重复前面的工具 JSON。",
         "",
         toolReport
       ].join("\n"),
@@ -312,16 +584,96 @@ async function streamToolResultFollowup(input: {
   return response;
 }
 
-async function runRequestedCommands(input: {
+async function streamEvaluationRevision(input: {
+  readonly baseMessages: readonly ChatMessage[];
+  readonly assistantMessageId: string;
+  readonly firstAssistantContent: string;
+  readonly userInput: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly runtimeContext: string;
+  readonly evaluation: OutputEvaluationResult;
+  readonly onEvent: ChatStreamHandler;
+}): Promise<{ readonly content: string; readonly stopReason?: string; readonly usage?: unknown }> {
+  const revisionMessages: readonly ChatMessage[] = [
+    ...input.baseMessages,
+    {
+      id: `msg-eval-answer-${Date.now()}`,
+      sender: "assistant",
+      roleLabel: "MiMo",
+      content: input.firstAssistantContent,
+      createdAt: new Date().toISOString()
+    },
+    {
+      id: `msg-eval-result-${Date.now()}`,
+      sender: "user",
+      roleLabel: "系统输出验收",
+      content: [
+        "以下是本轮输出验收结果。这不是用户的新输入，而是系统 evaluator 对上一条助手回复的检查结果。",
+        "",
+        "请只补充或修正缺失部分，不要重复已有内容，不要请求工具。",
+        "",
+        JSON.stringify(input.evaluation, null, 2)
+      ].join("\n"),
+      createdAt: new Date().toISOString()
+    }
+  ];
+
+  input.onEvent({
+    type: "stage",
+    label: "补充修正",
+    detail: "输出验收未通过，正在让大模型补充缺失内容"
+  });
+  input.onEvent({
+    type: "delta",
+    sessionId: input.sessionId,
+    messageId: input.assistantMessageId,
+    delta: "\n\n【补充修正】\n"
+  });
+
+  const response = await streamMimoChat({
+    messages: revisionMessages,
+    latestUserMessage: "系统输出验收",
+    intentSummary: JSON.stringify(
+      {
+        phase: "output_evaluation_revision",
+        previous_runtime_context: input.runtimeContext,
+        original_user_input: input.userInput,
+        output_evaluation: input.evaluation
+      },
+      null,
+      2
+    ),
+    onDelta: (delta) => {
+      input.onEvent({
+        type: "delta",
+        sessionId: input.sessionId,
+        messageId: input.assistantMessageId,
+        delta
+      });
+    }
+  });
+
+  saveModelReturnEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    stopReason: response.stopReason,
+    usage: response.usage
+  });
+
+  return response;
+}
+
+async function runRequestedTools(input: {
   readonly content: string;
   readonly projectId: string;
   readonly sessionId: string;
-  readonly toolSelection: Parameters<typeof runCommandThroughGateway>[0]["toolSelection"];
+  readonly toolSelection: Parameters<typeof runLocalToolThroughGateway>[0]["toolSelection"];
   readonly onEvent: ChatStreamHandler;
   readonly assistantMessageId: string;
-}): Promise<readonly CommandRunResult[]> {
-  const requests = parseCommandRunRequests(input.content);
-  const results: CommandRunResult[] = [];
+}): Promise<readonly ToolResult[]> {
+  const requests = parseLocalToolRequests(input.content);
+  const results: ToolResult[] = [];
 
   if (requests.length === 0) {
     return results;
@@ -330,7 +682,7 @@ async function runRequestedCommands(input: {
   input.onEvent({
     type: "stage",
     label: "工具执行",
-    detail: `检测到 ${requests.length} 个 command.run 请求，正在交给 Command Gateway`
+    detail: `检测到 ${requests.length} 个本地工具请求，正在交给 Tool Gateway`
   });
 
   for (const request of requests) {
@@ -340,9 +692,11 @@ async function runRequestedCommands(input: {
       request
     });
 
-    const result = await runCommandThroughGateway({
+    const result = await runLocalToolThroughGateway({
       request,
-      toolSelection: input.toolSelection
+      toolSelection: input.toolSelection,
+      projectId: input.projectId,
+      sessionId: input.sessionId
     });
 
     saveToolResultEvent({
@@ -356,7 +710,7 @@ async function runRequestedCommands(input: {
   return results;
 }
 
-function formatToolResults(results: readonly CommandRunResult[]): string {
+function formatToolResults(results: readonly ToolResult[]): string {
   if (results.length === 0) {
     return "";
   }
@@ -368,18 +722,36 @@ function formatToolResults(results: readonly CommandRunResult[]): string {
     ...results.map((result, index) => {
       return [
         "",
-        `#${index + 1} ${result.request.command}`,
+        `#${index + 1} ${formatToolTitle(result)}`,
         `decision: ${result.decision}`,
         `status: ${result.status}`,
         `reason: ${result.reason}`,
         typeof result.exitCode === "number" ? `exitCode: ${result.exitCode}` : "",
+        result.output ? `output:\n${result.output}` : "",
         result.stdout ? `stdout:\n${result.stdout}` : "",
-        result.stderr ? `stderr:\n${result.stderr}` : ""
+        result.stderr ? `stderr:\n${result.stderr}` : "",
+        result.data ? `data:\n${JSON.stringify(result.data, null, 2)}` : ""
       ]
         .filter((line) => line.length > 0)
         .join("\n");
     })
   ].join("\n");
+}
+
+function formatToolTitle(result: ToolResult): string {
+  if (result.request.type === "command.run") {
+    return `command.run ${result.request.command}`;
+  }
+
+  if (result.request.type === "file.read" || result.request.type === "file.list" || result.request.type === "file.write") {
+    return `${result.request.type} ${result.request.path}`;
+  }
+
+  if (result.request.type === "file.search") {
+    return `${result.request.type} ${result.request.query}`;
+  }
+
+  return `${result.request.type} ${result.request.content.slice(0, 60)}`;
 }
 
 function createUserMessage(content: string, createdAt: string): ChatMessage {

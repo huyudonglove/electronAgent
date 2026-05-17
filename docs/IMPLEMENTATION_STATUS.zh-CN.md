@@ -1862,6 +1862,127 @@ Router 定位：
 - 修改 `ollamaIntentProvider.ts` 的解析和校验逻辑。
 - Core 根据 Router 输出做 tool selection、task state 更新和上下文构建。
 
+## 2026-05-17 Router 验收问题方向
+
+用户观察当前主流 Agent 做法后提出：意图识别阶段可能还需要增加“问题”，形成“意图 + 问题 + 类型”的组合。其中“问题”用于大模型返回后的校验。
+
+设计判断：
+
+- 这个方向成立。
+- 这里的“问题”不应理解为向用户追问的问题，而应理解为后处理管线的验收问题。
+- Router 不只是判断用户想干什么，还要产出本轮执行完成后如何判断“做对了没有”。
+
+建议字段：
+
+```json
+{
+  "intent": "analysis",
+  "task_type": "design",
+  "rewritten_input": "用户想确认 Router 是否需要增加用于后处理校验的问题字段。",
+  "verification_question": "大模型回复是否清楚解释了该字段的作用、和 intent/task_type 的区别，以及它在后处理管线中的使用方式？",
+  "success_criteria": [
+    "解释问题字段不是用户追问，而是验收问题",
+    "说明它用于输出后校验",
+    "说明通过/失败后的下一步动作"
+  ],
+  "needs_user_clarification": false,
+  "clarifying_questions": []
+}
+```
+
+后处理用途：
+
+- 大模型回复完成后，把 `verification_question`、`success_criteria`、模型回复和任务状态交给后处理 evaluator。
+- evaluator 判断：
+  - 是否回答了用户真实问题。
+  - 是否满足任务目标。
+  - 是否需要继续调用工具。
+  - 是否需要再让大模型补充一轮。
+  - 是否需要向用户提问。
+
+与现有字段区别：
+
+- `intent`
+  - 用户这句话的大方向。
+- `task_type`
+  - 要进入哪类任务流程。
+- `verification_question`
+  - 完成后用什么问题检查结果是否合格。
+- `clarifying_questions`
+  - 只有信息不足时才给用户看的追问。
+
+当前状态：
+
+- 已记录设计方向。
+- 已在下一节完成 Router schema 和后处理 evaluator 第一版实现。
+
+## 2026-05-17 Output Evaluator 第一版实现
+
+用户确认希望按“意图 + 类型 + 验收问题/成功条件”改造当前链路，并启用大模型输出后的校验步骤。
+
+已完成：
+
+- `packages/shared/src/index.ts` 扩展 `RouterResult`：
+  - `verification_question`
+  - `success_criteria`
+  - `needs_user_clarification`
+  - `clarifying_questions`
+- 新增 `OutputEvaluationResult`：
+  - `should_evaluate`
+  - `passed`
+  - `satisfied_criteria`
+  - `missing_criteria`
+  - `issues`
+  - `next_action`
+  - `revision_instruction`
+  - `confidence`
+- `AgentEventType` 新增：
+  - `output_evaluation`
+- `packages/memorizes/intent/01-parser.md` 更新 Router 输出格式和示例。
+- 新增 Evaluator Prompt：
+  - `packages/memorizes/evaluator/01-system.md`
+  - `packages/memorizes/evaluator/02-input.md`
+- 新增 Provider：
+  - `packages/core/src/providers/outputEvaluatorProvider.ts`
+- `prompts.ts` 新增：
+  - `buildEvaluatorSystemPrompt`
+  - `buildEvaluatorUserPrompt`
+- `events.ts` 新增：
+  - `saveOutputEvaluationEvent`
+
+执行流程：
+
+1. 用户输入。
+2. Router 小模型输出 intent、task_type、verification_question、success_criteria 等字段。
+3. Core 选择工具并构建上下文。
+4. 大模型流式回复。
+5. 如有工具调用，先执行工具并进行工具结果整理。
+6. 如果是任务型输入且存在验收问题/成功条件，调用 Output Evaluator。
+7. Evaluator 通过：
+   - 直接保存最终回复。
+8. Evaluator 返回 `revise_answer`：
+   - 追加一次大模型补充修正。
+   - 不递归再验收，避免无限循环。
+9. Evaluator 返回 `ask_user` 或 `use_tools`：
+   - 第一版先在最终回复末尾追加系统提示。
+   - 不自动进入新工具循环。
+10. Evaluator 自身失败：
+   - 记录 `error` event，stage 为 `输出验收`。
+   - 不丢弃已经生成的大模型回复，直接返回原内容。
+
+当前边界：
+
+- Evaluator 复用 `router` 模型配置，不新增第四类模型配置。
+- 普通聊天和非任务输入不触发输出验收。
+- 第一版最多补充修正一轮。
+- `use_tools` 的二次工具循环暂不做，后续等完整 ReAct/任务状态系统更稳后再扩展。
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- 确认新增代码未使用 `yield`、`async function*`、`for await`。
+- `corepack pnpm build` 成功。
+
 ## 2026-05-16 Router 与 SQLite 关键决策
 
 用户确认三个关键决策：
@@ -1960,6 +2081,625 @@ Step 类型建议：
   - `agent_traces`
   - `trace_steps`
 
+## 2026-05-17 调试面板 Trace 视图改造
+
+用户反馈当前调试工具太难使用，很难看懂。
+
+问题判断：
+
+- 原调试面板主要是“模型请求列表”和“事件链列表”。
+- 对开发者来说信息完整，但对人类观察 Agent 行为不友好。
+- 用户需要先看懂“这一轮 Agent 到底发生了什么”，再按需展开原始 JSON。
+
+已完成：
+
+- 调试抽屉默认 Tab 改为 `Trace`。
+- Tab 结构调整为：
+  - `Trace`
+  - `模型请求`
+  - `事件链`
+- 新增 Trace 总览：
+  - 步骤数。
+  - 模型请求数。
+  - 事件数。
+- 新增 Trace 步骤时间线：
+  - 用户输入。
+  - Router 意图识别。
+  - Core 工具策略。
+  - 主模型回复。
+  - 工具执行。
+  - 输出验收。
+  - 最终回复。
+- 每个步骤展示：
+  - 中文标题。
+  - 状态 Badge。
+  - 简短摘要。
+  - 关键字段。
+  - 可折叠原始数据。
+- 原始模型请求和原始事件仍保留在次级 Tab 中，但默认不展开大段 JSON。
+
+涉及文件：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+- `apps/desktop/src/styles.css`
+
+当前限制：
+
+- Trace 仍由前端根据 `events` 和 `providerDebugLogs` 聚合生成，不是后端独立 `AgentTrace` 表。
+- 当前展示的是当前 session 最近事件，不是严格按 turnId 分组。
+- 后续可引入 `turnId` / `trace_steps` 后再做更精确的多轮 Trace。
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 调试面板 Trace 主入口收敛
+
+用户继续反馈：虽然 Trace 好了很多，但不理解最外层为什么是 `Trace / 模型请求 / 事件链` 三个组合。
+
+设计判断：
+
+- `Trace`、`模型请求`、`事件链` 不是同一层业务概念。
+- `Trace` 是人类可读主视图。
+- `模型请求` 和 `事件链` 是原始数据，应作为 Trace 步骤的展开详情，而不是外层平级入口。
+
+已完成：
+
+- 移除调试抽屉外层 Tab。
+- 删除 `debugTab` 状态。
+- 删除外层 `模型请求` 和 `事件链` 列表入口。
+- Trace 成为调试面板唯一主入口。
+- 每个 Trace 步骤保留：
+  - 中文标题。
+  - 状态。
+  - 摘要。
+  - 关键字段。
+  - 原始事件数据。
+  - 关联模型请求。
+  - 关联模型响应或错误。
+- Router、主模型、Evaluator 步骤会把对应模型请求/响应嵌入到步骤详情中。
+
+当前结构：
+
+```text
+调试面板
+└─ Trace
+   ├─ 用户输入
+   ├─ Router 意图识别
+   │  ├─ router_result event
+   │  └─ Router 模型请求/响应
+   ├─ Core 工具策略
+   ├─ 主模型回复
+   │  ├─ model_return event
+   │  └─ Main 模型请求/响应
+   ├─ 工具执行
+   ├─ 输出验收
+   │  ├─ output_evaluation event
+   │  └─ Evaluator 模型请求/响应
+   └─ 最终回复
+```
+
+涉及文件：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+- `apps/desktop/src/styles.css`
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 Trace 回合选择器
+
+用户反馈：第二次对话时，无法在调试面板精准看到前一次对话。
+
+问题判断：
+
+- 这不是故意设计。
+- 当前 SQLite events 只有 `session_id`，没有 `turn_id`。
+- ProviderDebugLog 也没有 `session_id` / `turn_id`。
+- 多轮对话后，Trace 只能看整个 session 的事件，导致前一轮和后一轮混在一起。
+
+本次前端修复：
+
+- 在 `MinimalChatPage.tsx` 中按 `chat_message(actor=user)` 将当前 session 的事件切分为多个回合。
+- 新增“第 N 轮”回合选择器。
+- 默认选择最新一轮。
+- 选择某一轮后：
+  - Trace 只展示该用户输入到下一次用户输入之前的事件。
+  - ProviderDebugLog 暂按时间窗口匹配到该轮。
+- 当前回合的 Trace 步骤、模型请求数、事件数都会跟随选择变化。
+
+涉及文件：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+- `apps/desktop/src/styles.css`
+
+当前限制：
+
+- 这是前端轻量切分，不是严格后端 trace。
+- ProviderDebugLog 通过时间窗口匹配回合，极端情况下可能不完全准确。
+- 后续应在 ChatService 每轮生成 `turnId`，并写入：
+  - `events`
+  - `ProviderDebugLog`
+  - `tool_call`
+  - `tool_result`
+  - `model_return`
+  - `output_evaluation`
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 模型请求详情人类可读化
+
+用户反馈：Trace 中请求详情仍然出现大量 `\n`、转义引号和嵌套 JSON 字符串，例如 `next_action`、`revision_instruction` 等字段看起来很难读。
+
+问题判断：
+
+- 原实现直接对整个 `request.body` 做 `JSON.stringify`。
+- 当 request body 里包含 prompt、messages 或 JSON 字符串时，会出现大量转义字符。
+- 这种格式适合机器存档，不适合作为默认的人类调试视图。
+
+已完成：
+
+- `modelLogDetails` 默认展示“模型请求”易读格式。
+- 请求详情按以下结构展示：
+  - provider。
+  - status。
+  - method。
+  - endpoint。
+  - model。
+  - baseURL。
+  - duration。
+  - temperature。
+  - max_tokens。
+  - stream。
+  - options。
+  - system。
+  - messages。
+- `messages` 按 `#序号 role=...` 分块展示。
+- message content 按原文显示，不再作为 JSON 字符串二次转义。
+- 仍保留“原始请求 JSON”展开项，供高级排查使用。
+
+涉及文件：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 对话与调试交互细节修复
+
+用户发现两个交互问题：
+
+- 接口调试中的回合选择应倒序显示。
+- 对话框显示不会自动滚动到底。
+
+已完成：
+
+- `MinimalChatPage` 引入 `useRef` / `useEffect`。
+- 消息区末尾增加滚动锚点。
+- 当 `messages`、`stageLabel` 或 `error` 变化时，自动 `scrollIntoView` 到底部。
+- Trace 回合选择器改为倒序显示。
+- 最新一轮显示在最上方。
+- 回合按钮仍保留真实轮次编号，例如“第 3 轮”不会因为倒序显示变成“第 1 轮”。
+
+涉及文件：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 Trace 关键字段摘要与自动刷新
+
+用户反馈：Trace 比之前好很多，但仍感觉难用，主要问题有两个：
+
+- 默认没有展示用户真正关心的字段。
+- 第二次对话后需要手动刷新，调试面板才出现新一轮。
+
+调整方向：
+
+- Trace 不只展示步骤列表，还需要先给“本轮关键信息”。
+- 新一轮流式完成后，应自动刷新当前完成的 session，并选中最新回合。
+
+已完成：
+
+- 新增 `TraceHighlight` 摘要模型。
+- Trace 面板新增“本轮关键信息”区。
+- 摘要区默认展示：
+  - 用户输入。
+  - 意图和任务类型。
+  - 任务目标。
+  - Router 置信度。
+  - 工具建议 / 已开放工具 / 权限模式。
+  - 主模型、stopReason、耗时。
+  - 输出验收结果。
+  - 错误信息。
+- 摘要项按状态做轻量提示：
+  - 通过 / 成功使用绿色。
+  - 低置信度、max_tokens、未通过验收使用黄色。
+  - 错误使用红色。
+- `sendMessage` 在监听流式事件时记录 `done` 事件中的真实 `sessionId`。
+- 主调用完成后使用该 `sessionId` 刷新调试数据。
+- `refreshSessionEvents` 支持 `selectLatest`，新回合完成后自动选择最新回合。
+- 手动刷新时优先保留用户当前选择的回合；如果该回合不存在，则回退到最新回合。
+
+涉及文件：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+- `apps/desktop/src/styles.css`
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 调试观察对象重新分层
+
+用户进一步明确：当前调试面板的问题不是单纯缺几个字段，而是展示对象不够直观。
+
+用户真正关心两类信息：
+
+- 各个节点的产出：
+  - Router 产出了什么。
+  - Core 工具策略产出了什么。
+  - 上下文构建产出了什么。
+  - 主模型产出了什么。
+  - 工具执行产出了什么。
+  - 输出验收产出了什么。
+- 输出信息：
+  - 发给小模型的请求。
+  - 发给大模型的上下文和 messages。
+  - 发给工具的命令或参数。
+  - 工具返回给模型的结果。
+  - 最终展示给用户的回复。
+
+由此得到新的观察层设计方向：
+
+- 调试面板不应只是一条线性 Trace。
+- 应拆成两个互补视角：
+  - `节点产物视图`：按 Agent 节点看每一步的输入、输出、状态和关键产物。
+  - `信息流视图`：按信息如何流动，看 user input -> router input/output -> context package -> model request/response -> tool input/output -> final answer。
+- 线性 Trace 仍可保留，但应降级为时间线或审计明细，不再承担全部理解任务。
+
+第一版可做的 UI 调整：
+
+- 每个节点做成清晰的产物卡片。
+- 卡片顶部展示节点名、状态、耗时。
+- 卡片主体直接展示该节点的核心产出。
+- 卡片底部提供“输入 / 输出 / 原始 JSON”切换或展开。
+- 右侧或下方增加“本轮输出信息”区，专门展示最终传递出去的信息包。
+
+## 2026-05-17 节点产物与输出信息 UI 试验版
+
+基于上面的观察层分层，先做一个前端聚合试验版，不改变后端事件结构。
+
+已完成：
+
+- Trace 主视图继续保留回合选择、摘要和本轮关键信息。
+- 新增“节点产物”区：
+  - `Router`：展示意图识别产物、intent、taskType、confidence、success criteria。
+  - `Core`：展示工具策略产物、开放工具、权限模式、autoAllowed。
+  - `Context`：展示大模型输入产物、provider、model、message count，并可展开大模型请求。
+  - `Model`：展示主模型产物、stopReason、耗时、状态，并可展开请求/响应。
+  - `Tools`：展示工具调用和工具结果数量。
+  - `Evaluator`：展示输出验收产物、nextAction、confidence、missing criteria。
+  - `Output`：展示最终回复产物。
+- 新增“输出信息”区：
+  - `User -> Router`：用户输入进入意图识别。
+  - `Core -> 小模型`：Router 请求。
+  - `Router -> Core`：Router 返回结构化结果。
+  - `Core -> Model`：本轮工具开放信息。
+  - `Core -> 大模型`：大模型上下文包。
+  - `大模型 -> Core`：大模型返回。
+  - `Core -> Tools`：工具输入与输出。
+  - `Core -> Evaluator`：输出验收请求/返回。
+  - `Core -> User`：最终展示给用户。
+- 原线性 Trace 时间线保留，但收进“时间线明细”折叠区，作为审计明细使用。
+- 新增轻量状态颜色：
+  - 绿色：完成/通过。
+  - 黄色：低置信度、max_tokens、需要修正。
+  - 红色：失败/错误。
+  - 低透明度：跳过。
+
+涉及文件：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+- `apps/desktop/src/styles.css`
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 提示词观察区
+
+用户继续明确一个核心关注点：提示词需要非常直观地展示，因为后续会做动态规划提示词。
+
+设计判断：
+
+- 提示词不应只藏在模型请求 JSON 里。
+- 提示词应该成为调试面板的一等观察对象。
+- 第一版先展示“最终拼装后的提示词”。
+- 后续动态规划提示词时，再扩展为：
+  - 模板名。
+  - 模板版本。
+  - 输入变量。
+  - 渲染结果。
+  - 规划链路。
+  - 不同版本提示词差异。
+
+已完成：
+
+- 调试面板新增“提示词”区。
+- 按模型调用阶段展示提示词卡片：
+  - `Router 提示词`。
+  - `主模型提示词`。
+  - `Evaluator 提示词`。
+- 每张卡片展示：
+  - providerId。
+  - model。
+  - status。
+  - message count。
+  - temperature。
+  - max_tokens / num_predict。
+  - stream。
+  - System 内容。
+  - messages 列表，按 role 展示。
+  - 完整提示词请求。
+- 目前数据来源仍是 `ProviderDebugLog.request.body`，即真实发送给模型的最终请求。
+- 这保证 UI 展示的是“模型实际收到的提示词”，不是理想化模板。
+
+后续修正：
+
+- 用户发现提示词没有显示完整。
+- 去掉 `System` 和单条 `message` 的前端截断。
+- `System` 改为完整文本展示，区域内部最大高度 `260px`，超过后滚动。
+- 单条 `message` 改为完整文本展示，区域内部最大高度 `220px`，超过后滚动。
+- 保留“完整提示词请求”展开项，用于查看完整模型请求。
+
+模板增强：
+
+- 用户认为除了最终提示词，还应该展示类似“模板”的稳定结构。
+- 第一版在提示词卡片中新增“模板”区。
+- 每张提示词卡片展示：
+  - 模板名称。
+  - 模板版本。
+  - 变量槽位。
+  - 模板模块文件。
+- 当前模板信息为前端按调用阶段静态标注：
+  - `router.intent.v1`
+  - `main.agent.v1`
+  - `output.evaluator.v1`
+- 这样可以同时看到：
+  - 稳定模板结构。
+  - 本次最终渲染后的提示词。
+  - 实际发送给模型的完整请求。
+- 后续更完整的做法：
+  - 由后端 Prompt Builder 返回模板元数据。
+  - ProviderDebugLog 记录 templateName、templateVersion、moduleFiles、variables、renderedMessages。
+  - UI 支持模板版本差异和变量值追踪。
+
+实际提示词流程增强：
+
+- 用户指出：提示词观察区能看到模板信息，但真实提示词里还没有增加“按步骤思考/流程”和结构化模板字段。
+- 已将流程要求写入真实 Markdown 模板，而不是只在 UI 中标注。
+- Router 模板增强：
+  - 输出 JSON 新增 `reasoning_brief`。
+  - 输出 JSON 新增 `planned_steps`。
+  - 输出 JSON 新增 `expected_output`。
+  - 示例同步更新。
+- 主模型 System 模板增强：
+  - 新增“工作流程模板”。
+  - 要求内部按以下流程推进：
+    - 理解目标。
+    - 选择路径。
+    - 拆分步骤。
+    - 执行或说明。
+    - 输出结果。
+  - 明确不要把完整内部思考过程原样输出给用户。
+  - 复杂任务可以简短展示“本轮做了什么 / 结果是什么 / 下一步是什么”。
+  - 简单聊天不要机械列步骤。
+- Evaluator 模板增强：
+  - 输出 JSON 新增 `check_steps`。
+  - 输出 JSON 新增 `decision_reason`。
+  - 要求按 `success_criteria` 逐项检查后再决定 `next_action`。
+- 类型与解析同步：
+  - `RouterResult` 增加 `reasoning_brief`、`planned_steps`、`expected_output`。
+  - `OutputEvaluationResult` 增加 `check_steps`、`decision_reason`。
+  - Router Provider 解析这些字段。
+  - Output Evaluator Provider 解析这些字段。
+- 调试面板同步：
+  - 本轮关键信息展示 Router `planned_steps`。
+  - Router 节点产物展示步骤和期望产出。
+  - Evaluator 节点产物展示检查步骤和判断原因。
+
+可见处理过程修正：
+
+- 用户继续指出：主模型提示词中没有明确要求模型“显示思考的过程”。
+- 设计上不直接要求输出完整内部思考链条，而是要求输出“可见处理过程”。
+- 已在主模型 System Prompt 中明确：
+  - 复杂任务、工具调用、项目实现、调试验证或持续推进时，回复中必须展示简短的可见处理过程。
+  - 可见处理过程包含：
+    - `目标理解`
+    - `处理步骤`
+    - `本轮结果`
+    - `下一步`
+  - 可见处理过程要短，不要写成长篇推理。
+  - 不要输出完整内部思考链条、隐藏推理、逐 token 推理或不确定的脑内草稿。
+  - 简单聊天、寒暄或非常简单的问题不要机械套模板。
+
+涉及文件：
+
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+- `apps/desktop/src/styles.css`
+- `packages/shared/src/index.ts`
+- `packages/core/src/providers/ollamaIntentProvider.ts`
+- `packages/core/src/providers/outputEvaluatorProvider.ts`
+- `packages/memorizes/intent/01-parser.md`
+- `packages/memorizes/system/02-goals.md`
+- `packages/memorizes/evaluator/01-system.md`
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 输出验收展示语义修正
+
+用户发现调试面板里“输出验收产物”显示“未通过”时不容易理解。
+
+问题原因：
+
+- 后端 Evaluator 的 `passed=false` 不一定表示系统失败。
+- 它也可能表示后处理管线认为还需要继续动作：
+  - 让大模型补充。
+  - 继续调用工具。
+  - 向用户追问。
+- 原 UI 把 `passed=false` 统一渲染成“未通过”和失败状态，语义太重。
+
+已完成：
+
+- 新增 `evaluationDisplayFromPayload`。
+- 输出验收展示从二元状态改为动作状态：
+  - `passed=true` -> `通过`。
+  - `next_action=revise_answer` -> `需修正`。
+  - `next_action=use_tools` -> `需工具`。
+  - `next_action=ask_user` -> `需追问`。
+  - `next_action=final` 且 `passed=false` -> `可放行`。
+  - 未知动作 -> `需确认`。
+- `输出验收`摘要、`节点产物`、`输出信息`和`时间线明细`统一使用新的展示语义。
+- `passed=false` 不再直接等于 UI 失败。
+- 只有真正错误事件或模型调用错误才应按失败理解。
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
+## 2026-05-17 长期记忆与提示词自动迭代第一版
+
+用户希望开始增加长期记忆和提示词自动迭代能力。
+
+设计边界：
+
+- 长期记忆第一版使用 SQLite，不使用 Markdown 作为主存储。
+- 第一版不做向量检索，先做结构化字段 + 关键词/重要性召回。
+- 记忆捕获保持保守，只在用户表达明确长期信号时写入。
+- 提示词自动迭代第一版只生成候选建议，不自动改 Markdown 模板。
+- 自动改模板需要后续加入人工确认、版本差异和回滚机制后再做。
+
+长期记忆已完成：
+
+- SQLite 新增 `memories` 表。
+- 新增共享类型 `MemoryRecord` 和 `MemoryType`。
+- 新增 Core 模块 `longTermMemories.ts`。
+- 支持：
+  - `captureLongTermMemories`
+  - `saveMemory`
+  - `listRelevantMemories`
+- 当前捕获信号包括：
+  - `记住`
+  - `记录`
+  - `长期`
+  - `以后`
+  - `后续`
+  - `我希望`
+  - `我偏好`
+  - `我不希望`
+  - `不要`
+  - `规则`
+  - `系统规则`
+  - `决定`
+  - `确认`
+- 记忆类型：
+  - `fact`
+  - `preference`
+  - `decision`
+  - `plan`
+  - `constraint`
+- 每条记忆保存：
+  - projectId
+  - type
+  - content
+  - tags
+  - importance
+  - confidence
+  - sourceSessionId
+  - sourceEventIds
+  - status
+- ChatService 在 Router 后：
+  - 捕获可长期保存的用户输入。
+  - 写入 `memory_write` event。
+  - 按当前用户输入、Router rewrite、keywords、task_goal 召回相关长期记忆。
+  - 写入 `memory_recall` event。
+  - 将召回记忆注入主模型上下文。
+- 主模型收到的长期记忆上下文会标明：
+  - 这是本地长期记忆召回。
+  - 不是用户本轮新输入。
+  - 高重要性规则应优先遵守。
+  - 不要原样复述。
+
+提示词自动迭代已完成：
+
+- SQLite 新增 `prompt_iterations` 表。
+- 新增共享类型 `PromptIterationRecord`。
+- 新增 Core 模块 `promptIterations.ts`。
+- 支持：
+  - `savePromptIteration`
+  - `listPromptIterations`
+- 当 Output Evaluator 返回非 `passed` 且 `next_action` 不是 `final` 时，生成提示词迭代候选。
+- 候选记录包括：
+  - targetTemplate
+  - trigger
+  - reason
+  - suggestedChange
+  - sourceEventIds
+  - status
+- 当前 targetTemplate 规则：
+  - `next_action=use_tools` 时优先建议检查 `main.agent.v1`。
+  - 其他验收缺口优先建议检查 `output.evaluator.v1`。
+- 写入 `prompt_iteration` event。
+- 当前不自动修改 `packages/memorizes/**/*.md`。
+
+调试面板已完成：
+
+- 节点产物新增 `Memory` 节点。
+  - 展示写入数量。
+  - 展示召回数量。
+  - 可展开查看写入/召回 JSON。
+- 节点产物新增 `Prompt` 节点。
+  - 展示提示词迭代候选。
+  - 展示 targetTemplate 和 trigger。
+  - 可展开查看候选 JSON。
+
+涉及文件：
+
+- `packages/shared/src/index.ts`
+- `packages/core/src/storage/database.ts`
+- `packages/core/src/longTermMemories.ts`
+- `packages/core/src/promptIterations.ts`
+- `packages/core/src/events.ts`
+- `packages/core/src/chatService.ts`
+- `packages/core/src/providers/mimoProvider.ts`
+- `packages/core/src/index.ts`
+- `apps/desktop/src/ui/MinimalChatPage.tsx`
+- `PROJECT_MEMORY.zh-CN.md`
+- `docs/IMPLEMENTATION_STATUS.zh-CN.md`
+
+验证：
+
+- `corepack pnpm --filter @xiaomi/desktop typecheck` 成功。
+- `corepack pnpm build` 成功。
+
 ## 2026-05-16 多 Agent 协作第一版确认
 
 用户确认多 Agent 协作第一版按当前建议推进。
@@ -2015,3 +2755,105 @@ Step 类型建议：
 4. 增加节点运行实时事件。
 5. 增加 Artifact 保存。
 6. 增加只读文件工具和权限确认。
+
+## 2026-05-17 本地语义工具第一版
+
+工具系统已从单一 `command.run` 扩展为“语义化本地工具 + 命令兜底”的 Tool Gateway。
+
+新增工具：
+
+- `file.read`
+  - 读取工作区内文本文件。
+  - 支持 `path` 和 `maxBytes`。
+- `file.list`
+  - 列出工作区内目录。
+  - 支持 `recursive` 和 `maxEntries`。
+- `file.search`
+  - 在工作区内搜索文本。
+  - 支持 `path`、`query`、`glob`、`maxResults`。
+- `file.write`
+  - 在工作区内写入文件。
+  - 需要 `project_write` 权限。
+  - 单次写入限制约 300KB。
+- `memory.save`
+  - 将模型认为需要长期保存的信息写入 SQLite 长期记忆。
+  - 支持 `memoryType`、`tags`、`importance`。
+- `command.run`
+  - 保留作为复杂 PowerShell、构建、测试、验证命令的兜底工具。
+
+执行规则：
+
+- 所有文件工具路径必须位于当前工作区内。
+- 读/列目录/搜索工具在 `project_read`、`project_verify`、`project_write` 下可用。
+- 读/列目录/搜索工具按低风险处理：只要本轮涉及项目上下文、需要工具或 Router 建议读取工具，即使 Router 置信度低于 0.7，也会以 `project_read` 模式开放。
+- 已修正策略顺序：当 Router 返回 `requires_project_context=true`，但 `needs_tools=false` 且 `suggested_tools=[]` 时，仍开放 `file.read`、`file.list`、`file.search`，避免模型需要读取项目时被 Core 拒绝。
+- 最新策略：读取权限彻底放开。`file.read`、`file.list`、`file.search` 在 Tool Gateway 层默认允许执行，不再依赖本轮 `tool_selection.selected_tools` 或 Router 是否开放工具。
+- 敏感文件保护：
+  - 拒绝读取/写入 `.env`、`secrets.local.json`、`model-runtime.local.json`、`agent.db`、证书、密钥、数据库文件。
+  - 拒绝路径中包含 `secret`、`token`、`apikey`、`api-key`、`credential` 的文件。
+  - 拒绝 `.ssh` 等敏感路径。
+  - `file.search` 和递归 `file.list` 会跳过敏感文件。
+- 管理员 Agent 权限模式：
+  - Tool Selection Policy 默认开放全部本地工具：`file.read`、`file.list`、`file.search`、`file.write`、`memory.save`、`command.run`。
+  - 默认 `access_mode=project_write`。
+  - Tool Gateway 对写入、记忆、命令请求默认放行。
+  - Command Gateway 不再根据本轮工具开放、读/验证/写权限、危险模式、安装依赖、git 操作等规则拦截 PowerShell 命令。
+  - 敏感文件允许读取、列目录和搜索。
+  - 敏感文件写入保护仍保留。
+  - 删除/清理类命令不会执行，会返回 `decision=confirm`、`status=skipped`，工具结果 `reason` 包含“删除确认”，等待用户确认。
+- `project_read` 只开放 `file.read`、`file.list`、`file.search`。
+- `file.write` 仅在 `project_write` 下自动执行。
+- `command.run` 仍走原 Command Gateway 安全策略。
+- 每轮最多解析和执行 8 个工具请求。
+- 工具执行结果统一写入 `tool_call` / `tool_result` events，并在工具结果整理阶段再次交给主模型生成最终回复。
+
+提示词更新：
+
+- Router 可建议 `file.read`、`file.list`、`file.search`、`file.write`、`memory.save`、`command.run`。
+- 主模型上下文提示要求优先使用语义化工具，复杂命令、构建、测试再使用 `command.run`。
+- 工具请求示例已更新为多工具格式。
+
+MiMo thinking / 原生工具兼容性注意：
+
+- 默认工具系统仍不是 MiMo/OpenAI/Anthropic 原生 function calling，而是文本 JSON 工具请求 + Tool Gateway。
+- 新增兼容模式 `toolCallingMode=native-openai`，仅在主模型为 OpenAI-compatible 时生效。
+- 新增配置 `thinkingEnabled`。开启后，OpenAI-compatible 请求会携带 `thinking: { type: "enabled" }`。
+- Native OpenAI 模式会：
+  - 向 `/chat/completions` 传 `tools`。
+  - 接收 assistant 原生 `reasoning_content`、`content`、`tool_calls`。
+  - 将 function tool call 映射到本地 `file.read`、`file.list`、`file.search`、`file.write`、`memory.save`、`command.run`。
+  - 执行 Tool Gateway。
+  - 追加 `role=tool`、`tool_call_id`、`content` 后继续请求模型。
+  - 最多执行 8 个工具请求。
+- 为避免 MiMo 多轮 400，最终助手消息会在 `metadata.openaiNativeMessages` 保存完整原生消息链，后续 OpenAI-compatible 请求会展开回传，而不是只回传可见 `content`。
+- Anthropic-compatible 原生 tools 尚未实现，仍走文本 JSON 工具协议。
+- 当前本地主模型配置已切换为 MiMo OpenAI 原生工具模式：
+  - `providerKind=openai-compatible`
+  - `baseURL=https://api.xiaomimimo.com/v1`
+  - `model=mimo-v2.5-pro`
+  - `toolCallingMode=native-openai`
+  - `thinkingEnabled=true`
+- 模型配置 UI 已新增“使用 MiMo 原生工具”按钮。
+- 主模型配置项已联动防误操作：
+  - 只有主模型且 Provider 为 OpenAI Compatible 时，才能选择 Native OpenAI。
+  - 选择 Native OpenAI 会自动开启 Thinking。
+  - 关闭 Thinking 会自动切回 Text JSON。
+  - 切换到 Ollama 或 Anthropic Compatible 会自动关闭 Native OpenAI 和 Thinking。
+- Core 配置归一化也会兜底防止手写 JSON 出现不兼容组合。
+- UI 已增加模型思考与正式产出的视觉区分：
+  - 聊天区助手消息会按“正式回复”“工具结果整理”“补充修正”“系统提示”分块展示。
+  - 调试区会解析 MiMo 原生响应中的 `reasoning_content`、`tool_calls`、`content`。
+  - 原生响应分别展示为“模型思考 reasoning_content”“工具调用 tool_calls”“正式产出 content”和“完整模型响应”。
+  - Trace 摘要优先展示正式产出和工具调用摘要，不再默认把 reasoning JSON 当作主模型产出。
+
+涉及文件：
+
+- `packages/shared/src/index.ts`
+- `packages/core/src/toolCallParser.ts`
+- `packages/core/src/localToolGateway.ts`
+- `packages/core/src/toolSelectionPolicy.ts`
+- `packages/core/src/chatService.ts`
+- `packages/core/src/events.ts`
+- `packages/core/src/providers/ollamaIntentProvider.ts`
+- `packages/memorizes/context/intent-result.md`
+- `packages/memorizes/intent/01-parser.md`

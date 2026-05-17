@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ModelRuntimeConfig, ModelRuntimeRole, ModelRuntimeSettings } from "@xiaomi/shared";
-import { MIMO_BASE_URL, MIMO_MAX_TOKENS, MIMO_MODEL, OLLAMA_BASE_URL, OLLAMA_INTENT_MODEL } from "./modelConfig";
+import { MIMO_MAX_TOKENS, MIMO_MODEL, MIMO_OPENAI_BASE_URL, OLLAMA_BASE_URL, OLLAMA_INTENT_MODEL } from "./modelConfig";
 import { getMimoApiKey } from "./localSecrets";
 import { resolveProjectPath } from "./utils/projectRoot";
 
@@ -44,17 +44,29 @@ function normalizeSettings(settings: Partial<ModelRuntimeSettings>): ModelRuntim
 }
 
 function normalizeConfig(value: Partial<ModelRuntimeConfig> | undefined, fallback: ModelRuntimeConfig): ModelRuntimeConfig {
+  const providerKind = value?.providerKind === "openai-compatible" || value?.providerKind === "anthropic-compatible" || value?.providerKind === "ollama"
+    ? value.providerKind
+    : fallback.providerKind;
+  const requestedToolMode = value?.toolCallingMode === "native-openai" || value?.toolCallingMode === "text-json"
+    ? value.toolCallingMode
+    : fallback.toolCallingMode;
+  const toolCallingMode = providerKind === "openai-compatible" ? requestedToolMode : "text-json";
+
   return {
     role: fallback.role,
     label: stringOr(value?.label, fallback.label),
-    providerKind: value?.providerKind === "openai-compatible" || value?.providerKind === "anthropic-compatible" || value?.providerKind === "ollama"
-      ? value.providerKind
-      : fallback.providerKind,
+    providerKind,
     baseURL: stringOr(value?.baseURL, fallback.baseURL),
     model: stringOr(value?.model, fallback.model),
     apiKey: stringOr(value?.apiKey, fallback.apiKey),
     temperature: numberOr(value?.temperature, fallback.temperature),
-    maxTokens: numberOr(value?.maxTokens, fallback.maxTokens)
+    maxTokens: numberOr(value?.maxTokens, fallback.maxTokens),
+    toolCallingMode,
+    thinkingEnabled: toolCallingMode === "native-openai"
+      ? true
+      : providerKind === "openai-compatible" && typeof value?.thinkingEnabled === "boolean"
+        ? value.thinkingEnabled
+        : false
   };
 }
 
@@ -67,20 +79,24 @@ function defaultRouterConfig(): ModelRuntimeConfig {
     model: OLLAMA_INTENT_MODEL,
     apiKey: "",
     temperature: 0.2,
-    maxTokens: 768
+    maxTokens: 768,
+    toolCallingMode: "text-json",
+    thinkingEnabled: false
   };
 }
 
 function defaultMainConfig(): ModelRuntimeConfig {
   return {
     role: "main",
-    label: "MiMo Main",
-    providerKind: "anthropic-compatible",
-    baseURL: MIMO_BASE_URL,
+    label: "MiMo Native Main",
+    providerKind: "openai-compatible",
+    baseURL: MIMO_OPENAI_BASE_URL,
     model: MIMO_MODEL,
     apiKey: getMimoApiKey() ?? "",
     temperature: 1,
-    maxTokens: MIMO_MAX_TOKENS
+    maxTokens: MIMO_MAX_TOKENS,
+    toolCallingMode: "native-openai",
+    thinkingEnabled: true
   };
 }
 
@@ -93,7 +109,9 @@ function defaultCompressionConfig(): ModelRuntimeConfig {
     model: OLLAMA_INTENT_MODEL,
     apiKey: "",
     temperature: 0.2,
-    maxTokens: 1024
+    maxTokens: 1024,
+    toolCallingMode: "text-json",
+    thinkingEnabled: false
   };
 }
 

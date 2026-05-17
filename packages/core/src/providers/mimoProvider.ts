@@ -1,16 +1,19 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { ChatMessage } from "@xiaomi/shared";
+import type { ChatMessage, MemoryRecord, ToolRequest, ToolResult, ToolSelectionResult } from "@xiaomi/shared";
 import type { ConversationSummary } from "../conversationSummaries";
 import { getModelRuntimeConfig } from "../modelRuntimeConfig";
 import { addProviderDebugLog, createDebugLogBase } from "../providerDebugLogs";
 import { buildIntentContextMessage, buildSystemPrompt } from "../prompts";
-import { streamOpenAiChat } from "./openAiCompatibleProvider";
+import { streamOpenAiChat, streamOpenAiChatWithNativeTools } from "./openAiCompatibleProvider";
 
 interface StreamMimoChatInput {
   readonly messages: readonly ChatMessage[];
   readonly latestUserMessage: string;
   readonly intentSummary: string;
   readonly conversationSummary?: ConversationSummary;
+  readonly memories?: readonly MemoryRecord[];
+  readonly toolSelection?: ToolSelectionResult;
+  readonly executeToolRequest?: (request: ToolRequest) => Promise<ToolResult>;
   readonly onDelta: (delta: string) => void;
 }
 
@@ -18,6 +21,8 @@ export interface ModelResponse {
   readonly content: string;
   readonly stopReason?: string;
   readonly usage?: unknown;
+  readonly nativeMessages?: readonly unknown[];
+  readonly nativeToolResults?: readonly ToolResult[];
 }
 
 export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelResponse> {
@@ -27,19 +32,30 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
   if (config.providerKind === "openai-compatible") {
     const runtimeContext = [
       input.conversationSummary ? formatConversationSummary(input.conversationSummary) : "",
+      input.memories && input.memories.length > 0 ? formatLongTermMemories(input.memories) : "",
       buildIntentContextMessage(input.intentSummary)
     ]
       .filter((item) => item.trim().length > 0)
       .join("\n\n---\n\n");
 
-    return streamOpenAiChat({
+    const openAiInput = {
       config,
       system: systemPrompt,
       messages: trimCompressedMessages(input.messages, input.conversationSummary),
       runtimeContext,
       latestUserMessage: input.latestUserMessage,
       onDelta: input.onDelta
-    });
+    };
+
+    if (config.toolCallingMode === "native-openai" && input.toolSelection && input.executeToolRequest) {
+      return streamOpenAiChatWithNativeTools({
+        ...openAiInput,
+        toolSelection: input.toolSelection,
+        executeToolRequest: input.executeToolRequest
+      });
+    }
+
+    return streamOpenAiChat(openAiInput);
   }
 
   if (config.providerKind !== "anthropic-compatible") {
@@ -51,7 +67,7 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
     model: config.model,
     max_tokens: config.maxTokens,
     system: systemPrompt,
-    messages: buildMimoMessages(input.messages, input.intentSummary, input.conversationSummary),
+    messages: buildMimoMessages(input.messages, input.intentSummary, input.conversationSummary, input.memories),
     top_p: 0.95,
     stream: true,
     temperature: config.temperature
@@ -141,7 +157,8 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
 function buildMimoMessages(
   messages: readonly ChatMessage[],
   intentSummary: string,
-  conversationSummary?: ConversationSummary
+  conversationSummary?: ConversationSummary,
+  memories?: readonly MemoryRecord[]
 ): Anthropic.Messages.MessageParam[] {
   const activeMessages = trimCompressedMessages(messages, conversationSummary);
   const conversationMessages = toAnthropicMessages(activeMessages);
@@ -167,7 +184,21 @@ function buildMimoMessages(
       }
     ]
   };
-  const stableContextMessages = summaryContextMessage ? [summaryContextMessage] : [];
+  const memoryContextMessage: Anthropic.Messages.MessageParam | undefined = memories && memories.length > 0
+    ? {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: formatLongTermMemories(memories)
+          }
+        ]
+      }
+    : undefined;
+  const stableContextMessages = [
+    ...(summaryContextMessage ? [summaryContextMessage] : []),
+    ...(memoryContextMessage ? [memoryContextMessage] : [])
+  ];
 
   if (!latestUserMessage) {
     return [...stableContextMessages, runtimeContextMessage];
@@ -207,6 +238,25 @@ function formatConversationSummary(summary: ConversationSummary): string {
   ]
     .filter((item) => item.trim().length > 0)
     .join("\n");
+}
+
+function formatLongTermMemories(memories: readonly MemoryRecord[]): string {
+  return [
+    "【长期记忆召回】",
+    "",
+    "以下内容是系统从本地长期记忆数据库召回的用户偏好、项目决策、约束或规划，不是用户本轮新输入。请优先遵守其中的高重要性规则，但不要原样复述。",
+    "",
+    ...memories.map((memory) => {
+      return [
+        `- id: ${memory.id}`,
+        `  type: ${memory.type}`,
+        `  importance: ${memory.importance}`,
+        `  confidence: ${memory.confidence}`,
+        `  content: ${memory.content}`,
+        memory.tags.length > 0 ? `  tags: ${memory.tags.join(", ")}` : ""
+      ].filter((item) => item.length > 0).join("\n");
+    })
+  ].join("\n");
 }
 
 function formatList(label: string, items: readonly string[]): string {

@@ -3,8 +3,11 @@ import type {
   AgentEventRecord,
   AgentEventType,
   ChatMessage,
-  CommandRunRequest,
-  CommandRunResult,
+  MemoryRecord,
+  OutputEvaluationResult,
+  PromptIterationRecord,
+  ToolRequest,
+  ToolResult,
   ToolSelectionResult
 } from "@xiaomi/shared";
 import { getDatabase } from "./storage/database";
@@ -36,7 +39,8 @@ export function saveChatMessageEvent(input: {
     roleLabel: input.message.roleLabel,
     content: input.message.content,
     payload: {
-      createdAt: input.message.createdAt
+      createdAt: input.message.createdAt,
+      metadata: input.message.metadata
     },
     createdAt: input.message.createdAt
   });
@@ -81,7 +85,7 @@ export function saveToolSelectionEvent(input: {
 export function saveToolCallEvent(input: {
   readonly projectId: string;
   readonly sessionId: string;
-  readonly request: CommandRunRequest;
+  readonly request: ToolRequest;
 }): AgentEventRecord {
   const content = JSON.stringify(input.request, null, 2);
 
@@ -90,7 +94,7 @@ export function saveToolCallEvent(input: {
     sessionId: input.sessionId,
     type: "tool_call",
     actor: "model",
-    roleLabel: "command.run",
+    roleLabel: input.request.type,
     content,
     payload: input.request,
     createdAt: new Date().toISOString()
@@ -100,7 +104,7 @@ export function saveToolCallEvent(input: {
 export function saveToolResultEvent(input: {
   readonly projectId: string;
   readonly sessionId: string;
-  readonly result: CommandRunResult;
+  readonly result: ToolResult;
 }): AgentEventRecord {
   const content = JSON.stringify(
     {
@@ -119,7 +123,7 @@ export function saveToolResultEvent(input: {
     sessionId: input.sessionId,
     type: "tool_result",
     actor: "tool",
-    roleLabel: "Command Gateway",
+    roleLabel: "Tool Gateway",
     content,
     payload: input.result,
     createdAt: new Date().toISOString()
@@ -164,6 +168,88 @@ export function saveModelReturnEvent(input: {
       stopReason: input.stopReason,
       usage: input.usage
     },
+    createdAt: new Date().toISOString()
+  });
+}
+
+export function saveOutputEvaluationEvent(input: {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly result: OutputEvaluationResult;
+}): AgentEventRecord {
+  const content = JSON.stringify(input.result, null, 2);
+
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "output_evaluation",
+    actor: "evaluator",
+    roleLabel: "Output Evaluator",
+    content,
+    payload: input.result,
+    createdAt: new Date().toISOString()
+  });
+}
+
+export function saveMemoryWriteEvent(input: {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly memories: readonly MemoryRecord[];
+}): AgentEventRecord | undefined {
+  if (input.memories.length === 0) {
+    return undefined;
+  }
+
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "memory_write",
+    actor: "memory",
+    roleLabel: "Long Term Memory",
+    content: input.memories.map((memory) => `- ${memory.type}: ${memory.content}`).join("\n"),
+    payload: {
+      memories: input.memories
+    },
+    createdAt: new Date().toISOString()
+  });
+}
+
+export function saveMemoryRecallEvent(input: {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly memories: readonly MemoryRecord[];
+}): AgentEventRecord | undefined {
+  if (input.memories.length === 0) {
+    return undefined;
+  }
+
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "memory_recall",
+    actor: "memory",
+    roleLabel: "Long Term Memory Recall",
+    content: input.memories.map((memory) => `- ${memory.type}: ${memory.content}`).join("\n"),
+    payload: {
+      memories: input.memories
+    },
+    createdAt: new Date().toISOString()
+  });
+}
+
+export function savePromptIterationEvent(input: {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly record: PromptIterationRecord;
+}): AgentEventRecord {
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "prompt_iteration",
+    actor: "prompt",
+    roleLabel: "Prompt Iteration Candidate",
+    content: input.record.suggestedChange,
+    payload: input.record,
     createdAt: new Date().toISOString()
   });
 }

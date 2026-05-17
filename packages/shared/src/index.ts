@@ -11,6 +11,7 @@ export interface ChatMessage {
   readonly roleLabel: string;
   readonly content: string;
   readonly createdAt: string;
+  readonly metadata?: Record<string, unknown>;
 }
 
 export interface ChatSession {
@@ -41,6 +42,7 @@ export interface ModelProfile {
 
 export type ModelRuntimeRole = "router" | "main" | "compression";
 export type ModelProviderKind = "ollama" | "anthropic-compatible" | "openai-compatible";
+export type ModelToolCallingMode = "text-json" | "native-openai";
 
 export interface ModelRuntimeConfig {
   readonly role: ModelRuntimeRole;
@@ -51,6 +53,8 @@ export interface ModelRuntimeConfig {
   readonly apiKey: string;
   readonly temperature: number;
   readonly maxTokens: number;
+  readonly toolCallingMode: ModelToolCallingMode;
+  readonly thinkingEnabled: boolean;
 }
 
 export interface ModelRuntimeSettings {
@@ -140,11 +144,65 @@ export interface RouterResult {
   readonly is_task: boolean;
   readonly task_goal: string;
   readonly task_type: RouterTaskType;
+  readonly reasoning_brief: string;
+  readonly planned_steps: readonly string[];
+  readonly expected_output: string;
+  readonly verification_question: string;
+  readonly success_criteria: readonly string[];
+  readonly needs_user_clarification: boolean;
+  readonly clarifying_questions: readonly string[];
   readonly requires_project_context: boolean;
   readonly needs_tools: boolean;
   readonly suggested_tools: readonly string[];
   readonly tool_reason: string;
   readonly confidence: number;
+}
+
+export type EvaluationNextAction = "final" | "revise_answer" | "ask_user" | "use_tools";
+
+export interface OutputEvaluationResult {
+  readonly should_evaluate: boolean;
+  readonly passed: boolean;
+  readonly verification_question: string;
+  readonly satisfied_criteria: readonly string[];
+  readonly missing_criteria: readonly string[];
+  readonly issues: readonly string[];
+  readonly check_steps: readonly string[];
+  readonly decision_reason: string;
+  readonly next_action: EvaluationNextAction;
+  readonly revision_instruction: string;
+  readonly confidence: number;
+}
+
+export type MemoryType = "fact" | "preference" | "decision" | "plan" | "constraint";
+
+export interface MemoryRecord {
+  readonly id: string;
+  readonly projectId: string;
+  readonly type: MemoryType;
+  readonly content: string;
+  readonly tags: readonly string[];
+  readonly importance: number;
+  readonly confidence: number;
+  readonly sourceSessionId?: string;
+  readonly sourceEventIds: readonly string[];
+  readonly status: "active" | "archived";
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface PromptIterationRecord {
+  readonly id: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly targetTemplate: string;
+  readonly trigger: "evaluation_gap" | "user_feedback" | "manual";
+  readonly reason: string;
+  readonly suggestedChange: string;
+  readonly sourceEventIds: readonly string[];
+  readonly status: "proposed" | "accepted" | "rejected" | "applied";
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 export type ToolAccessMode = "none" | "project_read" | "project_write" | "project_verify";
@@ -166,6 +224,54 @@ export interface CommandRunRequest {
   readonly command: string;
 }
 
+export interface FileReadRequest {
+  readonly type: "file.read";
+  readonly reason: string;
+  readonly path: string;
+  readonly maxBytes?: number;
+}
+
+export interface FileListRequest {
+  readonly type: "file.list";
+  readonly reason: string;
+  readonly path: string;
+  readonly recursive?: boolean;
+  readonly maxEntries?: number;
+}
+
+export interface FileSearchRequest {
+  readonly type: "file.search";
+  readonly reason: string;
+  readonly path?: string;
+  readonly query: string;
+  readonly glob?: string;
+  readonly maxResults?: number;
+}
+
+export interface FileWriteRequest {
+  readonly type: "file.write";
+  readonly reason: string;
+  readonly path: string;
+  readonly content: string;
+}
+
+export interface MemorySaveRequest {
+  readonly type: "memory.save";
+  readonly reason: string;
+  readonly content: string;
+  readonly memoryType?: MemoryType;
+  readonly tags?: readonly string[];
+  readonly importance?: number;
+}
+
+export type ToolRequest =
+  | CommandRunRequest
+  | FileReadRequest
+  | FileListRequest
+  | FileSearchRequest
+  | FileWriteRequest
+  | MemorySaveRequest;
+
 export type CommandDecision = "allow" | "confirm" | "deny";
 
 export interface CommandRunResult {
@@ -179,12 +285,29 @@ export interface CommandRunResult {
   readonly durationMs?: number;
 }
 
+export interface ToolResult {
+  readonly request: ToolRequest;
+  readonly decision: CommandDecision;
+  readonly status: "executed" | "skipped" | "failed";
+  readonly reason: string;
+  readonly exitCode?: number;
+  readonly stdout?: string;
+  readonly stderr?: string;
+  readonly output?: string;
+  readonly data?: unknown;
+  readonly durationMs?: number;
+}
+
 export type AgentEventType =
   | "chat_message"
   | "router_result"
   | "tool_selection"
   | "tool_call"
   | "tool_result"
+  | "output_evaluation"
+  | "memory_write"
+  | "memory_recall"
+  | "prompt_iteration"
   | "conversation_summary"
   | "model_return"
   | "error";

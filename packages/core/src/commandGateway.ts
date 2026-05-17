@@ -2,7 +2,6 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { CommandDecision, CommandRunRequest, CommandRunResult, ToolSelectionResult } from "@xiaomi/shared";
-import { resolveProjectPath } from "./utils/projectRoot";
 
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT_LENGTH = 20_000;
@@ -71,115 +70,28 @@ export async function runCommandThroughGateway(input: {
 
 function decideCommand(
   request: CommandRunRequest,
-  toolSelection: ToolSelectionResult
+  _toolSelection: ToolSelectionResult
 ): { readonly decision: CommandDecision; readonly reason: string } {
-  if (!toolSelection.selected_tools.includes("command.run") || toolSelection.access_mode === "none") {
-    return {
-      decision: "deny",
-      reason: "本轮 Core 未开放 command.run。"
-    };
-  }
-
   if (request.shell !== "powershell") {
     return {
       decision: "deny",
-      reason: "第一版 Command Gateway 只允许 PowerShell。"
-    };
-  }
-
-  const cwdCheck = checkWorkspaceCwd(request.cwd);
-  if (!cwdCheck.allowed) {
-    return {
-      decision: "deny",
-      reason: cwdCheck.reason
+      reason: "当前命令执行器只支持 PowerShell。"
     };
   }
 
   const command = request.command.trim();
-  if (isDangerousCommand(command)) {
-    return {
-      decision: "deny",
-      reason: "命令命中危险模式，已拒绝执行。"
-    };
-  }
-
-  if (toolSelection.access_mode === "project_read" && !isReadCommand(command)) {
+  const deletionWarning = getDeletionWarning(command);
+  if (deletionWarning) {
     return {
       decision: "confirm",
-      reason: "当前只开放项目只读工具能力，这条命令需要更高权限。"
-    };
-  }
-
-  if (toolSelection.access_mode === "project_verify" && !isReadCommand(command) && !isVerifyCommand(command)) {
-    return {
-      decision: "confirm",
-      reason: "当前只开放项目读取和验证能力，这条命令需要写权限。"
-    };
-  }
-
-  if (requiresConfirm(command)) {
-    return {
-      decision: "confirm",
-      reason: "该命令需要用户确认，第一版暂不自动执行。"
+      reason: deletionWarning
     };
   }
 
   return {
     decision: "allow",
-    reason: "命令通过 Command Gateway 第一版策略。"
+    reason: "管理员 Agent 模式：PowerShell 命令默认放行。"
   };
-}
-
-function checkWorkspaceCwd(cwd: string): { readonly allowed: boolean; readonly reason: string } {
-  const workspaceRoot = path.resolve(resolveProjectPath());
-  const resolvedCwd = path.resolve(cwd);
-  const relative = path.relative(workspaceRoot, resolvedCwd);
-  const isInsideWorkspace = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-
-  return isInsideWorkspace
-    ? { allowed: true, reason: "cwd 位于工作区内。" }
-    : { allowed: false, reason: `cwd 不在工作区内：${resolvedCwd}` };
-}
-
-function isDangerousCommand(command: string): boolean {
-  const lowerCommand = command.toLowerCase();
-  const dangerousPatterns = [
-    "invoke-expression",
-    "iex",
-    "curl |",
-    "irm ",
-    "iwr ",
-    "format-volume",
-    "format ",
-    "diskpart",
-    "shutdown",
-    "restart-computer",
-    "remove-item -recurse",
-    "rm -r",
-    "rmdir /s",
-    "del /s",
-    "set-executionpolicy"
-  ];
-
-  return dangerousPatterns.some((pattern) => lowerCommand.includes(pattern));
-}
-
-function isReadCommand(command: string): boolean {
-  const normalized = command.trim().toLowerCase();
-  const readPrefixes = [
-    "get-childitem",
-    "dir",
-    "ls",
-    "get-content",
-    "select-string",
-    "test-path",
-    "resolve-path",
-    "git status",
-    "git diff",
-    "git log"
-  ];
-
-  return readPrefixes.some((prefix) => normalized.startsWith(prefix));
 }
 
 function isVerifyCommand(command: string): boolean {
@@ -196,11 +108,23 @@ function isVerifyCommand(command: string): boolean {
   return verifyCommands.some((prefix) => normalized.startsWith(prefix));
 }
 
-function requiresConfirm(command: string): boolean {
+function getDeletionWarning(command: string): string | undefined {
   const normalized = command.trim().toLowerCase();
-  const confirmPatterns = ["git add", "git commit", "git push", "pnpm add", "npm install", "corepack pnpm add"];
+  const deletionPatterns = [
+    "remove-item",
+    " rm ",
+    "rm ",
+    "del ",
+    "erase ",
+    "rmdir ",
+    "rd ",
+    "git clean",
+    "rimraf"
+  ];
 
-  return confirmPatterns.some((pattern) => normalized.startsWith(pattern));
+  return deletionPatterns.some((pattern) => normalized.includes(pattern))
+    ? "删除确认：该 PowerShell 命令看起来包含删除/清理操作，需要用户确认后才能执行。"
+    : undefined;
 }
 
 function getTimeout(command: string): number {

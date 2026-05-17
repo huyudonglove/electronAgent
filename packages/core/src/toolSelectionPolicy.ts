@@ -1,38 +1,17 @@
-import type { RouterResult, ToolAccessMode, ToolSelectionResult } from "@xiaomi/shared";
+import type { RouterResult, ToolSelectionResult } from "@xiaomi/shared";
 
 const ROUTER_CONFIDENCE_THRESHOLD = 0.7;
 const COMMAND_RUN = "command.run";
+const READ_TOOLS = ["file.read", "file.list", "file.search"] as const;
+const WRITE_TOOLS = ["file.write"] as const;
+const MEMORY_TOOLS = ["memory.save"] as const;
 
 export function selectToolsForRouter(routerResult: RouterResult): ToolSelectionResult {
   const routerConfidence = routerResult.confidence;
 
-  if (routerConfidence < ROUTER_CONFIDENCE_THRESHOLD) {
-    return noTools(routerResult, "Router 置信度低于阈值，Core 保守处理，不自动开放工具。");
-  }
-
-  if (routerResult.intent === "chat") {
-    return noTools(routerResult, "普通聊天不需要开放工具。");
-  }
-
-  if (routerResult.intent === "search") {
-    return noTools(routerResult, "当前阶段尚未实现 web.search，因此不开放搜索工具。");
-  }
-
-  if (!routerResult.needs_tools && routerResult.suggested_tools.length === 0) {
-    return noTools(routerResult, "Router 判断本轮不需要工具。");
-  }
-
-  if (!routerResult.needs_tools && routerResult.intent === "analysis" && !routerResult.requires_project_context) {
-    return noTools(routerResult, "普通分析不需要读取项目上下文。");
-  }
-
-  if (!routerResult.suggested_tools.includes(COMMAND_RUN) && !routerResult.needs_tools) {
-    return noTools(routerResult, "Router 没有建议当前可用工具。");
-  }
-
   return {
-    selected_tools: [COMMAND_RUN],
-    access_mode: resolveAccessMode(routerResult),
+    selected_tools: allTools(),
+    access_mode: "project_write",
     reason: buildReason(routerResult),
     confidence_threshold: ROUTER_CONFIDENCE_THRESHOLD,
     router_confidence: routerConfidence,
@@ -40,27 +19,8 @@ export function selectToolsForRouter(routerResult: RouterResult): ToolSelectionR
   };
 }
 
-function noTools(routerResult: RouterResult, reason: string): ToolSelectionResult {
-  return {
-    selected_tools: [],
-    access_mode: "none",
-    reason,
-    confidence_threshold: ROUTER_CONFIDENCE_THRESHOLD,
-    router_confidence: routerResult.confidence,
-    auto_allowed: false
-  };
-}
-
-function resolveAccessMode(routerResult: RouterResult): ToolAccessMode {
-  if (routerResult.intent === "code" || routerResult.task_type === "implementation") {
-    return "project_write";
-  }
-
-  if (routerResult.intent === "debug" || routerResult.task_type === "debugging" || routerResult.task_type === "verification") {
-    return "project_verify";
-  }
-
-  return "project_read";
+function allTools(): readonly string[] {
+  return [...READ_TOOLS, ...WRITE_TOOLS, COMMAND_RUN, ...MEMORY_TOOLS];
 }
 
 function buildReason(routerResult: RouterResult): string {
@@ -69,12 +29,12 @@ function buildReason(routerResult: RouterResult): string {
   }
 
   if (routerResult.intent === "code") {
-    return "本轮需要推进代码实现，允许后续 Command Gateway 在项目范围内处理读写和验证命令。";
+    return "管理员 Agent 模式：默认开放读取、写入、记忆和命令工具；删除类命令会在结果中提醒。";
   }
 
   if (routerResult.intent === "debug") {
-    return "本轮需要定位问题，允许后续 Command Gateway 在项目范围内读取文件并执行验证命令。";
+    return "管理员 Agent 模式：默认开放读取、写入、记忆和命令工具；删除类命令会在结果中提醒。";
   }
 
-  return "本轮需要项目上下文，允许后续 Command Gateway 进行项目只读检查。";
+  return "管理员 Agent 模式：默认开放读取、写入、记忆和命令工具；删除类命令会在结果中提醒。";
 }

@@ -122,6 +122,13 @@ function parseRouterResult(content: string): RouterResult {
     is_task: toBoolean(parsed.is_task),
     task_goal: toStringValue(parsed.task_goal),
     task_type: taskType,
+    reasoning_brief: toStringValue(parsed.reasoning_brief),
+    planned_steps: toStringArray(parsed.planned_steps),
+    expected_output: toStringValue(parsed.expected_output),
+    verification_question: toStringValue(parsed.verification_question),
+    success_criteria: toStringArray(parsed.success_criteria),
+    needs_user_clarification: toBoolean(parsed.needs_user_clarification),
+    clarifying_questions: toStringArray(parsed.clarifying_questions),
     requires_project_context: toBoolean(parsed.requires_project_context),
     needs_tools: needsTools,
     suggested_tools: suggestedTools,
@@ -198,10 +205,11 @@ function toStringArray(value: unknown): readonly string[] {
 }
 
 function normalizeSuggestedTools(value: unknown, needsTools: boolean): readonly string[] {
-  const tools = toStringArray(value).filter((tool) => tool === "command.run");
+  const allowed = new Set(["command.run", "file.read", "file.list", "file.search", "file.write", "memory.save"]);
+  const tools = toStringArray(value).filter((tool) => allowed.has(tool));
 
   if (needsTools && tools.length === 0) {
-    return ["command.run"];
+    return ["file.read", "file.search", "command.run"];
   }
 
   return tools;

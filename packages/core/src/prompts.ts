@@ -26,6 +26,14 @@ const COMPRESSION_USER_MODULES = [
   "packages/memorizes/compression/02-input.md"
 ] as const;
 
+const EVALUATOR_PROMPT_MODULES = [
+  "packages/memorizes/evaluator/01-system.md"
+] as const;
+
+const EVALUATOR_USER_MODULES = [
+  "packages/memorizes/evaluator/02-input.md"
+] as const;
+
 export function buildIntentSystemPrompt(): string {
   return readMarkdownFiles(INTENT_PROMPT_MODULES);
 }
@@ -58,6 +66,22 @@ export function buildCompressionUserPrompt(input: {
   return renderTemplate(readMarkdownFiles(COMPRESSION_USER_MODULES), {
     previous_summary: input.previousSummary || "无",
     messages: formatMessages(input.messages)
+  });
+}
+
+export function buildEvaluatorSystemPrompt(): string {
+  return readMarkdownFiles(EVALUATOR_PROMPT_MODULES);
+}
+
+export function buildEvaluatorUserPrompt(input: {
+  readonly userInput: string;
+  readonly routerResult: string;
+  readonly assistantAnswer: string;
+}): string {
+  return renderTemplate(readMarkdownFiles(EVALUATOR_USER_MODULES), {
+    user_input: input.userInput,
+    router_result: input.routerResult,
+    assistant_answer: input.assistantAnswer
   });
 }
 
