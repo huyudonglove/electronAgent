@@ -1,15 +1,7 @@
 import type { ChatMessage, EvaluationNextAction, OutputEvaluationResult, RouterResult } from "@xiaomi/shared";
 import { getModelRuntimeConfig } from "../modelRuntimeConfig";
-import { addProviderDebugLog, createDebugLogBase } from "../providerDebugLogs";
 import { buildEvaluatorSystemPrompt, buildEvaluatorUserPrompt } from "../prompts";
-import { createOpenAiJsonChat } from "./openAiCompatibleProvider";
-
-interface OllamaChatResponse {
-  readonly message?: {
-    readonly content?: string;
-  };
-  readonly response?: string;
-}
+import { createJsonChat } from "./jsonChatProvider";
 
 export async function evaluateOutput(input: {
   readonly messages: readonly ChatMessage[];
@@ -17,7 +9,7 @@ export async function evaluateOutput(input: {
   readonly routerResult: RouterResult;
   readonly assistantAnswer: string;
 }): Promise<OutputEvaluationResult> {
-  const config = getModelRuntimeConfig("router");
+  const config = getModelRuntimeConfig("evaluator");
   const routerResultText = JSON.stringify(input.routerResult, null, 2);
   const userPrompt = buildEvaluatorUserPrompt({
     userInput: input.userInput,
@@ -25,92 +17,19 @@ export async function evaluateOutput(input: {
     assistantAnswer: input.assistantAnswer
   });
 
-  if (config.providerKind === "openai-compatible") {
-    const content = await createOpenAiJsonChat({
-      config,
-      providerId: "output-evaluator-openai-compatible",
-      latestUserMessage: input.userInput,
-      messages: [
-        {
-          role: "system",
-          content: buildEvaluatorSystemPrompt()
-        },
-        {
-          role: "user",
-          content: userPrompt
-        }
-      ]
-    });
-
-    return parseEvaluationResult(content, input.routerResult);
-  }
-
-  if (config.providerKind !== "ollama") {
-    return defaultPassedEvaluation(input.routerResult, "Router Provider 不支持输出验收，跳过 evaluator。");
-  }
-
-  const startedAtMs = Date.now();
-  const requestBody = {
-    model: config.model,
-    stream: false,
-    messages: [
-      {
-        role: "system",
-        content: buildEvaluatorSystemPrompt()
-      },
-      {
-        role: "user",
-        content: userPrompt
-      }
-    ],
-    options: {
-      temperature: Math.min(config.temperature, 0.2),
-      num_predict: config.maxTokens
-    }
-  };
-  const debugLog = createDebugLogBase({
-    providerId: "output-evaluator-ollama",
-    model: config.model,
-    baseURL: config.baseURL,
-    request: {
-      method: "POST",
-      endpoint: `${config.baseURL}/api/chat`,
-      headers: {
-        "content-type": "application/json"
-      },
-      body: requestBody,
-      messageCount: input.messages.length,
-      latestUserMessage: input.userInput
-    }
-  });
-
-  const response = await fetch(`${config.baseURL}/api/chat`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
+  const content = await createJsonChat({
+    config: {
+      ...config,
+      temperature: Math.min(config.temperature, 0.2)
     },
-    body: JSON.stringify(requestBody)
+    providerId: "output-evaluator",
+    systemPrompt: buildEvaluatorSystemPrompt(),
+    userPrompt,
+    latestUserMessage: input.userInput,
+    messageCount: input.messages.length
   });
 
-  if (!response.ok) {
-    throw new Error(`Ollama Evaluator HTTP ${response.status}: ${await response.text()}`);
-  }
-
-  const data = (await response.json()) as OllamaChatResponse;
-  const content = (data.message?.content ?? data.response ?? "").trim();
-  const evaluation = parseEvaluationResult(content, input.routerResult);
-
-  addProviderDebugLog({
-    ...debugLog,
-    status: "succeeded",
-    completedAt: new Date().toISOString(),
-    durationMs: Date.now() - startedAtMs,
-    response: {
-      content
-    }
-  });
-
-  return evaluation;
+  return parseEvaluationResult(content, input.routerResult);
 }
 
 function parseEvaluationResult(content: string, routerResult: RouterResult): OutputEvaluationResult {

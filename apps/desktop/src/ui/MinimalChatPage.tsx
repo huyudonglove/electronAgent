@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { Bug, CheckCircle2, CircleDashed, RefreshCw, Send, SlidersHorizontal, X } from "lucide-react";
+import { Bug, CheckCircle2, CircleDashed, GitBranch, RefreshCw, Send, SlidersHorizontal, UserRound, X } from "lucide-react";
 import type {
   AgentEventRecord,
   ChatMessage,
   ChatSessionId,
   ChatStreamEvent,
   ModelProviderKind,
+  ModelBlockConfig,
   ModelRuntimeConfig,
   ModelRuntimeRole,
   ModelRuntimeSettings,
@@ -15,8 +16,12 @@ import type {
 } from "@xiaomi/shared";
 
 const PROJECT_ID = "local-project";
+const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
+const MIMO_ANTHROPIC_BASE_URL = "https://token-plan-cn.xiaomimimo.com/anthropic";
 const MIMO_OPENAI_BASE_URL = "https://api.xiaomimimo.com/v1";
 const MIMO_MODEL = "mimo-v2.5-pro";
+const OLLAMA_BASE_URL = "http://127.0.0.1:11434";
+const LOCAL_QWEN_MODEL = "qwen2.5:1.5b";
 
 const initialMessage: ChatMessage = {
   id: "minimal-welcome",
@@ -41,7 +46,9 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
   const [debugLogs, setDebugLogs] = useState<readonly ProviderDebugLog[]>([]);
   const [eventLogs, setEventLogs] = useState<readonly AgentEventRecord[]>([]);
   const [selectedTurnId, setSelectedTurnId] = useState<string | undefined>();
-  const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
+  const [modelLibraryOpen, setModelLibraryOpen] = useState(false);
+  const [workflowOpen, setWorkflowOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
   const [modelSettings, setModelSettings] = useState<ModelRuntimeSettings | null>(null);
   const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -194,8 +201,27 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
           className="debug-toggle"
           type="button"
           onClick={async () => {
-            const nextOpen = !modelSettingsOpen;
-            setModelSettingsOpen(nextOpen);
+            const nextOpen = !profileOpen;
+            setProfileOpen(nextOpen);
+            setModelLibraryOpen(false);
+            setWorkflowOpen(false);
+            setDebugOpen(false);
+            if (nextOpen) {
+              await refreshDebugData();
+            }
+          }}
+        >
+          <UserRound size={16} />
+          画像
+        </button>
+        <button
+          className="debug-toggle"
+          type="button"
+          onClick={async () => {
+            const nextOpen = !modelLibraryOpen;
+            setModelLibraryOpen(nextOpen);
+            setWorkflowOpen(false);
+            setProfileOpen(false);
             setDebugOpen(false);
             if (nextOpen) {
               await refreshModelSettings();
@@ -203,7 +229,24 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
           }}
         >
           <SlidersHorizontal size={16} />
-          模型
+          模型库
+        </button>
+        <button
+          className="debug-toggle"
+          type="button"
+          onClick={async () => {
+            const nextOpen = !workflowOpen;
+            setWorkflowOpen(nextOpen);
+            setModelLibraryOpen(false);
+            setProfileOpen(false);
+            setDebugOpen(false);
+            if (nextOpen) {
+              await refreshModelSettings();
+            }
+          }}
+        >
+          <GitBranch size={16} />
+          流程
         </button>
         <button
           className="debug-toggle"
@@ -211,7 +254,9 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
           onClick={async () => {
             const nextOpen = !debugOpen;
             setDebugOpen(nextOpen);
-            setModelSettingsOpen(false);
+            setModelLibraryOpen(false);
+            setWorkflowOpen(false);
+            setProfileOpen(false);
             if (nextOpen) {
               await refreshDebugData();
             }
@@ -253,6 +298,29 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
         </button>
       </footer>
 
+      {profileOpen ? (
+        <aside className="debug-drawer profile-drawer" aria-label="画像面板">
+          <header>
+            <div>
+              <h2>画像</h2>
+              <p>独立观察用户、项目和环境画像，来源于 Router 每轮任务分析。</p>
+            </div>
+            <div className="debug-drawer__actions">
+              <button type="button" onClick={() => void refreshDebugData()} title="刷新">
+                <RefreshCw size={16} />
+              </button>
+              <button type="button" onClick={() => setProfileOpen(false)} title="关闭">
+                <X size={16} />
+              </button>
+            </div>
+          </header>
+
+          <section className="debug-log-list">
+            <ProfileView events={eventLogs} sessionId={sessionId} />
+          </section>
+        </aside>
+      ) : null}
+
       {debugOpen ? (
         <aside className="debug-drawer" aria-label="接口调试面板">
           <header>
@@ -282,18 +350,18 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
         </aside>
       ) : null}
 
-      {modelSettingsOpen ? (
-        <aside className="debug-drawer model-drawer" aria-label="模型配置面板">
+      {modelLibraryOpen ? (
+        <aside className="debug-drawer model-drawer" aria-label="模型库面板">
           <header>
             <div>
-              <h2>模型配置</h2>
-              <p>配置前置 Router、主模型和会话压缩模型，保存到本地文件。</p>
+              <h2>模型库</h2>
+              <p>只管理可复用模型块、API Key、接口地址和模型参数，不处理执行步骤。</p>
             </div>
             <div className="debug-drawer__actions">
               <button type="button" onClick={() => void refreshModelSettings()} title="刷新">
                 <RefreshCw size={16} />
               </button>
-              <button type="button" onClick={() => setModelSettingsOpen(false)} title="关闭">
+              <button type="button" onClick={() => setModelLibraryOpen(false)} title="关闭">
                 <X size={16} />
               </button>
             </div>
@@ -302,30 +370,84 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
           <section className="model-settings">
             {modelSettings ? (
               <>
-                {(["router", "main", "compression"] as const).map((role) => (
-                  <ModelConfigEditor
-                    config={modelSettings[role]}
-                    key={role}
-                    onChange={(config) => {
-                      setModelSettings((current) => current ? { ...current, [role]: config } : current);
-                    }}
-                  />
-                ))}
+                <ModelBlockGallery
+                  blocks={modelSettings.modelBlocks}
+                  onChange={(block) => updateModelBlock(block)}
+                  onSaveKey={() => void saveModelSettings("已保存模型块 API Key 到 config/model-runtime.local.json")}
+                />
                 <div className="model-settings__actions">
                   <button type="button" onClick={() => void saveModelSettings()}>
-                    保存模型配置
-                  </button>
-                  <button type="button" onClick={() => applyMiMoNativePreset()}>
-                    使用 MiMo 原生工具
-                  </button>
-                  <button type="button" onClick={() => applyDeepSeekPreset()}>
-                    使用 DeepSeek 预设
+                    保存模型库
                   </button>
                 </div>
                 {settingsStatus ? <p className="model-settings__status">{settingsStatus}</p> : null}
               </>
             ) : (
               <p className="debug-empty">正在读取模型配置...</p>
+            )}
+          </section>
+        </aside>
+      ) : null}
+
+      {workflowOpen ? (
+        <aside className="debug-drawer model-drawer workflow-drawer" aria-label="流程编排面板">
+          <header>
+            <div>
+              <h2>流程编排</h2>
+              <p>只管理 Agent 执行节点和每个节点绑定哪个模型块，模型 Key 在模型库中维护。</p>
+            </div>
+            <div className="debug-drawer__actions">
+              <button type="button" onClick={() => void refreshModelSettings()} title="刷新">
+                <RefreshCw size={16} />
+              </button>
+              <button type="button" onClick={() => setWorkflowOpen(false)} title="关闭">
+                <X size={16} />
+              </button>
+            </div>
+          </header>
+
+          <section className="model-settings">
+            {modelSettings ? (
+              <>
+                <ModelSchemePanel
+                  onApply={(settings, label) => {
+                    setModelSettings(settings);
+                    setSettingsStatus(`已套用 ${label}，请确认流程绑定后保存。`);
+                  }}
+                  settings={modelSettings}
+                />
+                <section className="model-step-panel" aria-label="步骤模型绑定">
+                  <header>
+                    <span>执行流程</span>
+                    <strong>节点只绑定模型块，不保存 API Key</strong>
+                  </header>
+                  <WorkflowOverview settings={modelSettings} />
+                  {MODEL_RUNTIME_ROLES.map((role) => (
+                    <ModelStepBindingEditor
+                      config={modelSettings[role]}
+                      key={role}
+                      onChange={(config) => {
+                        setModelSettings((current) => current ? { ...current, [role]: config } : current);
+                      }}
+                      settings={modelSettings}
+                    />
+                  ))}
+                </section>
+                <div className="model-settings__actions">
+                  <button type="button" onClick={() => void saveModelSettings("已保存流程绑定到 config/model-runtime.local.json")}>
+                    保存流程
+                  </button>
+                  <button type="button" onClick={() => applyMiMoNativePreset()}>
+                    Execution 使用 MiMo 原生
+                  </button>
+                  <button type="button" onClick={() => applyDeepSeekPreset()}>
+                    全流程 DeepSeek
+                  </button>
+                </div>
+                {settingsStatus ? <p className="model-settings__status">{settingsStatus}</p> : null}
+              </>
+            ) : (
+              <p className="debug-empty">正在读取流程配置...</p>
             )}
           </section>
         </aside>
@@ -339,14 +461,37 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
     setSettingsStatus(null);
   }
 
-  async function saveModelSettings(): Promise<void> {
+  async function saveModelSettings(status = "已保存到 config/model-runtime.local.json"): Promise<void> {
     if (!modelSettings) {
       return;
     }
 
     const saved = await window.workbench.saveModelRuntimeSettings(modelSettings);
     setModelSettings(saved);
-    setSettingsStatus("已保存到 config/model-runtime.local.json");
+    setSettingsStatus(status);
+  }
+
+  function updateModelBlock(block: ModelBlockConfig): void {
+    setModelSettings((current) => {
+      if (!current) {
+        return current;
+      }
+
+      const modelBlocks = current.modelBlocks.map((item) => item.id === block.id ? block : item);
+      const next = {
+        ...current,
+        modelBlocks
+      };
+
+      return {
+        ...next,
+        router: applyModelBlockToMatchingStep(next.router, block),
+        planner: applyModelBlockToMatchingStep(next.planner, block),
+        main: applyModelBlockToMatchingStep(next.main, block),
+        evaluator: applyModelBlockToMatchingStep(next.evaluator, block),
+        compression: applyModelBlockToMatchingStep(next.compression, block)
+      };
+    });
   }
 
   function applyDeepSeekPreset(): void {
@@ -355,41 +500,13 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
         return current;
       }
 
-      return {
-        router: {
-          ...current.router,
-          label: "DeepSeek Router",
-          providerKind: "openai-compatible",
-          baseURL: "https://api.deepseek.com",
-          model: "deepseek-v4-flash",
-          temperature: 0.2,
-          maxTokens: 768,
-          toolCallingMode: "text-json",
-          thinkingEnabled: false
-        },
-        main: {
-          ...current.main,
-          label: "DeepSeek Main",
-          providerKind: "openai-compatible",
-          baseURL: "https://api.deepseek.com",
-          model: "deepseek-v4-pro",
-          temperature: 0.7,
-          maxTokens: 8192,
-          toolCallingMode: "text-json",
-          thinkingEnabled: false
-        },
-        compression: {
-          ...current.compression,
-          label: "DeepSeek Compression",
-          providerKind: "openai-compatible",
-          baseURL: "https://api.deepseek.com",
-          model: "deepseek-v4-flash",
-          temperature: 0.2,
-          maxTokens: 1024,
-          toolCallingMode: "text-json",
-          thinkingEnabled: false
-        }
-      };
+      return applyModelScheme(current, {
+        router: "deepseek-flash",
+        planner: "deepseek-pro",
+        main: "deepseek-pro",
+        evaluator: "deepseek-flash",
+        compression: "deepseek-flash"
+      });
     });
     setSettingsStatus("已套用 DeepSeek 预设，请填写 API Key 后保存。");
   }
@@ -402,17 +519,7 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
 
       return {
         ...current,
-        main: {
-          ...current.main,
-          label: "MiMo Native Main",
-          providerKind: "openai-compatible",
-          baseURL: MIMO_OPENAI_BASE_URL,
-          model: MIMO_MODEL,
-          temperature: 1,
-          maxTokens: 8192,
-          toolCallingMode: "native-openai",
-          thinkingEnabled: true
-        }
+        main: applyModelBlockToRole(current.main, getModelBlock(current, "mimo-openai-native"))
       };
     });
     setSettingsStatus("已切换主模型为 MiMo OpenAI 原生工具模式，请确认 API Key 后保存。");
@@ -508,14 +615,573 @@ function pushMessageSection(
   });
 }
 
-function ModelConfigEditor(props: {
+function ProfileView(props: {
+  readonly events: readonly AgentEventRecord[];
+  readonly sessionId?: ChatSessionId;
+}): JSX.Element {
+  if (!props.sessionId) {
+    return <p className="debug-empty">发送消息后，Router 会开始建立用户、项目和环境画像。</p>;
+  }
+
+  const profile = buildProfileOverview(props.events);
+
+  if (profile.totalObservations === 0) {
+    return <p className="debug-empty">当前会话还没有画像观察。继续对话后，这里会显示 Router 的画像快照和候选更新。</p>;
+  }
+
+  return (
+    <div className="profile-panel">
+      <section className="profile-overview" aria-label="画像总览">
+        <header>
+          <span>画像总览</span>
+          <strong>{profile.totalObservations} 次观察</strong>
+        </header>
+        <dl>
+          <div>
+            <dt>候选更新</dt>
+            <dd>{profile.totalUpdates}</dd>
+          </div>
+          <div>
+            <dt>路由影响</dt>
+            <dd>{profile.routingInfluences.length}</dd>
+          </div>
+          <div>
+            <dt>最近观察</dt>
+            <dd>{profile.latestObservedAt ? formatTime(profile.latestObservedAt) : "-"}</dd>
+          </div>
+        </dl>
+      </section>
+
+      <div className="profile-grid">
+        {profile.sections.map((section) => (
+          <article className="profile-card" data-target={section.target} key={section.target}>
+            <header>
+              <div>
+                <span>{section.kind}</span>
+                <h3>{section.title}</h3>
+              </div>
+              <strong>{section.updates.length} 更新</strong>
+            </header>
+            <p>{section.description}</p>
+
+            <section className="profile-card__block">
+              <h4>当前使用的画像快照</h4>
+              {section.snapshot.length > 0 ? (
+                <ul>
+                  {section.snapshot.map((item, index) => (
+                    <li key={`${section.target}-snapshot-${index}`}>{item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p>暂无快照。</p>
+              )}
+            </section>
+
+            <section className="profile-card__block">
+              <h4>候选更新</h4>
+              {section.updates.length > 0 ? (
+                <ol className="profile-update-list">
+                  {section.updates.map((update, index) => (
+                    <li key={`${section.target}-update-${index}`}>
+                      <strong>{update.field || "未命名字段"}</strong>
+                      <span>{update.value || "-"}</span>
+                      <small>{compactText(joinNonEmpty([update.reason, update.evidence], " / "), 160) || "无说明"}</small>
+                      <em>confidence {formatNumber(update.confidence)}</em>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <p>暂无候选更新。</p>
+              )}
+            </section>
+          </article>
+        ))}
+      </div>
+
+      <details className="trace-audit-panel profile-influence-panel">
+        <summary>
+          <span>路由影响</span>
+          <strong>画像如何影响 Router 判断</strong>
+        </summary>
+        <div className="trace-audit-panel__body">
+          {profile.routingInfluences.length > 0 ? (
+            <ul className="profile-influence-list">
+              {profile.routingInfluences.map((item, index) => (
+                <li key={`profile-influence-${index}`}>{item}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="debug-empty">暂无路由影响记录。</p>
+          )}
+        </div>
+      </details>
+    </div>
+  );
+}
+
+interface ProfileOverview {
+  readonly totalObservations: number;
+  readonly totalUpdates: number;
+  readonly latestObservedAt?: string;
+  readonly routingInfluences: readonly string[];
+  readonly sections: readonly ProfileSection[];
+}
+
+interface ProfileSection {
+  readonly target: "user" | "project" | "environment";
+  readonly kind: string;
+  readonly title: string;
+  readonly description: string;
+  readonly snapshot: readonly string[];
+  readonly updates: readonly ProfileUpdateView[];
+}
+
+interface ProfileUpdateView {
+  readonly field: string;
+  readonly value: string;
+  readonly reason: string;
+  readonly evidence: string;
+  readonly confidence: number;
+}
+
+function buildProfileOverview(events: readonly AgentEventRecord[]): ProfileOverview {
+  const routerEvents = events.filter((event) => event.type === "router_result");
+  const snapshots: Record<ProfileSection["target"], string[]> = {
+    user: [],
+    project: [],
+    environment: []
+  };
+  const updates: Record<ProfileSection["target"], ProfileUpdateView[]> = {
+    user: [],
+    project: [],
+    environment: []
+  };
+  const routingInfluences: string[] = [];
+
+  for (const event of routerEvents) {
+    const payload = asRecord(event.payload);
+    const observation = asRecord(payload.profile_observation);
+    const snapshot = asRecord(observation.profile_snapshot_used);
+
+    for (const target of ["user", "project", "environment"] as const) {
+      snapshots[target].push(...toUniqueAppendItems(snapshots[target], stringArrayValues(snapshot[target])));
+    }
+
+    routingInfluences.push(...toUniqueAppendItems(routingInfluences, stringArrayValues(observation.routing_influences)));
+
+    for (const item of arrayField(observation, "profile_updates")) {
+      const record = asRecord(item);
+      const target = normalizeProfileTarget(stringField(record, "target"));
+      if (!target) {
+        continue;
+      }
+
+      updates[target].push({
+        field: stringField(record, "field"),
+        value: stringField(record, "value"),
+        reason: stringField(record, "reason"),
+        evidence: stringField(record, "evidence"),
+        confidence: Number(record.confidence ?? 0)
+      });
+    }
+  }
+
+  return {
+    totalObservations: routerEvents.length,
+    totalUpdates: updates.user.length + updates.project.length + updates.environment.length,
+    latestObservedAt: routerEvents.at(-1)?.createdAt,
+    routingInfluences,
+    sections: [
+      {
+        target: "user",
+        kind: "User",
+        title: "用户画像",
+        description: "你的偏好、沟通方式、确认规则、工作习惯和长期目标。",
+        snapshot: snapshots.user,
+        updates: updates.user
+      },
+      {
+        target: "project",
+        kind: "Project",
+        title: "项目画像",
+        description: "当前 Agent 项目的目标、架构、技术选型、阶段状态和约束。",
+        snapshot: snapshots.project,
+        updates: updates.project
+      },
+      {
+        target: "environment",
+        kind: "Environment",
+        title: "环境画像",
+        description: "本机路径、工具、运行环境、外部软件和可用资源。",
+        snapshot: snapshots.environment,
+        updates: updates.environment
+      }
+    ]
+  };
+}
+
+function normalizeProfileTarget(value: string): ProfileSection["target"] | undefined {
+  return value === "user" || value === "project" || value === "environment" ? value : undefined;
+}
+
+function formatNumber(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+
+  return value.toFixed(2);
+}
+
+function toUniqueAppendItems(existing: readonly string[], incoming: readonly string[]): string[] {
+  const seen = new Set(existing);
+  return incoming.filter((item) => {
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      return false;
+    }
+    seen.add(trimmed);
+    return true;
+  });
+}
+
+interface ModelProfilePreset {
+  readonly id: string;
+  readonly label: string;
+  readonly provider: string;
+  readonly description: string;
+  readonly supports: readonly ModelRuntimeRole[];
+  readonly config: Omit<ModelRuntimeConfig, "role">;
+}
+
+const MODEL_RUNTIME_ROLES: readonly ModelRuntimeRole[] = ["router", "planner", "main", "evaluator", "compression"];
+
+const MODEL_PROFILE_PRESETS: readonly ModelProfilePreset[] = [
+  {
+    id: "deepseek-flash",
+    label: "DeepSeek Flash",
+    provider: "DeepSeek",
+    description: "适合 Router、Evaluator、压缩和轻量执行。",
+    supports: ["router", "planner", "main", "evaluator", "compression"],
+    config: {
+      label: "DeepSeek Flash",
+      providerKind: "openai-compatible",
+      baseURL: DEEPSEEK_BASE_URL,
+      model: "deepseek-v4-flash",
+      apiKey: "",
+      temperature: 0.2,
+      maxTokens: 1024,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "deepseek-pro",
+    label: "DeepSeek Pro",
+    provider: "DeepSeek",
+    description: "适合主模型和复杂任务规划。",
+    supports: ["planner", "main"],
+    config: {
+      label: "DeepSeek Pro",
+      providerKind: "openai-compatible",
+      baseURL: DEEPSEEK_BASE_URL,
+      model: "deepseek-v4-pro",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 8192,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-anthropic-pro",
+    label: "MiMo Pro Anthropic",
+    provider: "MiMo",
+    description: "当前稳定主模型路径，走 Anthropic-compatible。",
+    supports: ["planner", "main"],
+    config: {
+      label: "MiMo Pro Anthropic",
+      providerKind: "anthropic-compatible",
+      baseURL: MIMO_ANTHROPIC_BASE_URL,
+      model: MIMO_MODEL,
+      apiKey: "",
+      temperature: 1,
+      maxTokens: 8192,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-openai-native",
+    label: "MiMo Native Tools",
+    provider: "MiMo",
+    description: "原生 OpenAI tools/thinking 路径，需要 /v1 Key 可用。",
+    supports: ["planner", "main"],
+    config: {
+      label: "MiMo Native Tools",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: MIMO_MODEL,
+      apiKey: "",
+      temperature: 1,
+      maxTokens: 8192,
+      toolCallingMode: "native-openai",
+      thinkingEnabled: true
+    }
+  },
+  {
+    id: "local-qwen",
+    label: "Local Qwen",
+    provider: "Ollama",
+    description: "本地小模型，适合离线 Router 和压缩。",
+    supports: ["router", "evaluator", "compression"],
+    config: {
+      label: "Local Qwen",
+      providerKind: "ollama",
+      baseURL: OLLAMA_BASE_URL,
+      model: LOCAL_QWEN_MODEL,
+      apiKey: "",
+      temperature: 0.2,
+      maxTokens: 1024,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  }
+];
+
+const MODEL_SCHEMES: readonly {
+  readonly id: string;
+  readonly label: string;
+  readonly description: string;
+  readonly bindings: Record<ModelRuntimeRole, string>;
+}[] = [
+  {
+    id: "deepseek-router-mimo-main",
+    label: "DeepSeek 前置 + MiMo 主模型",
+    description: "Router 用 Flash，主回复走当前稳定 MiMo Anthropic，压缩也用 Flash。",
+    bindings: {
+      router: "deepseek-flash",
+      planner: "deepseek-pro",
+      main: "mimo-anthropic-pro",
+      evaluator: "deepseek-flash",
+      compression: "deepseek-flash"
+    }
+  },
+  {
+    id: "all-deepseek",
+    label: "全 DeepSeek",
+    description: "Router/压缩用 Flash，主模型用 Pro，切换成本最低。",
+    bindings: {
+      router: "deepseek-flash",
+      planner: "deepseek-pro",
+      main: "deepseek-pro",
+      evaluator: "deepseek-flash",
+      compression: "deepseek-flash"
+    }
+  },
+  {
+    id: "local-router-mimo-main",
+    label: "本地前置 + MiMo 主模型",
+    description: "Router/压缩走 Ollama，本地成本低，主回复走 MiMo。",
+    bindings: {
+      router: "local-qwen",
+      planner: "mimo-anthropic-pro",
+      main: "mimo-anthropic-pro",
+      evaluator: "local-qwen",
+      compression: "local-qwen"
+    }
+  }
+];
+
+function ModelSchemePanel(props: {
+  readonly settings: ModelRuntimeSettings;
+  readonly onApply: (settings: ModelRuntimeSettings, label: string) => void;
+}): JSX.Element {
+  return (
+    <section className="model-schemes" aria-label="模型方案">
+      <header>
+        <span>一键方案</span>
+        <strong>先选工作模式，再按角色微调</strong>
+      </header>
+      <div className="model-scheme-grid">
+        {MODEL_SCHEMES.map((scheme) => (
+          <button
+            key={scheme.id}
+            onClick={() => props.onApply(applyModelScheme(props.settings, scheme.bindings), scheme.label)}
+            type="button"
+          >
+            <span>{scheme.label}</span>
+            <small>{scheme.description}</small>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function applyModelScheme(
+  settings: ModelRuntimeSettings,
+  bindings: Record<ModelRuntimeRole, string>
+): ModelRuntimeSettings {
+  return {
+    modelBlocks: settings.modelBlocks,
+    router: applyModelProfileToRole(settings.router, getModelPreset(bindings.router), settings),
+    planner: applyModelProfileToRole(settings.planner, getModelPreset(bindings.planner), settings),
+    main: applyModelProfileToRole(settings.main, getModelPreset(bindings.main), settings),
+    evaluator: applyModelProfileToRole(settings.evaluator, getModelPreset(bindings.evaluator), settings),
+    compression: applyModelProfileToRole(settings.compression, getModelPreset(bindings.compression), settings)
+  };
+}
+
+function getModelPreset(id: string): ModelProfilePreset {
+  return MODEL_PROFILE_PRESETS.find((preset) => preset.id === id) ?? MODEL_PROFILE_PRESETS[0];
+}
+
+function getModelBlock(settings: ModelRuntimeSettings, id: string): ModelBlockConfig {
+  return settings.modelBlocks.find((block) => block.id === id) ?? modelPresetToBlock(getModelPreset(id));
+}
+
+function modelPresetToBlock(preset: ModelProfilePreset): ModelBlockConfig {
+  return {
+    id: preset.id,
+    label: preset.label,
+    provider: preset.provider,
+    description: preset.description,
+    providerKind: preset.config.providerKind,
+    baseURL: preset.config.baseURL,
+    model: preset.config.model,
+    apiKey: preset.config.apiKey,
+    temperature: preset.config.temperature,
+    maxTokens: preset.config.maxTokens,
+    toolCallingMode: preset.config.toolCallingMode,
+    thinkingEnabled: preset.config.thinkingEnabled
+  };
+}
+
+function ModelBlockGallery(props: {
+  readonly blocks: readonly ModelBlockConfig[];
+  readonly onChange: (block: ModelBlockConfig) => void;
+  readonly onSaveKey: () => void;
+}): JSX.Element {
+  return (
+    <section className="model-block-panel" aria-label="模型块">
+      <header>
+        <span>模型块</span>
+        <strong>可复用模型档案</strong>
+      </header>
+      <div className="model-block-grid">
+        {props.blocks.map((block) => (
+          <article className="model-block-card" key={block.id}>
+            <header>
+              <span>{block.provider}</span>
+              <h3>{block.label}</h3>
+            </header>
+            <p>{block.description}</p>
+            <dl>
+              <div>
+                <dt>模型</dt>
+                <dd>{block.model}</dd>
+              </div>
+              <div>
+                <dt>接口</dt>
+                <dd>{block.baseURL}</dd>
+              </div>
+              <div>
+                <dt>模式</dt>
+                <dd>{block.toolCallingMode}</dd>
+              </div>
+            </dl>
+            <div className="model-block-card__key-row">
+              <label>
+                <span>
+                  API Key
+                  <strong data-ready={Boolean(block.apiKey)}>
+                    {block.apiKey ? `已保存 ${maskApiKey(block.apiKey)}` : "未配置"}
+                  </strong>
+                </span>
+                <input
+                  type="password"
+                  value={block.apiKey}
+                  onChange={(event) => props.onChange({ ...block, apiKey: event.target.value })}
+                  placeholder={block.providerKind === "ollama" ? "Ollama 可留空" : "输入或替换模型块 Key"}
+                />
+              </label>
+              <button type="button" onClick={props.onSaveKey}>
+                保存 Key
+              </button>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function WorkflowOverview(props: {
+  readonly settings: ModelRuntimeSettings;
+}): JSX.Element {
+  return (
+    <ol className="workflow-overview" aria-label="Agent 执行流程概览">
+      {MODEL_RUNTIME_ROLES.map((role, index) => {
+        const config = props.settings[role];
+        const block = props.settings.modelBlocks.find((item) => item.id === config.modelBlockId);
+
+        return (
+          <li key={role}>
+            <span>{index + 1}</span>
+            <div>
+              <strong>{workflowRoleTitle(role)}</strong>
+              <small>{workflowRoleSummary(role)}</small>
+            </div>
+            <em>{block?.label ?? config.label}</em>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function workflowRoleTitle(role: ModelRuntimeRole): string {
+  const labels: Record<ModelRuntimeRole, string> = {
+    router: "Router",
+    planner: "Planning",
+    main: "Execution",
+    evaluator: "Evaluator",
+    compression: "Compression"
+  };
+
+  return labels[role];
+}
+
+function workflowRoleSummary(role: ModelRuntimeRole): string {
+  const summaries: Record<ModelRuntimeRole, string> = {
+    router: "理解用户输入和任务类型",
+    planner: "规划目标、步骤、风险和执行指令",
+    main: "按计划执行、调用工具并生成回复",
+    evaluator: "检查输出是否满足成功条件",
+    compression: "长会话摘要和上下文压缩"
+  };
+
+  return summaries[role];
+}
+
+function ModelStepBindingEditor(props: {
   readonly config: ModelRuntimeConfig;
   readonly onChange: (config: ModelRuntimeConfig) => void;
+  readonly settings: ModelRuntimeSettings;
 }): JSX.Element {
   const roleLabels: Record<ModelRuntimeRole, string> = {
     router: "前置 Router",
+    planner: "规划模型",
     main: "主对话模型",
+    evaluator: "输出验收模型",
     compression: "会话压缩模型"
+  };
+  const roleDescriptions: Record<ModelRuntimeRole, string> = {
+    router: "负责任务分析、流程路由、上下文需求、画像观察和验收种子。",
+    planner: "负责在执行前拆解目标、步骤、风险和执行指令。",
+    main: "负责面向用户的正式回复、工具请求和工具结果整理。",
+    evaluator: "负责检查主模型输出是否满足本轮成功条件。",
+    compression: "负责长会话摘要和上下文压缩。"
   };
 
   function update(patch: Partial<ModelRuntimeConfig>): void {
@@ -526,99 +1192,136 @@ function ModelConfigEditor(props: {
     props.onChange(next);
   }
 
+  function applyProfile(profileId: string): void {
+    const preset = MODEL_PROFILE_PRESETS.find((item) => item.id === profileId);
+    if (!preset) {
+      return;
+    }
+
+    props.onChange(applyModelBlockToRole(props.config, getModelBlock(props.settings, preset.id)));
+  }
+
   const canUseNativeOpenAiTools = props.config.role === "main" && props.config.providerKind === "openai-compatible";
+  const availableProfiles = MODEL_PROFILE_PRESETS;
+  const selectedProfileId = matchModelProfilePreset(props.config)?.id ?? "custom";
 
   return (
     <article className="model-card">
-      <h3>{roleLabels[props.config.role]}</h3>
+      <header>
+        <div>
+          <span>{roleLabels[props.config.role]}</span>
+          <h3>{props.config.label}</h3>
+        </div>
+        <strong>{providerLabel(props.config.providerKind)}</strong>
+      </header>
+      <p className="model-card__role-desc">{roleDescriptions[props.config.role]}</p>
       <label>
-        <span>名称</span>
-        <input value={props.config.label} onChange={(event) => update({ label: event.target.value })} />
-      </label>
-      <label>
-        <span>Provider</span>
-        <select
-          value={props.config.providerKind}
-          onChange={(event) => update({ providerKind: event.target.value as ModelProviderKind })}
-        >
-          <option value="ollama">Ollama</option>
-          <option value="openai-compatible">OpenAI Compatible</option>
-          <option value="anthropic-compatible">Anthropic Compatible</option>
+        <span>绑定模型块</span>
+        <select value={selectedProfileId} onChange={(event) => applyProfile(event.target.value)}>
+          <option value="custom">自定义：{props.config.label || props.config.model}</option>
+          {availableProfiles.map((preset) => (
+            <option key={preset.id} value={preset.id}>
+              {preset.label} · {preset.provider}
+            </option>
+          ))}
         </select>
       </label>
-      <label>
-        <span>Base URL</span>
-        <input value={props.config.baseURL} onChange={(event) => update({ baseURL: event.target.value })} />
-      </label>
-      <label>
-        <span>Model</span>
-        <input value={props.config.model} onChange={(event) => update({ model: event.target.value })} />
-      </label>
-      <label>
-        <span>API Key</span>
-        <input
-          type="password"
-          value={props.config.apiKey}
-          onChange={(event) => update({ apiKey: event.target.value })}
-          placeholder={props.config.providerKind === "ollama" ? "Ollama 可留空" : "本地保存，不提交"}
-        />
-      </label>
-      <div className="model-card__grid">
+      <dl className="model-card__summary">
+        <div>
+          <dt>模型</dt>
+          <dd>{props.config.model}</dd>
+        </div>
+        <div>
+          <dt>地址</dt>
+          <dd>{props.config.baseURL}</dd>
+        </div>
+        <div>
+          <dt>工具</dt>
+          <dd>{props.config.toolCallingMode}</dd>
+        </div>
+      </dl>
+      <details className="model-card__advanced">
+        <summary>高级参数</summary>
         <label>
-          <span>Temperature</span>
-          <input
-            type="number"
-            min="0"
-            max="2"
-            step="0.1"
-            value={props.config.temperature}
-            onChange={(event) => update({ temperature: Number(event.target.value) })}
-          />
+          <span>名称</span>
+          <input value={props.config.label} onChange={(event) => update({ label: event.target.value })} />
         </label>
         <label>
-          <span>Max Tokens</span>
-          <input
-            type="number"
-            min="1"
-            step="1"
-            value={props.config.maxTokens}
-            onChange={(event) => update({ maxTokens: Number(event.target.value) })}
-          />
+          <span>Provider</span>
+          <select
+            value={props.config.providerKind}
+            onChange={(event) => update({ providerKind: event.target.value as ModelProviderKind })}
+          >
+            <option value="ollama">Ollama</option>
+            <option value="openai-compatible">OpenAI Compatible</option>
+            <option value="anthropic-compatible">Anthropic Compatible</option>
+          </select>
         </label>
-      </div>
-      {props.config.role === "main" ? (
+        <label>
+          <span>Base URL</span>
+          <input value={props.config.baseURL} onChange={(event) => update({ baseURL: event.target.value })} />
+        </label>
+        <label>
+          <span>Model</span>
+          <input value={props.config.model} onChange={(event) => update({ model: event.target.value })} />
+        </label>
         <div className="model-card__grid">
           <label>
-            <span>Tool Mode</span>
-            <select
-              value={props.config.toolCallingMode}
-              disabled={!canUseNativeOpenAiTools}
-              onChange={(event) => {
-                const toolCallingMode = event.target.value as ModelToolCallingMode;
-                update({
-                  toolCallingMode,
-                  thinkingEnabled: toolCallingMode === "native-openai"
-                });
-              }}
-            >
-              <option value="text-json">Text JSON</option>
-              <option value="native-openai">Native OpenAI</option>
-            </select>
-          </label>
-          <label className="model-card__check">
+            <span>Temperature</span>
             <input
-              type="checkbox"
-              checked={props.config.thinkingEnabled}
-              disabled={!canUseNativeOpenAiTools}
-              onChange={(event) => update({
-                thinkingEnabled: event.target.checked,
-                toolCallingMode: event.target.checked ? "native-openai" : "text-json"
-              })}
+              type="number"
+              min="0"
+              max="2"
+              step="0.1"
+              value={props.config.temperature}
+              onChange={(event) => update({ temperature: Number(event.target.value) })}
             />
-            <span>Thinking</span>
+          </label>
+          <label>
+            <span>Max Tokens</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={props.config.maxTokens}
+              onChange={(event) => update({ maxTokens: Number(event.target.value) })}
+            />
           </label>
         </div>
-      ) : null}
+        {props.config.role === "main" ? (
+          <div className="model-card__grid">
+            <label>
+              <span>Tool Mode</span>
+              <select
+                value={props.config.toolCallingMode}
+                disabled={!canUseNativeOpenAiTools}
+                onChange={(event) => {
+                  const toolCallingMode = event.target.value as ModelToolCallingMode;
+                  update({
+                    toolCallingMode,
+                    thinkingEnabled: toolCallingMode === "native-openai"
+                  });
+                }}
+              >
+                <option value="text-json">Text JSON</option>
+                <option value="native-openai">Native OpenAI</option>
+              </select>
+            </label>
+            <label className="model-card__check">
+              <input
+                type="checkbox"
+                checked={props.config.thinkingEnabled}
+                disabled={!canUseNativeOpenAiTools}
+                onChange={(event) => update({
+                  thinkingEnabled: event.target.checked,
+                  toolCallingMode: event.target.checked ? "native-openai" : "text-json"
+                })}
+              />
+              <span>Thinking</span>
+            </label>
+          </div>
+        ) : null}
+      </details>
       {props.config.role === "main" ? (
         <p className="model-card__hint">
           Native OpenAI 会自动绑定 OpenAI Compatible 和 Thinking；切到其他 Provider 时会回到 Text JSON。
@@ -626,6 +1329,81 @@ function ModelConfigEditor(props: {
       ) : null}
     </article>
   );
+}
+
+function applyModelProfileToRole(config: ModelRuntimeConfig, preset: ModelProfilePreset, settings: ModelRuntimeSettings): ModelRuntimeConfig {
+  return applyModelBlockToRole(config, getModelBlock(settings, preset.id));
+}
+
+function applyModelBlockToRole(config: ModelRuntimeConfig, block: ModelBlockConfig): ModelRuntimeConfig {
+  return normalizeLinkedModelConfig({
+    ...config,
+    modelBlockId: block.id,
+    label: block.label,
+    providerKind: block.providerKind,
+    baseURL: block.baseURL,
+    model: block.model,
+    apiKey: block.apiKey,
+    temperature: block.temperature,
+    maxTokens: block.maxTokens,
+    toolCallingMode: block.toolCallingMode,
+    thinkingEnabled: block.thinkingEnabled,
+    role: config.role
+  });
+}
+
+function applyModelBlockToMatchingStep(config: ModelRuntimeConfig, block: ModelBlockConfig): ModelRuntimeConfig {
+  if (config.modelBlockId !== block.id) {
+    return config;
+  }
+
+  return normalizeLinkedModelConfig({
+    ...config,
+    label: block.label,
+    providerKind: block.providerKind,
+    baseURL: block.baseURL,
+    model: block.model,
+    apiKey: block.apiKey,
+    temperature: block.temperature,
+    maxTokens: block.maxTokens,
+    toolCallingMode: block.toolCallingMode,
+    thinkingEnabled: block.thinkingEnabled,
+    role: config.role,
+  });
+}
+
+function matchModelProfilePreset(config: ModelRuntimeConfig): ModelProfilePreset | undefined {
+  return MODEL_PROFILE_PRESETS.find((preset) =>
+    preset.config.providerKind === config.providerKind
+    && trimTrailingSlash(preset.config.baseURL) === trimTrailingSlash(config.baseURL)
+    && preset.config.model === config.model
+    && preset.config.toolCallingMode === config.toolCallingMode
+  );
+}
+
+function providerLabel(providerKind: ModelProviderKind): string {
+  if (providerKind === "openai-compatible") {
+    return "OpenAI";
+  }
+
+  if (providerKind === "anthropic-compatible") {
+    return "Anthropic";
+  }
+
+  return "Ollama";
+}
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function maskApiKey(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= 6) {
+    return "******";
+  }
+
+  return `****${trimmed.slice(-4)}`;
 }
 
 function normalizeLinkedModelConfig(config: ModelRuntimeConfig): ModelRuntimeConfig {
@@ -682,6 +1460,8 @@ function TraceView(props: {
   const visibleLogs = selectedTurn ? filterLogsForTurn(props.logs, selectedTurn) : props.logs;
   const steps = buildTraceSteps(visibleEvents, visibleLogs);
   const highlights = buildTraceHighlights(visibleEvents, visibleLogs);
+  const runtimeFlow = buildRuntimeFlow(visibleEvents, visibleLogs);
+  const executionLanes = buildExecutionLanes(visibleEvents, visibleLogs);
   const nodeOutputs = buildNodeOutputs(visibleEvents, visibleLogs);
   const promptViews = buildPromptViews(visibleLogs);
   const infoFlows = buildInfoFlows(visibleEvents, visibleLogs);
@@ -706,80 +1486,143 @@ function TraceView(props: {
         </section>
       ) : null}
 
-      <section className="trace-summary" aria-label="本轮摘要">
-        <div>
-          <span>步骤</span>
-          <strong>{steps.filter((step) => step.present).length}/{steps.length}</strong>
-        </div>
-        <div>
-          <span>模型请求</span>
-          <strong>{visibleLogs.length}</strong>
-        </div>
-        <div>
-          <span>事件</span>
-          <strong>{visibleEvents.length}</strong>
-        </div>
-      </section>
-
-      {highlights.length > 0 ? (
-        <section className="trace-highlights" aria-label="本轮关键信息">
-          <header>
-            <span>本轮关键信息</span>
-            <strong>{selectedTurn ? `第 ${selectedTurn.index} 轮` : "当前会话"}</strong>
-          </header>
-          <dl>
-            {highlights.map((item) => (
-              <div data-tone={item.tone ?? "default"} key={item.label}>
-                <dt>{item.label}</dt>
-                <dd>{item.value}</dd>
-              </div>
-            ))}
-          </dl>
-        </section>
-      ) : null}
-
-      {nodeOutputs.length > 0 ? (
-        <section className="node-output-panel" aria-label="节点产物">
-          <header>
-            <span>节点产物</span>
-            <strong>看每一步产出了什么</strong>
-          </header>
-          <div className="node-output-grid">
-            {nodeOutputs.map((node) => (
-              <article className="node-output-card" data-status={node.status} key={node.id}>
+      <section className="runtime-flow-panel" aria-label="本轮数据流转">
+        <header>
+          <span>本轮数据流转</span>
+          <strong>每个节点独立显示，跳过也保留位置</strong>
+        </header>
+        <ol className="runtime-flow-list">
+          {runtimeFlow.map((node, index) => (
+            <li className="runtime-flow-item" data-kind={node.kind} data-status={node.status} key={node.id}>
+              <span className="runtime-flow-item__index">{index + 1}</span>
+              <article>
                 <header>
                   <div>
-                    <span>{node.kind}</span>
+                    <span>{node.kindLabel}</span>
                     <h3>{node.title}</h3>
                   </div>
                   <strong>{node.badge}</strong>
                 </header>
-                <p>{node.output}</p>
-                {node.fields.length > 0 ? (
+                <p>{node.summary}</p>
+                <dl>
+                  <div>
+                    <dt>接收数据</dt>
+                    <dd>{node.input}</dd>
+                  </div>
+                  <div>
+                    <dt>节点产出</dt>
+                    <dd>{node.output}</dd>
+                  </div>
+                </dl>
+              </article>
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      <details className="trace-audit-panel">
+        <summary>
+          <span>审计详情</span>
+          <strong>关键信息、执行链路、节点产物</strong>
+        </summary>
+        <div className="trace-audit-panel__body">
+          {highlights.length > 0 ? (
+            <section className="trace-highlights" aria-label="本轮关键信息">
+              <header>
+                <span>本轮关键信息</span>
+                <strong>{selectedTurn ? `第 ${selectedTurn.index} 轮` : "当前会话"}</strong>
+              </header>
+              <dl>
+                {highlights.map((item) => (
+                  <div data-tone={item.tone ?? "default"} key={item.label}>
+                    <dt>{item.label}</dt>
+                    <dd>{item.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
+          ) : null}
+
+          <section className="execution-lanes" aria-label="执行链路">
+            <header>
+              <span>执行链路</span>
+              <strong>区分判断、思考、执行和最终产出</strong>
+            </header>
+            <div className="execution-lane-grid">
+              {executionLanes.map((lane) => (
+                <article className="execution-lane-card" data-kind={lane.kind} data-status={lane.status} key={lane.id}>
+                  <header>
+                    <span>{lane.badge}</span>
+                    <h3>{lane.title}</h3>
+                  </header>
+                  <p>{lane.summary}</p>
                   <dl>
-                    {node.fields.map((field) => (
+                    {lane.fields.map((field) => (
                       <div key={field.label}>
                         <dt>{field.label}</dt>
                         <dd>{field.value}</dd>
                       </div>
                     ))}
                   </dl>
-                ) : null}
-                {node.details.length > 0 ? (
-                  <div className="node-output-details">
-                    {node.details.map((item) => (
-                      <details className="debug-details" key={item.label}>
-                        <summary>{item.label}</summary>
-                        <pre>{item.content}</pre>
-                      </details>
-                    ))}
-                  </div>
-                ) : null}
-              </article>
-            ))}
-          </div>
-        </section>
-      ) : null}
+                  {lane.details.length > 0 ? (
+                    <div className="execution-lane-details">
+                      {lane.details.map((item) => (
+                        <details className="debug-details" key={item.label}>
+                          <summary>{item.label}</summary>
+                          <pre>{item.content}</pre>
+                        </details>
+                      ))}
+                    </div>
+                  ) : null}
+                </article>
+              ))}
+            </div>
+          </section>
+
+          {nodeOutputs.length > 0 ? (
+            <section className="node-output-panel">
+              <header>
+                <span>系统节点产物</span>
+                <strong>记忆、工具策略、上下文和审计明细</strong>
+              </header>
+              <div className="node-output-grid">
+                {nodeOutputs.map((node) => (
+                  <article className="node-output-card" data-status={node.status} key={node.id}>
+                    <header>
+                      <div>
+                        <span>{node.kind}</span>
+                        <h3>{node.title}</h3>
+                      </div>
+                      <strong>{node.badge}</strong>
+                    </header>
+                    <p>{node.output}</p>
+                    {node.fields.length > 0 ? (
+                      <dl>
+                        {node.fields.map((field) => (
+                          <div key={field.label}>
+                            <dt>{field.label}</dt>
+                            <dd>{field.value}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    ) : null}
+                    {node.details.length > 0 ? (
+                      <div className="node-output-details">
+                        {node.details.map((item) => (
+                          <details className="debug-details" key={item.label}>
+                            <summary>{item.label}</summary>
+                            <pre>{item.content}</pre>
+                          </details>
+                        ))}
+                      </div>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+      </details>
 
       {promptViews.length > 0 ? (
         <section className="prompt-panel" aria-label="提示词">
@@ -854,32 +1697,36 @@ function TraceView(props: {
       ) : null}
 
       {infoFlows.length > 0 ? (
-        <section className="info-flow-panel" aria-label="输出信息">
-          <header>
+        <details className="trace-audit-panel" aria-label="输出信息">
+          <summary>
             <span>输出信息</span>
-            <strong>看信息怎么流动</strong>
-          </header>
-          <ol>
-            {infoFlows.map((item) => (
-              <li className="info-flow-item" data-tone={item.tone ?? "default"} key={item.id}>
-                <div>
-                  <span>{item.from}</span>
-                  <strong>{item.to}</strong>
-                </div>
-                <article>
-                  <h3>{item.title}</h3>
-                  <p>{item.content}</p>
-                  {item.raw ? (
-                    <details className="debug-details">
-                      <summary>{item.rawLabel ?? "完整内容"}</summary>
-                      <pre>{item.raw}</pre>
-                    </details>
-                  ) : null}
-                </article>
-              </li>
-            ))}
-          </ol>
-        </section>
+            <strong>原始输入输出明细</strong>
+          </summary>
+          <div className="trace-audit-panel__body">
+            <section className="info-flow-panel">
+              <ol>
+                {infoFlows.map((item) => (
+                  <li className="info-flow-item" data-tone={item.tone ?? "default"} key={item.id}>
+                    <div>
+                      <span>{item.from}</span>
+                      <strong>{item.to}</strong>
+                    </div>
+                    <article>
+                      <h3>{item.title}</h3>
+                      <p>{item.content}</p>
+                      {item.raw ? (
+                        <details className="debug-details">
+                          <summary>{item.rawLabel ?? "完整内容"}</summary>
+                          <pre>{item.raw}</pre>
+                        </details>
+                      ) : null}
+                    </article>
+                  </li>
+                ))}
+              </ol>
+            </section>
+          </div>
+        </details>
       ) : null}
 
       <details className="trace-timeline">
@@ -952,6 +1799,24 @@ interface TraceHighlight {
   readonly tone?: "default" | "success" | "warning" | "danger";
 }
 
+interface RunSummaryItem {
+  readonly label: string;
+  readonly value: string;
+  readonly tone?: "default" | "success" | "warning" | "danger";
+}
+
+interface RuntimeFlowNode {
+  readonly id: string;
+  readonly kind: "input" | "router" | "core" | "planning" | "execution" | "tool" | "evaluator" | "final";
+  readonly kindLabel: string;
+  readonly title: string;
+  readonly badge: string;
+  readonly status: "done" | "pending" | "failed" | "skipped";
+  readonly summary: string;
+  readonly input: string;
+  readonly output: string;
+}
+
 interface EvaluationDisplay {
   readonly badge: string;
   readonly status: "done" | "pending" | "failed" | "skipped";
@@ -967,6 +1832,17 @@ interface NodeOutput {
   readonly badge: string;
   readonly status: "done" | "pending" | "failed" | "skipped";
   readonly output: string;
+  readonly fields: readonly { readonly label: string; readonly value: string }[];
+  readonly details: readonly { readonly label: string; readonly content: string }[];
+}
+
+interface ExecutionLane {
+  readonly id: string;
+  readonly kind: "router" | "thinking" | "execution" | "final";
+  readonly title: string;
+  readonly badge: string;
+  readonly status: "done" | "pending" | "failed" | "skipped";
+  readonly summary: string;
   readonly fields: readonly { readonly label: string; readonly value: string }[];
   readonly details: readonly { readonly label: string; readonly content: string }[];
 }
@@ -1068,10 +1944,11 @@ function filterLogsForTurn(logs: readonly ProviderDebugLog[], turn: Conversation
 function buildTraceHighlights(events: readonly AgentEventRecord[], logs: readonly ProviderDebugLog[]): readonly TraceHighlight[] {
   const userMessage = events.find((event) => event.type === "chat_message" && event.actor === "user");
   const routerPayload = asRecord(findLastEvent(events, "router_result")?.payload);
+  const planningPayload = asRecord(findLastEvent(events, "planning_result")?.payload);
   const toolPayload = asRecord(findLastEvent(events, "tool_selection")?.payload);
   const evaluationPayload = asRecord(findLastEvent(events, "output_evaluation")?.payload);
   const errorEvent = findLastEvent(events, "error");
-  const mainModelLog = findLast(logs, (log) => log.providerId.includes("main") || log.providerId.includes("anthropic") || log.providerId.includes("openai"));
+  const mainModelLog = findMainModelLog(logs);
   const evaluationDisplay = Object.keys(evaluationPayload).length > 0 ? evaluationDisplayFromPayload(evaluationPayload) : undefined;
   const items: TraceHighlight[] = [];
 
@@ -1083,21 +1960,38 @@ function buildTraceHighlights(events: readonly AgentEventRecord[], logs: readonl
   }
 
   if (Object.keys(routerPayload).length > 0) {
+    const turnAnalysis = asRecord(routerPayload.turn_analysis);
+    const workflowDecision = asRecord(routerPayload.workflow_decision);
+    const contextDecision = asRecord(routerPayload.context_decision);
+    const profileObservation = asRecord(routerPayload.profile_observation);
+    const profileUpdates = arrayField(profileObservation, "profile_updates");
     items.push(
       {
-        label: "意图",
+        label: "路由",
         value: joinNonEmpty([
-          stringField(routerPayload, "intent"),
-          stringField(routerPayload, "task_type")
+          formatWorkflowRoute(stringField(workflowDecision, "workflow_route") || stringField(routerPayload, "execution_mode")),
+          booleanRaw(workflowDecision, "planning_required") ? "需要 Planning" : "跳过 Planning"
         ], " / ") || "-"
       },
       {
-        label: "任务目标",
-        value: compactText(stringField(routerPayload, "task_goal") || stringField(routerPayload, "rewritten_input") || "-", 100)
+        label: "任务分析",
+        value: compactText(joinNonEmpty([
+          stringField(turnAnalysis, "task_goal") || stringField(routerPayload, "task_goal"),
+          stringField(turnAnalysis, "task_type") || stringField(routerPayload, "task_type"),
+          stringField(turnAnalysis, "complexity") || stringField(routerPayload, "complexity")
+        ], " / ") || stringField(routerPayload, "rewritten_input") || "-", 100)
       },
       {
-        label: "计划步骤",
-        value: compactText(stringArrayField(routerPayload, "planned_steps") || "-", 100)
+        label: "上下文",
+        value: compactText(joinNonEmpty([
+          stringArrayField(contextDecision, "context_needs"),
+          stringField(contextDecision, "time_context_mode"),
+          booleanRaw(contextDecision, "needs_tools") ? "需要工具" : ""
+        ], " / ") || "-", 100)
+      },
+      {
+        label: "画像观察",
+        value: compactText(profileUpdates.length > 0 ? `${profileUpdates.length} 项候选更新` : stringArrayField(profileObservation, "routing_influences") || "-", 100)
       },
       {
         label: "置信度",
@@ -1105,6 +1999,14 @@ function buildTraceHighlights(events: readonly AgentEventRecord[], logs: readonl
         tone: confidenceTone(routerPayload)
       }
     );
+  }
+
+  if (Object.keys(planningPayload).length > 0) {
+    items.push({
+      label: "规划",
+      value: compactText(stringField(planningPayload, "plan_summary") || stringField(planningPayload, "goal") || "-", 100),
+      tone: booleanRaw(planningPayload, "needs_user_confirmation") ? "warning" : "success"
+    });
   }
 
   if (Object.keys(toolPayload).length > 0 || booleanRaw(routerPayload, "needs_tools")) {
@@ -1150,8 +2052,407 @@ function buildTraceHighlights(events: readonly AgentEventRecord[], logs: readonl
   return items;
 }
 
+function buildRuntimeFlow(events: readonly AgentEventRecord[], logs: readonly ProviderDebugLog[]): readonly RuntimeFlowNode[] {
+  const userMessage = events.find((event) => event.type === "chat_message" && event.actor === "user");
+  const routerEvent = findLastEvent(events, "router_result");
+  const toolSelectionEvent = findLastEvent(events, "tool_selection");
+  const planningEvent = findLastEvent(events, "planning_result");
+  const evaluationEvent = findLastEvent(events, "output_evaluation");
+  const toolCallEvents = events.filter((event) => event.type === "tool_call");
+  const toolResultEvents = events.filter((event) => event.type === "tool_result");
+  const assistantMessage = findLast(events, (event) => event.type === "chat_message" && event.actor === "assistant");
+  const errorEvent = findLastEvent(events, "error");
+  const routerPayload = asRecord(routerEvent?.payload);
+  const turnAnalysis = asRecord(routerPayload.turn_analysis);
+  const workflowDecision = asRecord(routerPayload.workflow_decision);
+  const contextDecision = asRecord(routerPayload.context_decision);
+  const evaluationSeed = asRecord(routerPayload.evaluation_seed);
+  const toolPayload = asRecord(toolSelectionEvent?.payload);
+  const planningPayload = asRecord(planningEvent?.payload);
+  const evaluationPayload = asRecord(evaluationEvent?.payload);
+  const workflowRoute = stringField(workflowDecision, "workflow_route") || stringField(routerPayload, "execution_mode") || "";
+  const planningRequired = booleanRaw(workflowDecision, "planning_required");
+  const routerLog = findRouterLog(logs);
+  const plannerLog = findPlannerLog(logs);
+  const mainModelLog = findMainModelLog(logs);
+  const evaluatorLog = findEvaluatorLog(logs);
+  const toolNames = toolCallEvents.map((event) => {
+    const payload = asRecord(event.payload);
+    return stringField(payload, "type") || stringField(payload, "tool") || stringField(payload, "name") || "tool";
+  });
+  const evaluationDisplay = evaluationEvent ? evaluationDisplayFromPayload(evaluationPayload) : undefined;
+  const mainOutput = mainModelLog?.response
+    ? compactText(formatModelResponseSummary(mainModelLog.response), 120)
+    : mainModelLog?.error ? compactText(mainModelLog.error, 120) : "-";
+
+  return [
+    {
+      id: "flow-input",
+      kind: "input",
+      kindLabel: "User",
+      title: "用户输入",
+      badge: userMessage ? "已接收" : "等待",
+      status: userMessage ? "done" : "pending",
+      summary: userMessage?.content ? compactText(userMessage.content, 120) : "等待本轮用户消息。",
+      input: "用户在对话框输入的原始内容",
+      output: userMessage?.content ? compactText(userMessage.content, 120) : "-"
+    },
+    {
+      id: "flow-router",
+      kind: "router",
+      kindLabel: "Model",
+      title: "Router 任务分析",
+      badge: routerLog ? providerFlowBadge(routerLog) : routerEvent ? "已完成" : "等待",
+      status: routerLog?.status === "failed" ? "failed" : routerEvent ? "done" : "pending",
+      summary: routerEvent
+        ? compactText(joinNonEmpty([
+            formatWorkflowRoute(workflowRoute),
+            stringField(turnAnalysis, "intent") || stringField(routerPayload, "intent"),
+            stringField(turnAnalysis, "task_goal") || stringField(routerPayload, "task_goal")
+          ], " / "), 140)
+        : "前置模型分析用户诉求、任务类型、路由、上下文需求和画像线索。",
+      input: "用户输入 + 简短历史",
+      output: routerEvent
+        ? compactText(joinNonEmpty([
+            `route=${workflowRoute || "-"}`,
+            `planning=${booleanField(workflowDecision, "planning_required")}`,
+            stringField(routerPayload, "main_model_brief")
+          ], "；"), 140)
+        : "-"
+    },
+    {
+      id: "flow-tool-policy",
+      kind: "core",
+      kindLabel: "Core",
+      title: "工具开放策略",
+      badge: toolSelectionEvent ? "已决策" : routerEvent ? "等待" : "未开始",
+      status: toolSelectionEvent ? "done" : routerEvent ? "pending" : "skipped",
+      summary: toolSelectionEvent
+        ? compactText(stringField(toolPayload, "reason") || formatToolHighlight(routerPayload, toolPayload), 140)
+        : "Core 根据 Router 结果决定本轮给 Execution 开放哪些工具。",
+      input: "Router 结构化结果",
+      output: toolSelectionEvent
+        ? compactText(joinNonEmpty([
+            stringField(toolPayload, "access_mode"),
+            stringArrayField(toolPayload, "selected_tools")
+          ], " / "), 120)
+        : "-"
+    },
+    {
+      id: "flow-planning",
+      kind: "planning",
+      kindLabel: "Model",
+      title: "Planning 执行前规划",
+      badge: planningEvent ? providerFlowBadge(plannerLog) : planningRequired ? "应执行" : "已跳过",
+      status: planningEvent ? "done" : planningRequired ? "pending" : "skipped",
+      summary: planningEvent
+        ? compactText(stringField(planningPayload, "plan_summary") || stringField(planningPayload, "goal") || "Planning 已返回执行计划。", 140)
+        : planningRequired
+          ? "Router 判断需要规划，但本轮尚未看到 Planning 输出。"
+          : `Router 路由为 ${formatWorkflowRoute(workflowRoute || "answer_only")}，本轮不进入规划模型。`,
+      input: "Router 结果 + 工具策略 + 记忆/历史摘要",
+      output: planningEvent
+        ? compactText(joinNonEmpty([
+            stringField(planningPayload, "goal"),
+            stringArrayField(planningPayload, "required_tools")
+          ], " / "), 140)
+        : planningRequired ? "-" : "跳过，Execution 直接接收 Router 上下文"
+    },
+    {
+      id: "flow-execution",
+      kind: "execution",
+      kindLabel: "Model",
+      title: "Execution 主模型",
+      badge: mainModelLog ? providerFlowBadge(mainModelLog) : "等待",
+      status: mainModelLog?.status === "failed" ? "failed" : mainModelLog ? "done" : "pending",
+      summary: mainModelLog
+        ? mainOutput
+        : "主模型接收上下文包，生成正式回复或工具调用请求。",
+      input: planningEvent ? "Planning 计划 + 上下文包" : "Router 摘要 + 上下文包",
+      output: mainOutput
+    },
+    {
+      id: "flow-tool-run",
+      kind: "tool",
+      kindLabel: "Tool",
+      title: "工具真实执行",
+      badge: toolCallEvents.length > 0 ? `${toolResultEvents.length}/${toolCallEvents.length}` : "已跳过",
+      status: toolResultEvents.some((event) => stringField(asRecord(event.payload), "status") === "failed")
+        ? "failed"
+        : toolCallEvents.length > 0 ? "done" : "skipped",
+      summary: toolCallEvents.length > 0
+        ? compactText(formatToolEventsSummary(toolCallEvents, toolResultEvents), 140)
+        : "Execution 没有产生真实工具调用，本轮不执行工具。",
+      input: toolCallEvents.length > 0 ? compactText(toolNames.join(" / "), 120) : "无工具调用",
+      output: toolResultEvents.length > 0 ? `${toolResultEvents.length} 个工具结果` : "跳过"
+    },
+    {
+      id: "flow-evaluator",
+      kind: "evaluator",
+      kindLabel: "Model",
+      title: "Evaluator 输出验收",
+      badge: evaluationEvent ? evaluationDisplay?.badge ?? "已验收" : "已跳过",
+      status: evaluatorLog?.status === "failed" ? "failed" : evaluationEvent ? "done" : "skipped",
+      summary: evaluationEvent
+        ? compactText(evaluationDisplay?.summary || formatJson(evaluationPayload), 140)
+        : "本轮没有触发输出验收模型。",
+      input: compactText(stringArrayField(evaluationSeed, "success_criteria") || "最终回复 + 成功条件", 120),
+      output: evaluationEvent
+        ? compactText(joinNonEmpty([
+            stringField(evaluationPayload, "status"),
+            stringField(evaluationPayload, "next_action"),
+            compactText(stringArrayField(evaluationPayload, "missing_criteria"), 80)
+          ], " / "), 140)
+        : "跳过"
+    },
+    {
+      id: "flow-final",
+      kind: "final",
+      kindLabel: "UI",
+      title: "最终显示",
+      badge: errorEvent ? "错误" : assistantMessage ? "已显示" : "等待",
+      status: errorEvent ? "failed" : assistantMessage ? "done" : "pending",
+      summary: assistantMessage?.content
+        ? compactText(assistantMessage.content, 140)
+        : errorEvent?.content ? compactText(errorEvent.content, 140) : "等待最终消息写入对话区。",
+      input: "Execution 返回 + 工具结果 + 验收结果",
+      output: assistantMessage?.content ? compactText(assistantMessage.content, 140) : errorEvent?.content ? compactText(errorEvent.content, 140) : "-"
+    }
+  ];
+}
+
+function providerFlowBadge(log?: ProviderDebugLog): string {
+  if (!log) {
+    return "已完成";
+  }
+
+  if (log.status === "failed") {
+    return "失败";
+  }
+
+  return log.status === "pending" ? "请求中" : "已返回";
+}
+
+function buildRunSummary(events: readonly AgentEventRecord[], logs: readonly ProviderDebugLog[]): readonly RunSummaryItem[] {
+  const routerEvent = findLastEvent(events, "router_result");
+  const planningEvent = findLastEvent(events, "planning_result");
+  const evaluationEvent = findLastEvent(events, "output_evaluation");
+  const toolCallEvents = events.filter((event) => event.type === "tool_call");
+  const toolResultEvents = events.filter((event) => event.type === "tool_result");
+  const routerPayload = asRecord(routerEvent?.payload);
+  const workflowDecision = asRecord(routerPayload.workflow_decision);
+  const route = stringField(workflowDecision, "workflow_route") || stringField(routerPayload, "execution_mode") || "-";
+  const planningRequired = booleanRaw(workflowDecision, "planning_required");
+  const modelCalls = logs.filter((log) =>
+    log.providerId.includes("router") ||
+    log.providerId.includes("planner") ||
+    log.providerId.includes("main") ||
+    log.providerId.includes("evaluator") ||
+    log.providerId.includes("compression")
+  );
+
+  return [
+    {
+      label: "路由",
+      value: formatWorkflowRoute(route),
+      tone: route === "answer_only" ? "success" : route === "planning" ? "warning" : "default"
+    },
+    {
+      label: "模型调用",
+      value: String(modelCalls.length),
+      tone: modelCalls.length <= 2 ? "success" : "warning"
+    },
+    {
+      label: "Planning",
+      value: planningEvent ? "已执行" : planningRequired ? "等待/缺失" : "已跳过",
+      tone: planningEvent ? "warning" : planningRequired ? "danger" : "success"
+    },
+    {
+      label: "工具",
+      value: toolCallEvents.length > 0 ? `${toolResultEvents.length}/${toolCallEvents.length}` : "未执行",
+      tone: toolCallEvents.length > 0 ? "warning" : "success"
+    },
+    {
+      label: "验收",
+      value: evaluationEvent ? "已触发" : "已跳过",
+      tone: evaluationEvent ? "warning" : "success"
+    }
+  ];
+}
+
+function formatWorkflowRoute(route: string): string {
+  const labels: Record<string, string> = {
+    answer_only: "直接回答",
+    planning: "进入规划",
+    ask_user: "需要追问",
+    reject: "拒绝"
+  };
+
+  return labels[route] ?? route;
+}
+
+function buildExecutionLanes(events: readonly AgentEventRecord[], logs: readonly ProviderDebugLog[]): readonly ExecutionLane[] {
+  const routerEvent = findLastEvent(events, "router_result");
+  const planningEvent = findLastEvent(events, "planning_result");
+  const toolSelectionEvent = findLastEvent(events, "tool_selection");
+  const toolCallEvents = events.filter((event) => event.type === "tool_call");
+  const toolResultEvents = events.filter((event) => event.type === "tool_result");
+  const assistantMessage = findLast(events, (event) => event.type === "chat_message" && event.actor === "assistant");
+  const errorEvent = findLastEvent(events, "error");
+  const routerPayload = asRecord(routerEvent?.payload);
+  const turnAnalysis = asRecord(routerPayload.turn_analysis);
+  const workflowDecision = asRecord(routerPayload.workflow_decision);
+  const contextDecision = asRecord(routerPayload.context_decision);
+  const profileObservation = asRecord(routerPayload.profile_observation);
+  const inputRisk = asRecord(workflowDecision.input_risk);
+  const planningRequired = booleanRaw(workflowDecision, "planning_required");
+  const workflowRoute = stringField(workflowDecision, "workflow_route");
+  const planningPayload = asRecord(planningEvent?.payload);
+  const toolPayload = asRecord(toolSelectionEvent?.payload);
+  const routerLog = findRouterLog(logs);
+  const plannerLog = findPlannerLog(logs);
+  const mainModelLog = findMainModelLog(logs);
+  const mainResponse = mainModelLog?.response;
+  const nativeResponse = mainResponse ? parseNativeModelResponse(mainResponse.content) : undefined;
+  const failedToolResults = toolResultEvents.filter((event) => stringField(asRecord(event.payload), "status") === "failed").length;
+  const confirmToolResults = toolResultEvents.filter((event) => stringField(asRecord(event.payload), "decision") === "confirm").length;
+  const requestedToolNames = toolCallEvents.map((event) => {
+    const payload = asRecord(event.payload);
+    return stringField(payload, "type") || stringField(payload, "tool") || stringField(payload, "name") || event.type;
+  });
+  const nativeToolNames = nativeResponse?.toolCalls.map((call) => {
+    const fn = asRecord(call.function);
+    return stringField(fn, "name") || stringField(call, "id") || "tool_call";
+  }) ?? [];
+  const mainModelMode = nativeResponse ? "Native reasoning/tool_calls" : mainModelLog ? "Text JSON / 普通文本" : "-";
+  const mainModelSummary = mainResponse
+    ? nativeResponse
+      ? compactText(joinNonEmpty([
+          nativeResponse.reasoningContent ? `思考：${nativeResponse.reasoningContent}` : "",
+          nativeToolNames.length > 0 ? `请求工具：${nativeToolNames.join(" / ")}` : "",
+          nativeResponse.content ? `正式产出：${nativeResponse.content}` : ""
+        ], "；"), 180)
+      : compactText(formatModelResponseSummary(mainResponse), 180)
+    : mainModelLog?.error ? compactText(mainModelLog.error, 180) : "等待主模型返回。";
+
+  return [
+    {
+      id: "router-lane",
+      kind: "router",
+      title: "前置模型 Router",
+      badge: routerEvent ? "判断完成" : "等待判断",
+      status: routerEvent ? "done" : "pending",
+      summary: routerEvent
+        ? compactText(joinNonEmpty([
+            `路由 ${formatWorkflowRoute(stringField(workflowDecision, "workflow_route"))}`,
+            `任务 ${stringField(turnAnalysis, "task_type") || stringField(routerPayload, "task_type") || "-"}`,
+            stringField(turnAnalysis, "task_goal") || stringField(routerPayload, "task_goal") || stringField(routerPayload, "rewritten_input")
+          ], " / "), 180)
+        : "Router v2 负责任务分析、流程路由、上下文需求、画像观察和验收种子，不是给用户的最终回复。",
+      fields: [
+        { label: "性质", value: "任务分析/流程路由/画像观察，不直接执行" },
+        { label: "route", value: stringField(workflowDecision, "workflow_route") || "-" },
+        { label: "planning", value: booleanField(workflowDecision, "planning_required") },
+        { label: "intent", value: stringField(turnAnalysis, "intent") || stringField(routerPayload, "intent") || "-" },
+        { label: "taskType", value: stringField(turnAnalysis, "task_type") || stringField(routerPayload, "task_type") || "-" },
+        { label: "scope", value: joinNonEmpty([stringField(turnAnalysis, "task_scope"), stringField(turnAnalysis, "complexity")], " / ") || "-" },
+        { label: "risk", value: joinNonEmpty([stringField(inputRisk, "level"), booleanField(inputRisk, "requires_confirmation")], " / ") || "-" },
+        { label: "context", value: compactText(stringArrayField(contextDecision, "context_needs") || "-", 120) },
+        { label: "profile", value: compactText(stringArrayField(profileObservation, "routing_influences") || "-", 120) },
+        { label: "needsTools", value: booleanField(contextDecision, "needs_tools") },
+        { label: "brief", value: compactText(stringField(routerPayload, "main_model_brief") || "-", 120) },
+        { label: "confidence", value: numberField(routerPayload, "confidence") }
+      ],
+      details: [
+        ...(routerEvent ? [{ label: "Router 输出 JSON", content: formatJson(routerPayload) }] : []),
+        ...(routerLog ? modelLogDetails(routerLog) : [])
+      ]
+    },
+    {
+      id: "planning-lane",
+      kind: "thinking",
+      title: "规划模型 Planning",
+      badge: planningEvent ? "规划完成" : planningRequired ? "应执行" : "已跳过",
+      status: planningEvent ? "done" : planningRequired ? "pending" : "skipped",
+      summary: planningEvent
+        ? compactText(stringField(planningPayload, "plan_summary") || stringField(planningPayload, "goal") || "Planning 已产出执行计划。", 180)
+        : planningRequired
+          ? "Router 判断本轮需要 Planning，但当前回合尚未看到 Planning 产物。"
+          : `Router 路由为 ${workflowRoute || "answer_only"}，本轮跳过 Planning，直接进入 Execution。`,
+      fields: [
+        { label: "性质", value: "执行前计划，不直接执行" },
+        { label: "route", value: workflowRoute || "-" },
+        { label: "required", value: booleanField(workflowDecision, "planning_required") },
+        { label: "goal", value: compactText(stringField(planningPayload, "goal") || "-", 120) },
+        { label: "tools", value: stringArrayField(planningPayload, "required_tools") || "none" },
+        { label: "confirm", value: booleanField(planningPayload, "needs_user_confirmation") },
+        { label: "confidence", value: numberField(planningPayload, "confidence") }
+      ],
+      details: [
+        ...(planningEvent ? [{ label: "Planning 输出 JSON", content: formatJson(planningPayload) }] : []),
+        ...(plannerLog ? modelLogDetails(plannerLog) : [])
+      ]
+    },
+    {
+      id: "main-thinking-lane",
+      kind: "thinking",
+      title: "执行模型 Execution",
+      badge: nativeResponse?.reasoningContent ? "含思考" : mainModelLog ? "模型返回" : "等待",
+      status: mainModelLog?.status === "failed" ? "failed" : mainModelLog ? "done" : "pending",
+      summary: mainModelSummary,
+      fields: [
+        { label: "性质", value: "模型生成/工具请求，不等于已执行" },
+        { label: "Provider", value: mainModelLog?.providerId ?? "-" },
+        { label: "Mode", value: mainModelMode },
+        { label: "ToolCalls", value: String(nativeToolNames.length) },
+        { label: "Stop", value: mainResponse?.stopReason ?? "-" }
+      ],
+      details: mainModelLog ? modelLogDetails(mainModelLog) : []
+    },
+    {
+      id: "tool-execution-lane",
+      kind: "execution",
+      title: "工具真实执行",
+      badge: toolCallEvents.length > 0 ? `${toolResultEvents.length}/${toolCallEvents.length}` : "未执行",
+      status: failedToolResults > 0 ? "failed" : toolCallEvents.length > 0 ? "done" : "skipped",
+      summary: toolCallEvents.length > 0
+        ? compactText(formatToolEventsSummary(toolCallEvents, toolResultEvents), 180)
+        : "本轮没有真实读写文件或运行命令。主模型文字里出现工具计划，也要等这里出现结果才算执行。",
+      fields: [
+        { label: "性质", value: "这里才是真实工具 I/O" },
+        { label: "开放工具", value: stringArrayField(toolPayload, "selected_tools") || "none" },
+        { label: "请求数", value: String(toolCallEvents.length) },
+        { label: "结果数", value: String(toolResultEvents.length) },
+        { label: "需确认", value: String(confirmToolResults) }
+      ],
+      details: toolCallEvents.length > 0 || toolResultEvents.length > 0
+        ? [{ label: "工具调用与执行结果", content: formatJson({ requestedTools: requestedToolNames, calls: toolCallEvents, results: toolResultEvents }) }]
+        : toolSelectionEvent ? [{ label: "工具开放策略", content: formatJson(toolPayload) }] : []
+    },
+    {
+      id: "final-lane",
+      kind: "final",
+      title: "最终展示给用户",
+      badge: errorEvent ? "错误" : assistantMessage ? "已展示" : "等待",
+      status: errorEvent ? "failed" : assistantMessage ? "done" : "pending",
+      summary: assistantMessage?.content
+        ? compactText(assistantMessage.content, 180)
+        : errorEvent?.content ? compactText(errorEvent.content, 180) : "等待 Core 汇总模型返回、工具结果和验收后写入对话。",
+      fields: [
+        { label: "性质", value: "用户真正看到的正式产出" },
+        { label: "message", value: assistantMessage?.messageId ?? "-" },
+        { label: "time", value: assistantMessage ? formatTime(assistantMessage.createdAt) : "-" }
+      ],
+      details: assistantMessage
+        ? [{ label: "最终回复完整内容", content: assistantMessage.content ?? "" }]
+        : errorEvent ? [{ label: "错误事件", content: formatJson(errorEvent) }] : []
+    }
+  ];
+}
+
 function buildNodeOutputs(events: readonly AgentEventRecord[], logs: readonly ProviderDebugLog[]): readonly NodeOutput[] {
   const routerEvent = findLastEvent(events, "router_result");
+  const planningEvent = findLastEvent(events, "planning_result");
   const memoryWriteEvent = findLastEvent(events, "memory_write");
   const memoryRecallEvent = findLastEvent(events, "memory_recall");
   const toolSelectionEvent = findLastEvent(events, "tool_selection");
@@ -1162,6 +2463,14 @@ function buildNodeOutputs(events: readonly AgentEventRecord[], logs: readonly Pr
   const assistantMessage = findLast(events, (event) => event.type === "chat_message" && event.actor === "assistant");
   const errorEvent = findLastEvent(events, "error");
   const routerPayload = asRecord(routerEvent?.payload);
+  const turnAnalysis = asRecord(routerPayload.turn_analysis);
+  const workflowDecision = asRecord(routerPayload.workflow_decision);
+  const contextDecision = asRecord(routerPayload.context_decision);
+  const profileObservation = asRecord(routerPayload.profile_observation);
+  const evaluationSeed = asRecord(routerPayload.evaluation_seed);
+  const inputRisk = asRecord(workflowDecision.input_risk);
+  const profileUpdates = arrayField(profileObservation, "profile_updates");
+  const planningPayload = asRecord(planningEvent?.payload);
   const memoryWritePayload = asRecord(memoryWriteEvent?.payload);
   const memoryRecallPayload = asRecord(memoryRecallEvent?.payload);
   const toolPayload = asRecord(toolSelectionEvent?.payload);
@@ -1169,6 +2478,7 @@ function buildNodeOutputs(events: readonly AgentEventRecord[], logs: readonly Pr
   const promptIterationPayload = asRecord(promptIterationEvent?.payload);
   const evaluationDisplay = evaluationEvent ? evaluationDisplayFromPayload(evaluationPayload) : undefined;
   const routerLog = findRouterLog(logs);
+  const plannerLog = findPlannerLog(logs);
   const mainModelLog = findMainModelLog(logs);
   const evaluatorLog = findEvaluatorLog(logs);
   const nodes: NodeOutput[] = [];
@@ -1176,26 +2486,41 @@ function buildNodeOutputs(events: readonly AgentEventRecord[], logs: readonly Pr
   nodes.push({
     id: "router",
     kind: "Router",
-    title: "意图识别产物",
+    title: "Router v2 任务分析产物",
     badge: routerEvent ? "完成" : "等待",
     status: routerEvent ? "done" : "pending",
     output: routerEvent
       ? compactText(joinNonEmpty([
-          stringField(routerPayload, "rewritten_input"),
-          stringField(routerPayload, "task_goal"),
-          stringField(routerPayload, "reasoning_brief"),
-          stringField(routerPayload, "tool_reason")
+          stringField(workflowDecision, "workflow_route") ? `route=${stringField(workflowDecision, "workflow_route")}` : "",
+          stringField(turnAnalysis, "task_goal") || stringField(routerPayload, "task_goal"),
+          stringField(turnAnalysis, "reasoning_brief") || stringField(routerPayload, "reasoning_brief"),
+          stringArrayField(profileObservation, "routing_influences")
         ], " | "), 150) || "Router 已产出结构化结果"
-      : "等待小模型产出意图、任务类型、工具建议和验收条件。",
+      : "等待 Router 产出任务分析、流程路由、上下文需求、画像观察和验收种子。",
     fields: [
-      { label: "intent", value: stringField(routerPayload, "intent") || "-" },
-      { label: "taskType", value: stringField(routerPayload, "task_type") || "-" },
-      { label: "steps", value: compactText(stringArrayField(routerPayload, "planned_steps") || "-", 96) },
-      { label: "output", value: compactText(stringField(routerPayload, "expected_output") || "-", 96) },
+      { label: "route", value: stringField(workflowDecision, "workflow_route") || "-" },
+      { label: "planning", value: booleanField(workflowDecision, "planning_required") },
+      { label: "intent", value: stringField(turnAnalysis, "intent") || stringField(routerPayload, "intent") || "-" },
+      { label: "taskType", value: stringField(turnAnalysis, "task_type") || stringField(routerPayload, "task_type") || "-" },
+      { label: "scope", value: joinNonEmpty([stringField(turnAnalysis, "task_scope"), stringField(turnAnalysis, "complexity")], " / ") || "-" },
+      { label: "risk", value: joinNonEmpty([stringField(inputRisk, "level"), booleanField(inputRisk, "requires_confirmation")], " / ") || "-" },
+      { label: "contextNeeds", value: compactText(stringArrayField(contextDecision, "context_needs") || "-", 96) },
+      { label: "time", value: stringField(contextDecision, "time_context_mode") || "-" },
+      { label: "profileUpdates", value: String(profileUpdates.length) },
+      { label: "influences", value: compactText(stringArrayField(profileObservation, "routing_influences") || "-", 96) },
+      { label: "brief", value: compactText(stringField(routerPayload, "main_model_brief") || "-", 96) },
+      { label: "output", value: compactText(stringField(turnAnalysis, "expected_output") || stringField(routerPayload, "expected_output") || "-", 96) },
       { label: "confidence", value: numberField(routerPayload, "confidence") },
-      { label: "criteria", value: compactText(stringArrayField(routerPayload, "success_criteria") || "-", 96) }
+      { label: "criteria", value: compactText(stringArrayField(evaluationSeed, "success_criteria") || stringArrayField(routerPayload, "success_criteria") || "-", 96) }
     ],
     details: [
+      ...(routerEvent ? [
+        { label: "turn_analysis", content: formatJson(turnAnalysis) },
+        { label: "workflow_decision", content: formatJson(workflowDecision) },
+        { label: "context_decision", content: formatJson(contextDecision) },
+        { label: "profile_observation", content: formatJson(profileObservation) },
+        { label: "evaluation_seed", content: formatJson(evaluationSeed) }
+      ] : []),
       ...(routerEvent ? [{ label: "Router 结构化产物", content: formatJson(routerPayload) }] : []),
       ...(routerLog ? modelLogDetails(routerLog) : [])
     ]
@@ -1216,6 +2541,33 @@ function buildNodeOutputs(events: readonly AgentEventRecord[], logs: readonly Pr
       { label: "auto", value: booleanField(toolPayload, "auto_allowed") }
     ],
     details: toolSelectionEvent ? [{ label: "工具策略 JSON", content: formatJson(toolPayload) }] : []
+  });
+
+  nodes.push({
+    id: "planning",
+    kind: "Planning",
+    title: "规划产物",
+    badge: planningEvent ? "完成" : "等待",
+    status: planningEvent ? "done" : "pending",
+    output: planningEvent
+      ? compactText(joinNonEmpty([
+          stringField(planningPayload, "goal"),
+          stringField(planningPayload, "plan_summary"),
+          stringField(planningPayload, "expected_result")
+        ], " | "), 180)
+      : "等待 Planning 模型产出执行计划。Planning 不执行工具，只给 Execution 提供目标、步骤和风险。",
+    fields: [
+      { label: "tools", value: stringArrayField(planningPayload, "required_tools") || "none" },
+      { label: "inspect", value: compactText(stringArrayField(planningPayload, "files_to_inspect") || "-", 96) },
+      { label: "modify", value: compactText(stringArrayField(planningPayload, "files_to_modify") || "-", 96) },
+      { label: "confirm", value: booleanField(planningPayload, "needs_user_confirmation") },
+      { label: "risks", value: compactText(stringArrayField(planningPayload, "risks") || "-", 96) },
+      { label: "confidence", value: numberField(planningPayload, "confidence") }
+    ],
+    details: [
+      ...(planningEvent ? [{ label: "Planning 结构化产物", content: formatJson(planningPayload) }] : []),
+      ...(plannerLog ? modelLogDetails(plannerLog) : [])
+    ]
   });
 
   nodes.push({
@@ -1354,21 +2706,35 @@ function buildPromptViews(logs: readonly ProviderDebugLog[]): readonly PromptVie
     promptViewFromLog(findRouterLog(logs), {
       id: "router-prompt",
       title: "Router 提示词",
-      purpose: "小模型用于识别意图、任务类型、工具需求和验收条件。",
+      purpose: "前置模型用于任务分析、流程路由、上下文需求、画像观察和验收种子。",
       template: {
-        name: "router.intent.v1",
-        version: "v1",
+        name: "router.task-analysis.v2",
+        version: "v2",
         files: [
-          "packages/memorizes/intent/01-parser.md",
-          "packages/memorizes/intent/02-input.md"
+          "packages/memorizes/router/01-system.md",
+          "packages/memorizes/router/02-input.md"
         ],
         variables: ["recent_messages", "input"]
       }
     }),
+    promptViewFromLog(findPlannerLog(logs), {
+      id: "planning-prompt",
+      title: "Planning 提示词",
+      purpose: "规划模型用于在执行前拆目标、步骤、工具需求、风险和确认项。",
+      template: {
+        name: "main.planning.v1",
+        version: "v1",
+        files: [
+          "packages/memorizes/planning/01-system.md",
+          "packages/memorizes/planning/02-input.md"
+        ],
+        variables: ["user_input", "router_result", "tool_selection", "memories", "conversation_summary", "recent_messages"]
+      }
+    }),
     promptViewFromLog(findMainModelLog(logs), {
       id: "main-prompt",
-      title: "主模型提示词",
-      purpose: "大模型用于生成本轮面向用户或工具执行后的回复。",
+      title: "Execution 提示词",
+      purpose: "执行模型用于按 Planning 结果请求工具、整理结果并生成正式回复。",
       template: {
         name: "main.agent.v1",
         version: "v1",
@@ -1376,9 +2742,9 @@ function buildPromptViews(logs: readonly ProviderDebugLog[]): readonly PromptVie
           "packages/memorizes/system/01-role.md",
           "packages/memorizes/system/02-goals.md",
           "packages/memorizes/system/03-style.md",
-          "packages/memorizes/context/intent-result.md"
+          "packages/memorizes/context/router-runtime.md"
         ],
-        variables: ["intent_result", "messages"]
+        variables: ["router_context", "messages"]
       }
     }),
     promptViewFromLog(findEvaluatorLog(logs), {
@@ -1444,12 +2810,14 @@ function promptViewFromLog(
 function buildInfoFlows(events: readonly AgentEventRecord[], logs: readonly ProviderDebugLog[]): readonly InfoFlowItem[] {
   const userMessage = events.find((event) => event.type === "chat_message" && event.actor === "user");
   const routerEvent = findLastEvent(events, "router_result");
+  const planningEvent = findLastEvent(events, "planning_result");
   const toolSelectionEvent = findLastEvent(events, "tool_selection");
   const toolCallEvents = events.filter((event) => event.type === "tool_call");
   const toolResultEvents = events.filter((event) => event.type === "tool_result");
   const evaluationEvent = findLastEvent(events, "output_evaluation");
   const assistantMessage = findLast(events, (event) => event.type === "chat_message" && event.actor === "assistant");
   const routerLog = findRouterLog(logs);
+  const plannerLog = findPlannerLog(logs);
   const mainModelLog = findMainModelLog(logs);
   const evaluatorLog = findEvaluatorLog(logs);
   const flows: InfoFlowItem[] = [];
@@ -1459,7 +2827,7 @@ function buildInfoFlows(events: readonly AgentEventRecord[], logs: readonly Prov
       id: "user-to-router",
       from: "User",
       to: "Router",
-      title: "用户输入进入意图识别",
+      title: "用户输入进入 Router 任务分析",
       content: compactText(userMessage.content, 140),
       rawLabel: "用户输入",
       raw: userMessage.content
@@ -1470,8 +2838,8 @@ function buildInfoFlows(events: readonly AgentEventRecord[], logs: readonly Prov
     flows.push({
       id: "router-request",
       from: "Core",
-      to: "小模型",
-      title: "小模型请求",
+      to: "Router",
+      title: "Router 模型请求",
       content: compactText(routerLog.request.latestUserMessage ?? readModelRequestMessages(routerLog).at(-1)?.content ?? "已发送 Router 请求。", 140),
       rawLabel: "Router 请求",
       raw: formatModelRequest(routerLog)
@@ -1480,15 +2848,17 @@ function buildInfoFlows(events: readonly AgentEventRecord[], logs: readonly Prov
 
   if (routerEvent) {
     const routerPayload = asRecord(routerEvent.payload);
+    const workflowDecision = asRecord(routerPayload.workflow_decision);
+    const turnAnalysis = asRecord(routerPayload.turn_analysis);
     flows.push({
       id: "router-output",
       from: "Router",
       to: "Core",
       title: "Router 返回结构化产物",
       content: compactText(joinNonEmpty([
-        stringField(routerPayload, "intent"),
-        stringField(routerPayload, "task_type"),
-        stringField(routerPayload, "task_goal")
+        formatWorkflowRoute(stringField(workflowDecision, "workflow_route")),
+        stringField(turnAnalysis, "task_type") || stringField(routerPayload, "task_type"),
+        stringField(turnAnalysis, "task_goal") || stringField(routerPayload, "task_goal")
       ], " / "), 140),
       rawLabel: "Router 输出 JSON",
       raw: formatJson(routerPayload),
@@ -1510,12 +2880,38 @@ function buildInfoFlows(events: readonly AgentEventRecord[], logs: readonly Prov
     });
   }
 
+  if (plannerLog) {
+    flows.push({
+      id: "planning-request",
+      from: "Core",
+      to: "Planning",
+      title: "规划模型请求",
+      content: compactText(plannerLog.request.latestUserMessage ?? readModelRequestMessages(plannerLog).at(-1)?.content ?? "已发送 Planning 请求。", 140),
+      rawLabel: "Planning 请求",
+      raw: formatModelRequest(plannerLog)
+    });
+  }
+
+  if (planningEvent) {
+    const planningPayload = asRecord(planningEvent.payload);
+    flows.push({
+      id: "planning-output",
+      from: "Planning",
+      to: "Execution",
+      title: "Planning 返回执行计划",
+      content: compactText(stringField(planningPayload, "plan_summary") || stringField(planningPayload, "goal") || "Planning 已返回。", 150),
+      rawLabel: "Planning 输出 JSON",
+      raw: formatJson(planningPayload),
+      tone: booleanRaw(planningPayload, "needs_user_confirmation") ? "warning" : "success"
+    });
+  }
+
   if (mainModelLog) {
     flows.push({
       id: "main-request",
       from: "Core",
-      to: "大模型",
-      title: "大模型上下文包",
+      to: "Execution",
+      title: "Execution 上下文包",
       content: compactText(formatModelMessagesSummary(mainModelLog), 150),
       rawLabel: "大模型请求",
       raw: formatModelRequest(mainModelLog)
@@ -1525,9 +2921,9 @@ function buildInfoFlows(events: readonly AgentEventRecord[], logs: readonly Prov
   if (mainModelLog?.response?.content) {
     flows.push({
       id: "main-response",
-      from: "大模型",
+      from: "Execution",
       to: "Core",
-      title: "大模型返回",
+      title: "Execution 返回",
       content: compactText(formatModelResponseSummary(mainModelLog.response), 160),
       rawLabel: "大模型响应",
       raw: formatResponse(mainModelLog.response),
@@ -1585,6 +2981,7 @@ function buildInfoFlows(events: readonly AgentEventRecord[], logs: readonly Prov
 function buildTraceSteps(events: readonly AgentEventRecord[], logs: readonly ProviderDebugLog[]): readonly TraceStep[] {
   const userMessage = events.find((event) => event.type === "chat_message" && event.actor === "user");
   const routerEvent = findLastEvent(events, "router_result");
+  const planningEvent = findLastEvent(events, "planning_result");
   const toolSelectionEvent = findLastEvent(events, "tool_selection");
   const toolCallEvents = events.filter((event) => event.type === "tool_call");
   const toolResultEvents = events.filter((event) => event.type === "tool_result");
@@ -1593,12 +2990,14 @@ function buildTraceSteps(events: readonly AgentEventRecord[], logs: readonly Pro
   const assistantMessage = findLast(events, (event) => event.type === "chat_message" && event.actor === "assistant");
   const errorEvent = findLastEvent(events, "error");
   const routerPayload = asRecord(routerEvent?.payload);
+  const planningPayload = asRecord(planningEvent?.payload);
   const toolPayload = asRecord(toolSelectionEvent?.payload);
   const evaluationPayload = asRecord(evaluationEvent?.payload);
   const evaluationDisplay = evaluationEvent ? evaluationDisplayFromPayload(evaluationPayload) : undefined;
-  const mainModelLog = findLast(logs, (log) => log.providerId.includes("main") || log.providerId.includes("anthropic") || log.providerId.includes("openai"));
-  const routerLog = findLast(logs, (log) => log.providerId.includes("router") || log.providerId.includes("intent"));
-  const evaluatorLog = findLast(logs, (log) => log.providerId.includes("evaluator"));
+  const mainModelLog = findMainModelLog(logs);
+  const routerLog = findRouterLog(logs);
+  const plannerLog = findPlannerLog(logs);
+  const evaluatorLog = findEvaluatorLog(logs);
 
   return [
     {
@@ -1617,15 +3016,22 @@ function buildTraceSteps(events: readonly AgentEventRecord[], logs: readonly Pro
     },
     {
       id: "router",
-      title: "Router 意图识别",
-      summary: routerEvent ? `${stringField(routerPayload, "intent")} / ${stringField(routerPayload, "task_type")}` : "等待 Router 结果",
+      title: "Router 任务分析",
+      summary: routerEvent
+        ? compactText(joinNonEmpty([
+            formatWorkflowRoute(stringField(asRecord(routerPayload.workflow_decision), "workflow_route")),
+            stringField(asRecord(routerPayload.turn_analysis), "task_type") || stringField(routerPayload, "task_type"),
+            stringField(asRecord(routerPayload.turn_analysis), "task_goal") || stringField(routerPayload, "task_goal")
+          ], " / "), 120)
+        : "等待 Router 结果",
       badge: routerEvent ? "完成" : "等待",
       present: Boolean(routerEvent),
       status: "done",
       fields: [
-        { label: "意图", value: stringField(routerPayload, "intent") },
-        { label: "类型", value: stringField(routerPayload, "task_type") },
-        { label: "任务", value: booleanField(routerPayload, "is_task") },
+        { label: "路由", value: formatWorkflowRoute(stringField(asRecord(routerPayload.workflow_decision), "workflow_route")) },
+        { label: "Planning", value: booleanField(asRecord(routerPayload.workflow_decision), "planning_required") },
+        { label: "类型", value: stringField(asRecord(routerPayload.turn_analysis), "task_type") || stringField(routerPayload, "task_type") },
+        { label: "任务范围", value: joinNonEmpty([stringField(asRecord(routerPayload.turn_analysis), "task_scope"), stringField(asRecord(routerPayload.turn_analysis), "complexity")], " / ") || "-" },
         { label: "置信度", value: numberField(routerPayload, "confidence") },
         { label: "验收问题", value: compactText(stringField(routerPayload, "verification_question"), 120) },
         { label: "成功条件", value: stringArrayField(routerPayload, "success_criteria") }
@@ -1633,6 +3039,23 @@ function buildTraceSteps(events: readonly AgentEventRecord[], logs: readonly Pro
       rawLabel: "router_result event",
       raw: routerEvent ? formatJson(routerPayload) : undefined,
       related: routerLog ? modelLogDetails(routerLog) : []
+    },
+    {
+      id: "planning",
+      title: "Planning 规划",
+      summary: planningEvent ? compactText(stringField(planningPayload, "plan_summary") || stringField(planningPayload, "goal"), 110) : "等待规划结果",
+      badge: planningEvent ? "完成" : "等待",
+      present: Boolean(planningEvent),
+      status: planningEvent ? "done" : "pending",
+      fields: [
+        { label: "目标", value: compactText(stringField(planningPayload, "goal"), 120) },
+        { label: "工具", value: stringArrayField(planningPayload, "required_tools") || "none" },
+        { label: "需确认", value: booleanField(planningPayload, "needs_user_confirmation") },
+        { label: "预期结果", value: compactText(stringField(planningPayload, "expected_result"), 120) }
+      ],
+      rawLabel: "planning_result event",
+      raw: planningEvent ? formatJson(planningPayload) : undefined,
+      related: plannerLog ? modelLogDetails(plannerLog) : []
     },
     {
       id: "tool-selection",
@@ -1889,7 +3312,11 @@ function findRouterLog(logs: readonly ProviderDebugLog[]): ProviderDebugLog | un
 }
 
 function findMainModelLog(logs: readonly ProviderDebugLog[]): ProviderDebugLog | undefined {
-  return findLast(logs, (log) => log.providerId.includes("main") || log.providerId.includes("anthropic") || log.providerId.includes("openai"));
+  return findLast(logs, (log) => log.providerId === "main" || log.providerId.startsWith("main-"));
+}
+
+function findPlannerLog(logs: readonly ProviderDebugLog[]): ProviderDebugLog | undefined {
+  return findLast(logs, (log) => log.providerId.includes("planner"));
 }
 
 function findEvaluatorLog(logs: readonly ProviderDebugLog[]): ProviderDebugLog | undefined {
@@ -2066,7 +3493,11 @@ function numberOrFallback(
 
 function stringArrayField(record: Record<string, unknown>, key: string): string {
   const value = record[key];
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").join(" / ") : "";
+  return stringArrayValues(value).join(" / ");
+}
+
+function stringArrayValues(value: unknown): readonly string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function joinNonEmpty(values: readonly (string | undefined)[], separator: string): string {

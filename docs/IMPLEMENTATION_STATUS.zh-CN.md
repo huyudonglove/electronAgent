@@ -2845,6 +2845,68 @@ MiMo thinking / 原生工具兼容性注意：
   - 调试区会解析 MiMo 原生响应中的 `reasoning_content`、`tool_calls`、`content`。
   - 原生响应分别展示为“模型思考 reasoning_content”“工具调用 tool_calls”“正式产出 content”和“完整模型响应”。
   - Trace 摘要优先展示正式产出和工具调用摘要，不再默认把 reasoning JSON 当作主模型产出。
+- UI 已新增“执行链路”视图，用四段明确区分：
+  - `前置模型 Router`：只做意图、任务、工具需求和验收条件判断。
+  - `主模型思考/回复草稿`：展示大模型返回、reasoning/tool_calls 或文本工具请求，但不代表已执行。
+  - `工具真实执行`：只有这里出现的 `tool_call/tool_result` 才表示实际读写文件、运行命令或保存记忆。
+  - `最终展示给用户`：Core 汇总后的正式对话产出。
+- 主模型调试日志匹配已收紧为 `main` / `main-*`，避免前置 Router 或 Evaluator 的 OpenAI-compatible 日志被误显示为主模型产物。
+
+DeepSeek Router 配置：
+
+- 前置模型 Router 当前切换为 DeepSeek Flash：
+  - `providerKind=openai-compatible`
+  - `baseURL=https://api.deepseek.com`
+  - `model=deepseek-v4-flash`
+  - `label=DeepSeek Flash Router`
+  - `toolCallingMode=text-json`
+  - `thinkingEnabled=false`
+- Router 走 `createOpenAiJsonChat`，请求 `/chat/completions`，并要求 `response_format={ type: "json_object" }`。
+- DeepSeek API Key 需要写入本地 `config/model-runtime.local.json` 的 `router.apiKey`，或通过 GUI 模型配置面板填写；不要提交。
+
+模型配置 GUI：
+
+- 模型配置面板从“每个角色手填 Provider/Base URL/Model/API Key”升级为“模型档案 + 角色绑定”：
+  - 内置档案：`DeepSeek Flash`、`DeepSeek Pro`、`MiMo Pro Anthropic`、`MiMo Native Tools`、`Local Qwen`。
+  - Router/Main/Compression 每个角色优先通过“模型档案”下拉切换。
+  - 步骤块下拉不做角色过滤，所有步骤都显示全部模型块，由用户自己决定使用哪个模型。
+  - API Key 保留在角色卡片上直接填写。
+  - Provider、Base URL、Model、Temperature、Max Tokens、Tool Mode、Thinking 收进“高级参数”折叠区。
+- 新增一键方案：
+  - `DeepSeek 前置 + MiMo 主模型`
+  - `全 DeepSeek`
+  - `本地前置 + MiMo 主模型`
+- 切换档案时，如果同 Provider 且同 Base URL 已经填过 API Key，会自动复用，减少重复填 Key。
+- 用户进一步明确期望：不是按角色堆配置表单，而是每个模型一个“模型块”，每个流程步骤一个“步骤块”，步骤块自己选择要使用的模型块。
+- GUI 已按这个方向调整：
+  - 新增 `模型块` 区，展示所有可复用模型档案及其 provider、model、baseURL、适用步骤。
+  - 新增 `步骤块` 区，按 Router、Main、Evaluator、Compression 分块，每个步骤通过下拉绑定模型块。
+  - 每个步骤块仍保留 API Key 输入和高级参数折叠，方便覆盖默认模型块。
+- 底层配置新增独立 `evaluator`：
+  - `ModelRuntimeRole = router | main | evaluator | compression`
+  - `ModelRuntimeSettings` 新增 `evaluator`
+  - `outputEvaluatorProvider` 改为读取 `getModelRuntimeConfig("evaluator")`
+  - 旧配置没有 `evaluator` 时会默认从 `router` 迁移/兜底。
+- API Key 归属已从步骤块移动到模型块：
+  - `ModelRuntimeSettings` 新增 `modelBlocks: ModelBlockConfig[]`
+  - 模型块保存 `providerKind/baseURL/model/apiKey/temperature/maxTokens/toolCallingMode/thinkingEnabled`
+  - 步骤块保存 `modelBlockId`，表示 Router/Main/Evaluator/Compression 绑定哪个模型块
+  - Core 读取配置时会根据 `modelBlockId` 将模型块展开为步骤实际运行配置
+  - GUI 中 API Key 输入和“保存 Key”按钮在模型块卡片中，步骤块不再显示 Key
+- 模型块 API Key 显示状态：
+  - 如果 `modelBlocks[].apiKey` 已存在，GUI 在 API Key 标签旁显示 `已保存 ****尾号`
+  - 如果没有 Key，显示 `未配置`
+  - 这样 Electron 重启后，即使密码输入框视觉上不明显，用户也能判断该模型块是否已有可用 Key
+- 旧配置没有 `modelBlocks` 时，Core 会使用内置默认模型块兜底；旧步骤配置仍会被读取，但后续保存会写入新结构。
+- 2026-05-18 运行配置临时调整：
+  - 用户遇到主模型 401。
+  - 当前 401 来自 `MiMo Pro Anthropic` 模型块，不是 DeepSeek Router。
+  - 已将 Main 步骤切到 `DeepSeek Pro`，Evaluator/Compression 切到 `DeepSeek Flash`，以恢复当前 Agent 可用性。
+  - MiMo Anthropic 模型块保留，但需要用户重新确认有效 Key 后再绑定到 Main。
+- 随后用户提供新的 MiMo Anthropic Key：
+  - 已写入 `mimo-anthropic-pro` 模型块。
+  - Main 步骤已切回 `MiMo Pro Anthropic`。
+  - 已通过最小 Anthropic-compatible 请求验证，服务端不再返回 401。
 
 涉及文件：
 
@@ -2857,3 +2919,206 @@ MiMo thinking / 原生工具兼容性注意：
 - `packages/core/src/providers/ollamaIntentProvider.ts`
 - `packages/memorizes/context/intent-result.md`
 - `packages/memorizes/intent/01-parser.md`
+
+Router 路由报告升级：
+
+- 用户反馈旧版 Router 过于单一，像初级意图分类。
+- RouterResult 从分类器升级为“路由报告”，新增：
+  - `secondary_intents`
+  - `complexity`
+  - `task_scope`
+  - `execution_mode`
+  - `required_context`
+  - `constraints`
+  - `risks`
+  - `suggested_roles`
+  - `main_model_brief`
+  - `routing_notes`
+- Router Prompt 已改为项目协作体调度员风格：
+  - 判断主意图和次要意图
+  - 判断复杂度、任务范围、执行模式
+  - 判断需要的上下文、工具、风险和约束
+  - 给主模型生成 1 到 3 句话的执行简报
+- 主模型内部上下文模板已提示优先关注 `main_model_brief`、`execution_mode`、`task_scope/complexity`、`required_context/constraints/risks`。
+- 调试面板 Router 节点和执行链路已展示新字段，方便观察前置模型产物是否足够“厚”。
+
+主模型两阶段拆分：
+
+- 用户确认采用 Router -> Planning -> Execution 的主链路。
+- 已新增独立 `planner` 步骤块：
+  - `ModelRuntimeRole = router | planner | main | evaluator | compression`
+  - `ModelRuntimeSettings` 新增 `planner`
+  - GUI 步骤块新增“规划模型”
+  - 一键模型方案同步绑定 planner，默认倾向使用 `DeepSeek Pro`
+- 已新增 `PlanningResult`：
+  - `goal`
+  - `plan_summary`
+  - `execution_plan`
+  - `required_tools`
+  - `files_to_inspect`
+  - `files_to_modify`
+  - `risks`
+  - `needs_user_confirmation`
+  - `confirmation_reason`
+  - `expected_result`
+  - `execution_instruction`
+  - `confidence`
+- 已新增 Planning 提示词：
+  - `packages/memorizes/planning/01-system.md`
+  - `packages/memorizes/planning/02-input.md`
+- 已新增 Planning Provider：
+  - `packages/core/src/providers/planningProvider.ts`
+  - 支持 `openai-compatible` 和 `ollama`
+  - Planning 只输出 JSON，不执行工具、不写文件、不直接回答用户
+- `chatService` 主链路已改为：
+  - 会话压缩
+  - Router 意图识别
+  - 长期记忆写入/召回
+  - Tool Selection
+  - Planning
+  - Execution/Main
+  - 工具执行与整理
+  - Evaluator
+  - Final
+- 调试面板已补充：
+  - Planning 执行链路段
+  - Planning 节点产物
+  - Planning 提示词卡
+  - Planning 信息流
+  - 时间线中的 Planning 步骤
+
+模型库与流程编排拆分：
+
+- 原单一“模型配置”入口已拆成：
+  - `模型库`
+  - `流程`
+- 模型库负责：
+  - 模型块
+  - API Key
+  - Base URL
+  - Model Name
+  - Temperature / Max Tokens
+  - Tool Mode / Thinking
+- 流程负责：
+  - Router
+  - Planning
+  - Execution
+  - Evaluator
+  - Compression
+  - 每个节点绑定哪个模型块
+- 流程面板新增链路概览：
+  - Router：理解用户输入和任务类型
+  - Planning：规划目标、步骤、风险和执行指令
+  - Execution：按计划执行、调用工具并生成回复
+  - Evaluator：检查输出是否满足成功条件
+  - Compression：长会话摘要和上下文压缩
+- 底层配置暂保持兼容：
+  - 模型块仍在 `modelBlocks[]`
+  - 执行步骤仍通过 `modelBlockId` 绑定模型块
+  - 保存仍写入 `config/model-runtime.local.json`
+
+Planning Provider 兼容性：
+
+- 初版 Planning Provider 只支持：
+  - `ollama`
+  - `openai-compatible`
+- 用户在流程中将 Planner 绑定到 `MiMo Pro Anthropic` 后触发报错：
+  - `Planning 当前只支持 ollama 或 openai-compatible，实际配置为：anthropic-compatible`
+- 已补充 `anthropic-compatible` 支持：
+  - 使用 `@anthropic-ai/sdk`
+  - 调用 `/v1/messages`
+  - 非流式返回
+  - System 中要求只输出合法 JSON
+  - 返回内容继续复用 `parsePlanningResult`
+  - ProviderDebugLog 记录 `planner-anthropic-compatible` 的请求与响应
+
+模型调用节点协议统一：
+
+- 新增通用结构化 JSON 调用入口：
+  - `packages/core/src/providers/jsonChatProvider.ts`
+- 统一支持：
+  - `ollama`
+  - `openai-compatible`
+  - `anthropic-compatible`
+- 已切换到统一 JSON 调用的节点：
+  - Router
+  - Planning
+  - Evaluator
+  - Compression
+- Main / Execution：
+  - 原已支持 `openai-compatible`
+  - 原已支持 `anthropic-compatible`
+  - 已新增 `ollama` 流式回复支持
+- 当前边界：
+  - OpenAI native tools 只适用于 `openai-compatible` 主模型
+  - Ollama / Anthropic 主模型走文本 JSON 工具协议
+  - 所有节点的请求和响应都应进入 ProviderDebugLog，便于调试面板观察
+
+Router v2 第一版：
+
+- 已将 Router 从单层路由报告升级为嵌套结构：
+  - `turn_analysis`
+  - `workflow_decision`
+  - `context_decision`
+  - `profile_observation`
+  - `evaluation_seed`
+- `RouterResult` 保留旧版字段，并新增 v2 字段。
+- Router parser 会从 v2 字段同步旧版兼容字段：
+  - `intent`
+  - `task_type`
+  - `execution_mode`
+  - `required_context`
+  - `verification_question`
+  - `success_criteria`
+  - `confidence`
+- Router prompt 已升级为“任务分析入口 Agent”：
+  - 判断本轮任务
+  - 判断 workflow route
+  - 判断上下文需求
+  - 观察画像更新
+  - 生成验收种子
+- 调试面板 Router 节点已展示：
+  - `workflow_route`
+  - `planning_required`
+  - `input_risk`
+  - `context_needs`
+  - `time_context_mode`
+  - `profile_updates`
+  - `routing_influences`
+- 当前暂不根据 `planning_required` 跳过 Planning，后续单独调整 Core 执行策略。
+- 已接入 Core 执行策略：
+  - `workflow_route=planning` 时进入 Planning
+  - `planning_required=true` 时进入 Planning
+  - `workflow_route=answer_only` 时跳过 Planning
+  - `workflow_route=ask_user` 时跳过 Planning
+  - `workflow_route=reject` 时跳过 Planning
+- 跳过 Planning 时，runtime context 中会带：
+  - `planning.skipped=true`
+  - `planning.reason`
+- Execution 仍会收到 Router 结果、Planning/skip 信息和工具策略。
+
+调试面板执行展示优化：
+
+- 用户反馈输入“你好”时看到多步，容易误解为模型执行了很多重任务。
+- 已将顶部摘要改为“实际执行摘要”：
+  - 路由
+  - 模型调用数
+  - Planning 是否执行
+  - 工具是否执行
+  - 验收是否触发
+- `节点产物` 改为折叠的 `系统节点产物`：
+  - 记忆写入/召回
+  - 工具策略
+  - 上下文组装
+  - 审计明细
+- Planning 跳过态文案明确显示：
+  - `已跳过`
+  - Router route
+  - planning_required
+  - 跳过原因
+- 目标是让简单聊天看起来像：
+  - Router 判断
+  - Planning 跳过
+  - Execution 回复
+  - Tools 未执行
+  - Evaluator 跳过

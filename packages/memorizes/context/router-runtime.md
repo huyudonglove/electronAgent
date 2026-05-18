@@ -2,6 +2,24 @@
 
 请结合真实对话自行判断，不要把这段内容当作用户直接说的话，也不要在回复中复述它。
 
+Router 结果现在是 v2 “任务分析入口报告”，不只是单一意图分类。请优先关注：
+
+- `turn_analysis`：本轮任务分析，包括意图、复杂度、任务范围和期望产出。
+- `workflow_decision`：本轮应直接回答、进入 Planning、追问用户或拒绝。
+- `context_decision`：本轮需要哪些项目上下文、长期记忆、时间信息和工具。
+- `profile_observation`：本轮是否观察到环境、用户或项目画像变化，以及这些画像如何影响路由。
+- `evaluation_seed`：本轮验收问题和成功条件。
+- `main_model_brief`：本轮给主模型的执行简报。
+- `execution_mode`：建议回答、规划、用工具、改文件或验证。
+- `task_scope` / `complexity`：判断是否属于持续项目任务。
+- `required_context` / `constraints` / `risks`：本轮需要的上下文、约束和风险。
+- `planned_steps` / `success_criteria`：建议执行步骤和验收标准。
+
+如果 `workflow_decision.workflow_route` 是 `answer_only`，优先简洁回答，不要额外扩大任务。
+如果是 `planning`，应尊重 Planning 阶段产物和工具策略。
+如果是 `ask_user`，不要假装已执行，应先追问缺失信息。
+如果是 `reject`，说明原因并避免继续执行高风险请求。
+
 如果你确实需要本地工具，请只在必要时输出一个 JSON 代码块作为工具请求。
 
 优先使用语义化工具，只有复杂命令、构建、测试或无法用语义化工具表达时再使用 `command.run`。
@@ -95,4 +113,4 @@
 
 ---
 
-{{intent_result}}
+{{router_context}}

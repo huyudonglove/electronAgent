@@ -5,6 +5,7 @@ import type {
   ChatMessage,
   MemoryRecord,
   OutputEvaluationResult,
+  PlanningResult,
   PromptIterationRecord,
   ToolRequest,
   ToolResult,
@@ -76,6 +77,25 @@ export function saveToolSelectionEvent(input: {
     type: "tool_selection",
     actor: "core",
     roleLabel: "Tool Selection Policy",
+    content,
+    payload: input.result,
+    createdAt: new Date().toISOString()
+  });
+}
+
+export function savePlanningResultEvent(input: {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly result: PlanningResult;
+}): AgentEventRecord {
+  const content = JSON.stringify(input.result, null, 2);
+
+  return saveEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    type: "planning_result",
+    actor: "planner",
+    roleLabel: "Planning Model",
     content,
     payload: input.result,
     createdAt: new Date().toISOString()

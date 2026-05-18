@@ -40,12 +40,28 @@ export interface ModelProfile {
   readonly capabilities: ProviderCapability;
 }
 
-export type ModelRuntimeRole = "router" | "main" | "compression";
+export type ModelRuntimeRole = "router" | "planner" | "main" | "evaluator" | "compression";
 export type ModelProviderKind = "ollama" | "anthropic-compatible" | "openai-compatible";
 export type ModelToolCallingMode = "text-json" | "native-openai";
 
+export interface ModelBlockConfig {
+  readonly id: string;
+  readonly label: string;
+  readonly provider: string;
+  readonly description: string;
+  readonly providerKind: ModelProviderKind;
+  readonly baseURL: string;
+  readonly model: string;
+  readonly apiKey: string;
+  readonly temperature: number;
+  readonly maxTokens: number;
+  readonly toolCallingMode: ModelToolCallingMode;
+  readonly thinkingEnabled: boolean;
+}
+
 export interface ModelRuntimeConfig {
   readonly role: ModelRuntimeRole;
+  readonly modelBlockId?: string;
   readonly label: string;
   readonly providerKind: ModelProviderKind;
   readonly baseURL: string;
@@ -58,8 +74,11 @@ export interface ModelRuntimeConfig {
 }
 
 export interface ModelRuntimeSettings {
+  readonly modelBlocks: readonly ModelBlockConfig[];
   readonly router: ModelRuntimeConfig;
+  readonly planner: ModelRuntimeConfig;
   readonly main: ModelRuntimeConfig;
+  readonly evaluator: ModelRuntimeConfig;
   readonly compression: ModelRuntimeConfig;
 }
 
@@ -136,17 +155,101 @@ export interface ProviderDebugLog {
 
 export type RouterIntent = "chat" | "analysis" | "code" | "debug" | "search";
 export type RouterTaskType = "chat" | "analysis" | "design" | "implementation" | "debugging" | "verification";
+export type RouterComplexity = "simple" | "moderate" | "complex";
+export type RouterTaskScope = "single_turn" | "multi_turn" | "project";
+export type RouterExecutionMode = "answer_only" | "plan" | "use_tools" | "modify_files" | "verify";
+export type RouterWorkflowRoute = "answer_only" | "planning" | "ask_user" | "reject";
+export type RouterRiskLevel = "low" | "medium" | "high";
+export type RouterTimeContextMode = "none" | "current_time" | "recent_history" | "historical_timeline";
+export type RouterProfileTarget = "environment" | "user" | "project";
 
-export interface RouterResult {
+export interface RouterTurnAnalysis {
   readonly intent: RouterIntent;
+  readonly secondary_intents: readonly RouterIntent[];
   readonly rewritten_input: string;
   readonly keywords: readonly string[];
   readonly is_task: boolean;
   readonly task_goal: string;
   readonly task_type: RouterTaskType;
+  readonly complexity: RouterComplexity;
+  readonly task_scope: RouterTaskScope;
+  readonly reasoning_brief: string;
+  readonly expected_output: string;
+}
+
+export interface RouterInputRisk {
+  readonly level: RouterRiskLevel;
+  readonly requires_confirmation: boolean;
+  readonly reasons: readonly string[];
+}
+
+export interface RouterWorkflowDecision {
+  readonly workflow_route: RouterWorkflowRoute;
+  readonly planning_required: boolean;
+  readonly execution_mode: RouterExecutionMode;
+  readonly needs_user_clarification: boolean;
+  readonly clarifying_questions: readonly string[];
+  readonly input_risk: RouterInputRisk;
+}
+
+export interface RouterContextDecision {
+  readonly requires_project_context: boolean;
+  readonly context_needs: readonly string[];
+  readonly required_context: readonly string[];
+  readonly memory_query: string;
+  readonly time_context_mode: RouterTimeContextMode;
+  readonly needs_tools: boolean;
+  readonly suggested_tools: readonly string[];
+  readonly tool_reason: string;
+}
+
+export interface RouterProfileSnapshotUsed {
+  readonly environment: readonly string[];
+  readonly user: readonly string[];
+  readonly project: readonly string[];
+}
+
+export interface RouterProfileUpdate {
+  readonly target: RouterProfileTarget;
+  readonly field: string;
+  readonly value: string;
+  readonly reason: string;
+  readonly confidence: number;
+  readonly evidence: string;
+}
+
+export interface RouterProfileObservation {
+  readonly profile_snapshot_used: RouterProfileSnapshotUsed;
+  readonly profile_updates: readonly RouterProfileUpdate[];
+  readonly routing_influences: readonly string[];
+}
+
+export interface RouterEvaluationSeed {
+  readonly verification_question: string;
+  readonly success_criteria: readonly string[];
+  readonly confidence: number;
+}
+
+export interface RouterResult {
+  readonly intent: RouterIntent;
+  readonly secondary_intents: readonly RouterIntent[];
+  readonly rewritten_input: string;
+  readonly keywords: readonly string[];
+  readonly is_task: boolean;
+  readonly task_goal: string;
+  readonly task_type: RouterTaskType;
+  readonly complexity: RouterComplexity;
+  readonly task_scope: RouterTaskScope;
+  readonly execution_mode: RouterExecutionMode;
   readonly reasoning_brief: string;
   readonly planned_steps: readonly string[];
   readonly expected_output: string;
+  readonly required_context: readonly string[];
+  readonly constraints: readonly string[];
+  readonly risks: readonly string[];
+  readonly suggested_roles: readonly string[];
+  readonly main_model_brief: string;
+  readonly routing_notes: string;
   readonly verification_question: string;
   readonly success_criteria: readonly string[];
   readonly needs_user_clarification: boolean;
@@ -155,6 +258,32 @@ export interface RouterResult {
   readonly needs_tools: boolean;
   readonly suggested_tools: readonly string[];
   readonly tool_reason: string;
+  readonly confidence: number;
+  readonly turn_analysis: RouterTurnAnalysis;
+  readonly workflow_decision: RouterWorkflowDecision;
+  readonly context_decision: RouterContextDecision;
+  readonly profile_observation: RouterProfileObservation;
+  readonly evaluation_seed: RouterEvaluationSeed;
+}
+
+export interface PlanningStep {
+  readonly step: number;
+  readonly title: string;
+  readonly detail: string;
+}
+
+export interface PlanningResult {
+  readonly goal: string;
+  readonly plan_summary: string;
+  readonly execution_plan: readonly PlanningStep[];
+  readonly required_tools: readonly string[];
+  readonly files_to_inspect: readonly string[];
+  readonly files_to_modify: readonly string[];
+  readonly risks: readonly string[];
+  readonly needs_user_confirmation: boolean;
+  readonly confirmation_reason: string;
+  readonly expected_result: string;
+  readonly execution_instruction: string;
   readonly confidence: number;
 }
 
@@ -301,6 +430,7 @@ export interface ToolResult {
 export type AgentEventType =
   | "chat_message"
   | "router_result"
+  | "planning_result"
   | "tool_selection"
   | "tool_call"
   | "tool_result"

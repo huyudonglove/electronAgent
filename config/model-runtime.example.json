@@ -1,6 +1,51 @@
 {
+  "modelBlocks": [
+    {
+      "id": "deepseek-flash",
+      "label": "DeepSeek Flash",
+      "provider": "DeepSeek",
+      "description": "适合 Router、Evaluator、压缩和轻量执行。",
+      "providerKind": "openai-compatible",
+      "baseURL": "https://api.deepseek.com",
+      "model": "deepseek-v4-flash",
+      "apiKey": "",
+      "temperature": 0.2,
+      "maxTokens": 1024,
+      "toolCallingMode": "text-json",
+      "thinkingEnabled": false
+    },
+    {
+      "id": "deepseek-pro",
+      "label": "DeepSeek Pro",
+      "provider": "DeepSeek",
+      "description": "适合主模型和复杂任务规划。",
+      "providerKind": "openai-compatible",
+      "baseURL": "https://api.deepseek.com",
+      "model": "deepseek-v4-pro",
+      "apiKey": "",
+      "temperature": 0.7,
+      "maxTokens": 8192,
+      "toolCallingMode": "text-json",
+      "thinkingEnabled": false
+    },
+    {
+      "id": "mimo-anthropic-pro",
+      "label": "MiMo Pro Anthropic",
+      "provider": "MiMo",
+      "description": "当前稳定主模型路径，走 Anthropic-compatible。",
+      "providerKind": "anthropic-compatible",
+      "baseURL": "https://token-plan-cn.xiaomimimo.com/anthropic",
+      "model": "mimo-v2.5-pro",
+      "apiKey": "",
+      "temperature": 1,
+      "maxTokens": 8192,
+      "toolCallingMode": "text-json",
+      "thinkingEnabled": false
+    }
+  ],
   "router": {
     "role": "router",
+    "modelBlockId": "deepseek-flash",
     "label": "Local Qwen Router",
     "providerKind": "ollama",
     "baseURL": "http://127.0.0.1:11434",
@@ -13,6 +58,7 @@
   },
   "main": {
     "role": "main",
+    "modelBlockId": "mimo-anthropic-pro",
     "label": "MiMo Native Main",
     "providerKind": "openai-compatible",
     "baseURL": "https://api.xiaomimimo.com/v1",
@@ -23,8 +69,35 @@
     "toolCallingMode": "native-openai",
     "thinkingEnabled": true
   },
+  "planner": {
+    "role": "planner",
+    "modelBlockId": "deepseek-pro",
+    "label": "DeepSeek Pro Planner",
+    "providerKind": "openai-compatible",
+    "baseURL": "https://api.deepseek.com",
+    "model": "deepseek-v4-pro",
+    "apiKey": "",
+    "temperature": 0.3,
+    "maxTokens": 4096,
+    "toolCallingMode": "text-json",
+    "thinkingEnabled": false
+  },
+  "evaluator": {
+    "role": "evaluator",
+    "modelBlockId": "deepseek-flash",
+    "label": "Local Qwen Evaluator",
+    "providerKind": "ollama",
+    "baseURL": "http://127.0.0.1:11434",
+    "model": "qwen2.5:1.5b",
+    "apiKey": "",
+    "temperature": 0.2,
+    "maxTokens": 768,
+    "toolCallingMode": "text-json",
+    "thinkingEnabled": false
+  },
   "compression": {
     "role": "compression",
+    "modelBlockId": "deepseek-flash",
     "label": "Local Qwen Compression",
     "providerKind": "ollama",
     "baseURL": "http://127.0.0.1:11434",

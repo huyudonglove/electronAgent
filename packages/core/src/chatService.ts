@@ -17,6 +17,7 @@ import {
   saveMemoryWriteEvent,
   saveModelReturnEvent,
   saveOutputEvaluationEvent,
+  savePlanningResultEvent,
   savePromptIterationEvent,
   saveRouterResultEvent,
   saveToolCallEvent,
@@ -29,8 +30,9 @@ import { getModelRuntimeConfig } from "./modelRuntimeConfig";
 import { MIMO_MODEL } from "./modelConfig";
 import { savePromptIteration } from "./promptIterations";
 import { streamMimoChat } from "./providers/mimoProvider";
-import { recognizeIntent } from "./providers/ollamaIntentProvider";
+import { analyzeRoute } from "./providers/routerProvider";
 import { evaluateOutput } from "./providers/outputEvaluatorProvider";
+import { createExecutionPlan } from "./providers/planningProvider";
 import { parseLocalToolRequests, removeLocalToolRequestBlocks } from "./toolCallParser";
 import { selectToolsForRouter } from "./toolSelectionPolicy";
 
@@ -107,14 +109,14 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
       message: userMessage
     });
 
-    currentStage = "意图识别";
+    currentStage = "Router 任务分析";
     onEvent({
       type: "stage",
       label: currentStage,
       detail: `正在调用 ${routerConfig.label} (${routerConfig.model})`
     });
 
-    const routerResult = await recognizeIntent(messages, request.message);
+    const routerResult = await analyzeRoute(messages, request.message);
     saveRouterResultEvent({
       projectId: session.projectId,
       sessionId: session.id,
@@ -155,20 +157,47 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
       result: toolSelection
     });
 
+    const shouldPlan = shouldRunPlanning(routerResult);
+    const planningResult = shouldPlan
+      ? await runPlanningStage({
+          messages,
+          latestUserMessage: request.message,
+          routerResult,
+          toolSelection,
+          conversationSummary,
+          memories: recalledMemories,
+          projectId: session.projectId,
+          sessionId: session.id,
+          setCurrentStage: (stage) => {
+            currentStage = stage;
+          },
+          onEvent
+        })
+      : undefined;
+    const planningContext = planningResult
+      ? planningResult
+      : {
+          skipped: true,
+          reason: formatPlanningSkipReason(routerResult)
+        };
+
     const runtimeContext = JSON.stringify(
       {
         router: routerResult,
+        planning: planningContext,
         tool_selection: toolSelection
       },
       null,
       2
     );
 
-    currentStage = "大模型对话";
+    currentStage = "大模型执行";
     onEvent({
       type: "stage",
       label: currentStage,
-      detail: `Router: ${routerResult.intent} / ${routerResult.task_type} / tools ${toolSelection.selected_tools.join(", ") || "none"}`
+      detail: planningResult
+        ? `Planning: ${planningResult.goal || routerResult.intent} / tools ${planningResult.required_tools.join(", ") || toolSelection.selected_tools.join(", ") || "none"}`
+        : `Router: ${routerResult.workflow_decision.workflow_route} / 跳过 Planning`
     });
 
     onEvent({
@@ -181,7 +210,7 @@ export async function streamChatMessage(request: ChatRequest, onEvent: ChatStrea
     const modelResponse = await streamMimoChat({
       messages,
       latestUserMessage: request.message,
-      intentSummary: runtimeContext,
+      routerContext: runtimeContext,
       conversationSummary,
       memories: recalledMemories,
       toolSelection,
@@ -322,6 +351,71 @@ function buildAssistantMetadata(modelResponse: {
     openaiNativeMessages: modelResponse.nativeMessages,
     nativeToolResults: modelResponse.nativeToolResults ?? []
   };
+}
+
+function shouldRunPlanning(routerResult: RouterResult): boolean {
+  if (routerResult.workflow_decision.workflow_route === "planning") {
+    return true;
+  }
+
+  if (routerResult.workflow_decision.workflow_route === "ask_user" || routerResult.workflow_decision.workflow_route === "reject") {
+    return false;
+  }
+
+  return routerResult.workflow_decision.planning_required;
+}
+
+function formatPlanningSkipReason(routerResult: RouterResult): string {
+  if (routerResult.workflow_decision.workflow_route === "answer_only") {
+    return "Router 判断本轮可直接回答，不需要进入 Planning。";
+  }
+
+  if (routerResult.workflow_decision.workflow_route === "ask_user") {
+    return "Router 判断本轮需要先追问用户，跳过 Planning。";
+  }
+
+  if (routerResult.workflow_decision.workflow_route === "reject") {
+    return "Router 判断本轮存在高风险或不可执行请求，跳过 Planning。";
+  }
+
+  return "Router 未要求 Planning。";
+}
+
+async function runPlanningStage(input: {
+  readonly messages: readonly ChatMessage[];
+  readonly latestUserMessage: string;
+  readonly routerResult: RouterResult;
+  readonly toolSelection: ReturnType<typeof selectToolsForRouter>;
+  readonly conversationSummary: Awaited<ReturnType<typeof maybeCompressConversation>>;
+  readonly memories: ReturnType<typeof listRelevantMemories>;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly setCurrentStage: (stage: string) => void;
+  readonly onEvent: ChatStreamHandler;
+}) {
+  const plannerConfig = getModelRuntimeConfig("planner");
+  input.setCurrentStage("规划目标");
+  input.onEvent({
+    type: "stage",
+    label: "规划目标",
+    detail: `正在调用 ${plannerConfig.label} (${plannerConfig.model})`
+  });
+
+  const planningResult = await createExecutionPlan({
+    messages: input.messages,
+    latestUserMessage: input.latestUserMessage,
+    routerResult: input.routerResult,
+    toolSelection: input.toolSelection,
+    conversationSummary: input.conversationSummary,
+    memories: input.memories
+  });
+  savePlanningResultEvent({
+    projectId: input.projectId,
+    sessionId: input.sessionId,
+    result: planningResult
+  });
+
+  return planningResult;
 }
 
 async function maybeEvaluateAndRevise(input: {
@@ -555,7 +649,7 @@ async function streamToolResultFollowup(input: {
   const response = await streamMimoChat({
     messages: followupMessages,
     latestUserMessage: "系统工具结果",
-    intentSummary: JSON.stringify(
+    routerContext: JSON.stringify(
       {
         phase: "tool_result_followup",
         previous_runtime_context: JSON.parse(input.runtimeContext),
@@ -634,7 +728,7 @@ async function streamEvaluationRevision(input: {
   const response = await streamMimoChat({
     messages: revisionMessages,
     latestUserMessage: "系统输出验收",
-    intentSummary: JSON.stringify(
+    routerContext: JSON.stringify(
       {
         phase: "output_evaluation_revision",
         previous_runtime_context: input.runtimeContext,

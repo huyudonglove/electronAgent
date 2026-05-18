@@ -8,15 +8,23 @@ const SYSTEM_PROMPT_MODULES = [
   "packages/memorizes/system/03-style.md"
 ] as const;
 
-const INTENT_PROMPT_MODULES = [
-  "packages/memorizes/intent/01-parser.md"
+const ROUTER_PROMPT_MODULES = [
+  "packages/memorizes/router/01-system.md"
 ] as const;
 
-const INTENT_USER_MODULES = [
-  "packages/memorizes/intent/02-input.md"
+const ROUTER_USER_MODULES = [
+  "packages/memorizes/router/02-input.md"
 ] as const;
 
-const INTENT_CONTEXT_TEMPLATE = "packages/memorizes/context/intent-result.md";
+const ROUTER_CONTEXT_TEMPLATE = "packages/memorizes/context/router-runtime.md";
+
+const PLANNING_PROMPT_MODULES = [
+  "packages/memorizes/planning/01-system.md"
+] as const;
+
+const PLANNING_USER_MODULES = [
+  "packages/memorizes/planning/02-input.md"
+] as const;
 
 const COMPRESSION_PROMPT_MODULES = [
   "packages/memorizes/compression/01-system.md"
@@ -34,12 +42,12 @@ const EVALUATOR_USER_MODULES = [
   "packages/memorizes/evaluator/02-input.md"
 ] as const;
 
-export function buildIntentSystemPrompt(): string {
-  return readMarkdownFiles(INTENT_PROMPT_MODULES);
+export function buildRouterSystemPrompt(): string {
+  return readMarkdownFiles(ROUTER_PROMPT_MODULES);
 }
 
-export function buildIntentUserPrompt(messages: readonly ChatMessage[], latestUserMessage: string): string {
-  return renderTemplate(readMarkdownFiles(INTENT_USER_MODULES), {
+export function buildRouterUserPrompt(messages: readonly ChatMessage[], latestUserMessage: string): string {
+  return renderTemplate(readMarkdownFiles(ROUTER_USER_MODULES), {
     recent_messages: formatRecentMessages(messages),
     input: latestUserMessage
   });
@@ -49,9 +57,31 @@ export function buildSystemPrompt(): string {
   return readMarkdownFiles(SYSTEM_PROMPT_MODULES, DEFAULT_SYSTEM_PROMPT);
 }
 
-export function buildIntentContextMessage(intentSummary: string): string {
-  return renderTemplate(readMarkdown(INTENT_CONTEXT_TEMPLATE), {
-    intent_result: intentSummary
+export function buildRouterContextMessage(routerContext: string): string {
+  return renderTemplate(readMarkdown(ROUTER_CONTEXT_TEMPLATE), {
+    router_context: routerContext
+  });
+}
+
+export function buildPlanningSystemPrompt(): string {
+  return readMarkdownFiles(PLANNING_PROMPT_MODULES);
+}
+
+export function buildPlanningUserPrompt(input: {
+  readonly userInput: string;
+  readonly routerResult: string;
+  readonly toolSelection: string;
+  readonly memories: string;
+  readonly conversationSummary: string;
+  readonly recentMessages: readonly ChatMessage[];
+}): string {
+  return renderTemplate(readMarkdownFiles(PLANNING_USER_MODULES), {
+    user_input: input.userInput,
+    router_result: input.routerResult,
+    tool_selection: input.toolSelection,
+    memories: input.memories || "无",
+    conversation_summary: input.conversationSummary || "无",
+    recent_messages: formatRecentMessages(input.recentMessages)
   });
 }
 

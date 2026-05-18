@@ -3,13 +3,13 @@ import type { ChatMessage, MemoryRecord, ToolRequest, ToolResult, ToolSelectionR
 import type { ConversationSummary } from "../conversationSummaries";
 import { getModelRuntimeConfig } from "../modelRuntimeConfig";
 import { addProviderDebugLog, createDebugLogBase } from "../providerDebugLogs";
-import { buildIntentContextMessage, buildSystemPrompt } from "../prompts";
+import { buildRouterContextMessage, buildSystemPrompt } from "../prompts";
 import { streamOpenAiChat, streamOpenAiChatWithNativeTools } from "./openAiCompatibleProvider";
 
 interface StreamMimoChatInput {
   readonly messages: readonly ChatMessage[];
   readonly latestUserMessage: string;
-  readonly intentSummary: string;
+  readonly routerContext: string;
   readonly conversationSummary?: ConversationSummary;
   readonly memories?: readonly MemoryRecord[];
   readonly toolSelection?: ToolSelectionResult;
@@ -33,7 +33,7 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
     const runtimeContext = [
       input.conversationSummary ? formatConversationSummary(input.conversationSummary) : "",
       input.memories && input.memories.length > 0 ? formatLongTermMemories(input.memories) : "",
-      buildIntentContextMessage(input.intentSummary)
+      buildRouterContextMessage(input.routerContext)
     ]
       .filter((item) => item.trim().length > 0)
       .join("\n\n---\n\n");
@@ -58,8 +58,21 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
     return streamOpenAiChat(openAiInput);
   }
 
+  if (config.providerKind === "ollama") {
+    return streamOllamaMainChat({
+      config,
+      systemPrompt,
+      messages: input.messages,
+      latestUserMessage: input.latestUserMessage,
+      routerContext: input.routerContext,
+      conversationSummary: input.conversationSummary,
+      memories: input.memories,
+      onDelta: input.onDelta
+    });
+  }
+
   if (config.providerKind !== "anthropic-compatible") {
-    throw new Error(`主模型当前只支持 anthropic-compatible 或 openai-compatible，实际配置为：${config.providerKind}`);
+    throw new Error(`主模型当前只支持 ollama、anthropic-compatible 或 openai-compatible，实际配置为：${config.providerKind}`);
   }
 
   const startedAtMs = Date.now();
@@ -67,7 +80,7 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
     model: config.model,
     max_tokens: config.maxTokens,
     system: systemPrompt,
-    messages: buildMimoMessages(input.messages, input.intentSummary, input.conversationSummary, input.memories),
+    messages: buildMimoMessages(input.messages, input.routerContext, input.conversationSummary, input.memories),
     top_p: 0.95,
     stream: true,
     temperature: config.temperature
@@ -156,7 +169,7 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
 
 function buildMimoMessages(
   messages: readonly ChatMessage[],
-  intentSummary: string,
+  routerContext: string,
   conversationSummary?: ConversationSummary,
   memories?: readonly MemoryRecord[]
 ): Anthropic.Messages.MessageParam[] {
@@ -180,7 +193,7 @@ function buildMimoMessages(
     content: [
       {
         type: "text",
-        text: buildIntentContextMessage(intentSummary)
+        text: buildRouterContextMessage(routerContext)
       }
     ]
   };
@@ -205,6 +218,156 @@ function buildMimoMessages(
   }
 
   return [...stableContextMessages, ...historyMessages, runtimeContextMessage, latestUserMessage];
+}
+
+async function streamOllamaMainChat(input: {
+  readonly config: ReturnType<typeof getModelRuntimeConfig>;
+  readonly systemPrompt: string;
+  readonly messages: readonly ChatMessage[];
+  readonly latestUserMessage: string;
+  readonly routerContext: string;
+  readonly conversationSummary?: ConversationSummary;
+  readonly memories?: readonly MemoryRecord[];
+  readonly onDelta: (delta: string) => void;
+}): Promise<ModelResponse> {
+  const startedAtMs = Date.now();
+  const requestBody = {
+    model: input.config.model,
+    stream: true,
+    messages: buildOllamaMessages(input),
+    options: {
+      temperature: input.config.temperature,
+      num_predict: input.config.maxTokens
+    }
+  };
+  const debugLog = createDebugLogBase({
+    providerId: "main-ollama",
+    model: input.config.model,
+    baseURL: input.config.baseURL,
+    request: {
+      method: "POST",
+      endpoint: `${input.config.baseURL}/api/chat`,
+      headers: {
+        "content-type": "application/json"
+      },
+      body: requestBody,
+      messageCount: input.messages.length,
+      latestUserMessage: input.latestUserMessage
+    }
+  });
+  const response = await fetch(`${input.config.baseURL}/api/chat`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  if (!response.ok || !response.body) {
+    const message = `${response.status}: ${await response.text()}`;
+    addProviderDebugLog({
+      ...debugLog,
+      status: "failed",
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedAtMs,
+      error: message
+    });
+    throw new Error(`Ollama 主模型调用失败：${message}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let stopReason: string | undefined;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(trimmed) as {
+          readonly message?: { readonly content?: string };
+          readonly done?: boolean;
+          readonly done_reason?: string;
+        };
+        const delta = parsed.message?.content ?? "";
+        if (delta) {
+          content += delta;
+          input.onDelta(delta);
+        }
+        if (parsed.done) {
+          stopReason = parsed.done_reason ?? "stop";
+        }
+      } catch {
+        // Ignore malformed streaming fragments.
+      }
+    }
+  }
+
+  addProviderDebugLog({
+    ...debugLog,
+    status: "succeeded",
+    completedAt: new Date().toISOString(),
+    durationMs: Date.now() - startedAtMs,
+    response: {
+      content,
+      stopReason
+    }
+  });
+
+  return {
+    content,
+    stopReason
+  };
+}
+
+function buildOllamaMessages(input: {
+  readonly systemPrompt: string;
+  readonly messages: readonly ChatMessage[];
+  readonly routerContext: string;
+  readonly conversationSummary?: ConversationSummary;
+  readonly memories?: readonly MemoryRecord[];
+}): readonly { readonly role: "system" | "user" | "assistant"; readonly content: string }[] {
+  const activeMessages = trimCompressedMessages(input.messages, input.conversationSummary);
+  const conversationMessages = activeMessages
+    .filter((message) => message.sender === "user" || message.sender === "assistant")
+    .map((message) => ({
+      role: message.sender === "assistant" ? "assistant" as const : "user" as const,
+      content: message.content
+    }));
+  const latestUserMessage = conversationMessages.at(-1);
+  const historyMessages = latestUserMessage ? conversationMessages.slice(0, -1) : conversationMessages;
+  const runtimeContext = [
+    input.conversationSummary ? formatConversationSummary(input.conversationSummary) : "",
+    input.memories && input.memories.length > 0 ? formatLongTermMemories(input.memories) : "",
+    buildRouterContextMessage(input.routerContext)
+  ].filter((item) => item.trim().length > 0).join("\n\n---\n\n");
+
+  return [
+    {
+      role: "system",
+      content: input.systemPrompt
+    },
+    ...historyMessages,
+    {
+      role: "user",
+      content: runtimeContext
+    },
+    ...(latestUserMessage ? [latestUserMessage] : [])
+  ];
 }
 
 function trimCompressedMessages(
