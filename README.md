@@ -4,7 +4,7 @@
 
 ## 界面演示
 
-- 演示资源：[GitHub user-attachments 文件](https://github.com/user-attachments/assets/6a280f4d-1226-4092-a976-3b6e0df57850)
+https://github.com/user-attachments/assets/6a280f4d-1226-4092-a976-3b6e0df57850
 
 ## 当前特性
 
