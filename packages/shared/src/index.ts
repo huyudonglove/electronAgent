@@ -119,6 +119,14 @@ export type ChatStreamEvent =
       readonly content: string;
     }
   | {
+      readonly type: "artifact";
+      readonly sessionId: ChatSessionId;
+      readonly messageId: ChatMessageId;
+      readonly action: "created" | "updated";
+      readonly path: string;
+      readonly bytes?: number;
+    }
+  | {
       readonly type: "done";
       readonly session: ChatSession;
       readonly assistantMessage: ChatMessage;
@@ -248,6 +256,7 @@ export interface RouterResult {
   readonly constraints: readonly string[];
   readonly risks: readonly string[];
   readonly suggested_roles: readonly string[];
+  readonly suggested_skills?: readonly string[];
   readonly main_model_brief: string;
   readonly routing_notes: string;
   readonly verification_question: string;
@@ -316,6 +325,79 @@ export interface MemoryRecord {
   readonly sourceSessionId?: string;
   readonly sourceEventIds: readonly string[];
   readonly status: "active" | "archived";
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface MemoryTypeCount {
+  readonly type: MemoryType;
+  readonly count: number;
+}
+
+export interface MemoryTagCount {
+  readonly tag: string;
+  readonly count: number;
+}
+
+export interface MemoryLayerGroup {
+  readonly key: "recent_writes" | "recent_recalls" | "session_memories" | "project_memories";
+  readonly title: string;
+  readonly description: string;
+  readonly count: number;
+  readonly memories: readonly MemoryRecord[];
+}
+
+export interface MemoryPanelStats {
+  readonly recentWrites: number;
+  readonly recentRecalls: number;
+  readonly totalProjectMemories: number;
+  readonly totalSessionMemories: number;
+  readonly typeCounts: readonly MemoryTypeCount[];
+  readonly topTags: readonly MemoryTagCount[];
+}
+
+export interface MemoryPanelData {
+  readonly stats: MemoryPanelStats;
+  readonly layers: readonly MemoryLayerGroup[];
+}
+
+export interface EnvironmentToolAvailability {
+  readonly name: string;
+  readonly available: boolean;
+  readonly version?: string;
+}
+
+export interface EnvironmentFingerprintPayload {
+  readonly os: {
+    readonly platform: string;
+    readonly release: string;
+    readonly arch: string;
+  };
+  readonly runtime: {
+    readonly nodeVersion: string;
+    readonly electronVersion?: string;
+    readonly timezone: string;
+    readonly shell: string;
+  };
+  readonly workspace: {
+    readonly cwd: string;
+    readonly projectRoot: string;
+    readonly packageManager: string;
+    readonly isGitRepo: boolean;
+    readonly hasPnpmWorkspace: boolean;
+    readonly appKind: string;
+  };
+  readonly markers: readonly string[];
+  readonly tools: readonly EnvironmentToolAvailability[];
+}
+
+export interface EnvironmentFingerprint {
+  readonly id: string;
+  readonly scope: "global";
+  readonly fingerprintHash: string;
+  readonly summary: string;
+  readonly snapshot: readonly string[];
+  readonly payload: EnvironmentFingerprintPayload;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -441,6 +523,35 @@ export type AgentEventType =
   | "conversation_summary"
   | "model_return"
   | "error";
+
+export type RuntimeLogLevel = "debug" | "info" | "warn" | "error";
+
+export type RuntimeLogStage =
+  | "environment"
+  | "compression"
+  | "router"
+  | "memory"
+  | "tool_selection"
+  | "planning"
+  | "main"
+  | "tool_gateway"
+  | "tool_followup"
+  | "evaluation"
+  | "revision"
+  | "session"
+  | "system";
+
+export interface RuntimeLogRecord {
+  readonly id: string;
+  readonly projectId: string;
+  readonly sessionId?: string;
+  readonly turnId?: string;
+  readonly stage: RuntimeLogStage;
+  readonly level: RuntimeLogLevel;
+  readonly message: string;
+  readonly payload?: unknown;
+  readonly createdAt: string;
+}
 
 export interface AgentEventRecord {
   readonly id: string;

@@ -2,7 +2,10 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  getEnvironmentFingerprint,
+  getMemoryPanelData,
   getModelRuntimeSettings,
+  listRuntimeLogs,
   listModelProfiles,
   listProviderDebugLogs,
   listSessionEvents,
@@ -20,12 +23,13 @@ process.env.APP_ROOT = path.join(currentDir, "..");
 const viteDevServerUrl = process.env.VITE_DEV_SERVER_URL;
 const rendererDist = path.join(process.env.APP_ROOT, "dist");
 const preloadPath = path.join(currentDir, "preload.cjs");
+const shouldOpenDevTools = process.env.OPEN_DEVTOOLS === "true";
 
 let mainWindow: BrowserWindow | null = null;
 
 async function createWindow(): Promise<void> {
   mainWindow = new BrowserWindow({
-    title: "XiaoMi Agent Workbench",
+    title: "huydAgent",
     width: 1380,
     height: 880,
     minWidth: 1120,
@@ -41,13 +45,16 @@ async function createWindow(): Promise<void> {
 
   if (viteDevServerUrl) {
     await mainWindow.loadURL(viteDevServerUrl);
-    mainWindow.webContents.openDevTools({ mode: "detach" });
+    if (shouldOpenDevTools) {
+      mainWindow.webContents.openDevTools({ mode: "detach" });
+    }
   } else {
     await mainWindow.loadFile(path.join(rendererDist, "index.html"));
   }
 }
 
 app.whenReady().then(async () => {
+  process.env.APP_USER_DATA = app.getPath("userData");
   registerIpcHandlers();
   await createWindow();
 
@@ -86,12 +93,27 @@ function registerIpcHandlers(): void {
     return listProviderDebugLogs();
   });
 
+  ipcMain.handle("workbench:list-runtime-logs", (_event, request?: { projectId?: string; sessionId?: string; limit?: number }) => {
+    return listRuntimeLogs(request);
+  });
+
   ipcMain.handle("workbench:list-session-events", (_event, request: { projectId: string; sessionId: string }) => {
     return listSessionEvents({
       projectId: request.projectId,
       sessionId: request.sessionId,
       limit: 100
     });
+  });
+
+  ipcMain.handle("workbench:get-memory-panel-data", (_event, request: { projectId: string; sessionId?: string }) => {
+    return getMemoryPanelData({
+      projectId: request.projectId,
+      sessionId: request.sessionId
+    });
+  });
+
+  ipcMain.handle("workbench:get-environment-fingerprint", () => {
+    return getEnvironmentFingerprint();
   });
 
   ipcMain.handle("workbench:get-model-runtime-settings", () => {

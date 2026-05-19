@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Bug, CheckCircle2, CircleDashed, GitBranch, RefreshCw, Send, SlidersHorizontal, UserRound, X } from "lucide-react";
+import { BookOpen, Bug, CheckCircle2, CircleDashed, GitBranch, RefreshCw, Send, SlidersHorizontal, UserRound, X } from "lucide-react";
 import type {
   AgentEventRecord,
   ChatMessage,
   ChatSessionId,
   ChatStreamEvent,
+  EnvironmentFingerprint,
+  MemoryPanelData,
+  MemoryRecord,
+  MemoryType,
   ModelProviderKind,
   ModelBlockConfig,
   ModelRuntimeConfig,
@@ -35,6 +39,21 @@ interface MinimalChatPageProps {
   readonly modelProfiles: readonly ModelProfile[];
 }
 
+interface FlowToastStep {
+  readonly id: string;
+  readonly label: string;
+  readonly detail?: string;
+}
+
+interface ArtifactNotice {
+  readonly id: string;
+  readonly action: "created" | "updated";
+  readonly path: string;
+  readonly bytes?: number;
+}
+
+type ReplyState = "idle" | "streaming" | "completed" | "failed";
+
 export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.Element {
   const [messages, setMessages] = useState<readonly ChatMessage[]>([initialMessage]);
   const [draft, setDraft] = useState("");
@@ -42,6 +61,12 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stageLabel, setStageLabel] = useState<string | null>(null);
+  const [flowToastSteps, setFlowToastSteps] = useState<readonly FlowToastStep[]>([]);
+  const [flowToastVisible, setFlowToastVisible] = useState(false);
+  const [artifactNotices, setArtifactNotices] = useState<readonly ArtifactNotice[]>([]);
+  const [artifactToastVisible, setArtifactToastVisible] = useState(false);
+  const [replyState, setReplyState] = useState<ReplyState>("idle");
+  const [replyCompletedAt, setReplyCompletedAt] = useState<string | null>(null);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugLogs, setDebugLogs] = useState<readonly ProviderDebugLog[]>([]);
   const [eventLogs, setEventLogs] = useState<readonly AgentEventRecord[]>([]);
@@ -49,9 +74,15 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
   const [modelLibraryOpen, setModelLibraryOpen] = useState(false);
   const [workflowOpen, setWorkflowOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [environmentFingerprint, setEnvironmentFingerprint] = useState<EnvironmentFingerprint | null>(null);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryPanelData, setMemoryPanelData] = useState<MemoryPanelData | null>(null);
+  const [selectedMemoryId, setSelectedMemoryId] = useState<string | undefined>();
   const [modelSettings, setModelSettings] = useState<ModelRuntimeSettings | null>(null);
   const [settingsStatus, setSettingsStatus] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const flowToastTimerRef = useRef<number | null>(null);
+  const artifactToastTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({
@@ -79,6 +110,14 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
     setIsSending(true);
     setError(null);
     setStageLabel(null);
+    setReplyState("streaming");
+    setReplyCompletedAt(null);
+    setFlowToastSteps([]);
+    setFlowToastVisible(false);
+    setArtifactNotices([]);
+    setArtifactToastVisible(false);
+    clearFlowToastTimer(flowToastTimerRef);
+    clearArtifactToastTimer(artifactToastTimerRef);
 
     let removeListener: (() => void) | undefined;
     let completedSessionId: ChatSessionId | undefined;
@@ -98,6 +137,7 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
       await refreshDebugData(completedSessionId, Boolean(completedSessionId));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setReplyState("failed");
       await refreshDebugData(completedSessionId);
     } finally {
       removeListener?.();
@@ -108,12 +148,19 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
 
   function handleStreamEvent(event: ChatStreamEvent): void {
     if (event.type === "stage") {
-      setStageLabel(event.detail ? `${event.label}：${event.detail}` : event.label);
+      const label = event.detail ? `${event.label}：${event.detail}` : event.label;
+      setStageLabel(label);
+      pushFlowToastStep({
+        id: `flow-step-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        label: event.label,
+        detail: event.detail
+      });
       return;
     }
 
     if (event.type === "start") {
       setStageLabel(null);
+      setReplyState("streaming");
       setSessionId(event.sessionId);
       setMessages((current) => [
         ...current,
@@ -156,21 +203,37 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
       return;
     }
 
+    if (event.type === "artifact") {
+      pushArtifactNotice({
+        id: `artifact-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        action: event.action,
+        path: event.path,
+        bytes: event.bytes
+      });
+      return;
+    }
+
     if (event.type === "done") {
       setStageLabel(null);
+      setReplyState("completed");
+      setReplyCompletedAt(event.assistantMessage.createdAt);
       setSessionId(event.session.id);
       setMessages(event.session.messages);
+      finalizeFlowToast("本轮流程已完成");
       void refreshSessionEvents(event.session.id, true);
       return;
     }
 
     setStageLabel(null);
+    setReplyState("failed");
     setError(event.error);
+    finalizeFlowToast("本轮流程已中断");
   }
 
   async function refreshDebugData(targetSessionId = sessionId, selectLatest = false): Promise<void> {
     const logs = await window.workbench.listProviderDebugLogs();
     setDebugLogs(logs);
+    await refreshEnvironmentFingerprint();
 
     if (targetSessionId) {
       await refreshSessionEvents(targetSessionId, selectLatest);
@@ -196,18 +259,104 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
 
   return (
     <main className="minimal-chat">
+      {flowToastVisible ? (
+        <aside className="flow-toast" aria-label="本轮流程提示">
+          <header>
+            <div>
+              <span>本轮流程</span>
+              <strong>{replyState === "completed" ? "已完成" : replyState === "failed" ? "已中断" : `${flowToastSteps.length} 步`}</strong>
+            </div>
+            <button
+              className="flow-toast__close"
+              onClick={() => {
+                setFlowToastVisible(false);
+                clearFlowToastTimer(flowToastTimerRef);
+              }}
+              title="关闭流程提示"
+              type="button"
+            >
+              <X size={14} />
+            </button>
+          </header>
+          <ol className="flow-toast__steps">
+            {flowToastSteps.slice(-6).map((step, index, list) => (
+              <li data-current={index === list.length - 1 && isSending} key={step.id}>
+                <span>{index + 1}</span>
+                <div>
+                  <strong>{step.label}</strong>
+                  {step.detail ? <small>{compactText(step.detail, 84)}</small> : null}
+                </div>
+              </li>
+            ))}
+          </ol>
+        </aside>
+      ) : null}
+
+      {artifactToastVisible && artifactNotices.length > 0 ? (
+        <aside className="artifact-toast" aria-label="文件产物提示">
+          <header>
+            <div>
+              <span>本轮产物</span>
+              <strong>{artifactNotices.length} 个文件变更</strong>
+            </div>
+            <button
+              className="artifact-toast__close"
+              onClick={() => {
+                setArtifactToastVisible(false);
+                clearArtifactToastTimer(artifactToastTimerRef);
+              }}
+              title="关闭产物提示"
+              type="button"
+            >
+              <X size={14} />
+            </button>
+          </header>
+          <ol className="artifact-toast__list">
+            {artifactNotices.slice(-4).map((artifact) => (
+              <li key={artifact.id}>
+                <CheckCircle2 size={14} />
+                <div>
+                  <strong>{artifact.action === "created" ? "已新建文件" : "已更新文件"}</strong>
+                  <small>{compactText(artifact.path, 72)}</small>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </aside>
+      ) : null}
+
       <div className="top-actions">
+        <button
+          className="debug-toggle"
+          type="button"
+          onClick={async () => {
+            const nextOpen = !memoryOpen;
+            setMemoryOpen(nextOpen);
+            setProfileOpen(false);
+            setModelLibraryOpen(false);
+            setWorkflowOpen(false);
+            setDebugOpen(false);
+            if (nextOpen) {
+              await refreshMemoryPanel();
+            }
+          }}
+        >
+          <BookOpen size={16} />
+          记忆
+        </button>
         <button
           className="debug-toggle"
           type="button"
           onClick={async () => {
             const nextOpen = !profileOpen;
             setProfileOpen(nextOpen);
+            setMemoryOpen(false);
             setModelLibraryOpen(false);
             setWorkflowOpen(false);
             setDebugOpen(false);
             if (nextOpen) {
               await refreshDebugData();
+              await refreshEnvironmentFingerprint();
             }
           }}
         >
@@ -222,6 +371,7 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
             setModelLibraryOpen(nextOpen);
             setWorkflowOpen(false);
             setProfileOpen(false);
+            setMemoryOpen(false);
             setDebugOpen(false);
             if (nextOpen) {
               await refreshModelSettings();
@@ -239,6 +389,7 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
             setWorkflowOpen(nextOpen);
             setModelLibraryOpen(false);
             setProfileOpen(false);
+            setMemoryOpen(false);
             setDebugOpen(false);
             if (nextOpen) {
               await refreshModelSettings();
@@ -257,6 +408,7 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
             setModelLibraryOpen(false);
             setWorkflowOpen(false);
             setProfileOpen(false);
+            setMemoryOpen(false);
             if (nextOpen) {
               await refreshDebugData();
             }
@@ -271,10 +423,15 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
         {messages.map((message) => (
           <article className={`minimal-message minimal-message--${message.sender}`} key={message.id}>
             <div className="minimal-message__meta">{message.roleLabel}</div>
-            <MessageContent content={message.content} sender={message.sender} />
+            <MessageContent
+              content={message.content}
+              sender={message.sender}
+              replyState={message.sender === "assistant" && message.id === messages.at(-1)?.id ? replyState : "idle"}
+              replyCompletedAt={message.sender === "assistant" && message.id === messages.at(-1)?.id ? replyCompletedAt : null}
+              artifacts={message.sender === "assistant" && message.id === messages.at(-1)?.id ? artifactNotices : []}
+            />
           </article>
         ))}
-        {stageLabel ? <div className="minimal-chat__stage">{stageLabel}</div> : null}
         {error ? <div className="minimal-chat__error">{error}</div> : null}
         <div ref={messagesEndRef} />
       </section>
@@ -293,8 +450,8 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
           placeholder="描述你的目标，例如：帮我组建 Agent 团队继续开发这个项目..."
           spellCheck={false}
         />
-        <button type="button" onClick={() => void sendMessage()} disabled={!draft.trim() || isSending} title="发送">
-          <Send size={18} />
+        <button type="button" onClick={() => void sendMessage()} disabled={!draft.trim() || isSending} title={isSending ? "处理中" : "发送"}>
+          {isSending ? <span className="minimal-composer__sending">处理中...</span> : <Send size={18} />}
         </button>
       </footer>
 
@@ -316,7 +473,39 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
           </header>
 
           <section className="debug-log-list">
-            <ProfileView events={eventLogs} sessionId={sessionId} />
+            <ProfileView
+              environmentFingerprint={environmentFingerprint}
+              events={eventLogs}
+              sessionId={sessionId}
+            />
+          </section>
+        </aside>
+      ) : null}
+
+      {memoryOpen ? (
+        <aside className="debug-drawer memory-drawer" aria-label="记忆面板">
+          <header>
+            <div>
+              <h2>记忆</h2>
+              <p>按“本轮新增 / 本轮召回 / 当前会话 / 项目长期记忆”分层查看，默认保持轻量。</p>
+            </div>
+            <div className="debug-drawer__actions">
+              <button type="button" onClick={() => void refreshMemoryPanel()} title="刷新">
+                <RefreshCw size={16} />
+              </button>
+              <button type="button" onClick={() => setMemoryOpen(false)} title="关闭">
+                <X size={16} />
+              </button>
+            </div>
+          </header>
+
+          <section className="debug-log-list">
+            <MemoryView
+              data={memoryPanelData}
+              selectedMemoryId={selectedMemoryId}
+              sessionId={sessionId}
+              onSelectMemory={setSelectedMemoryId}
+            />
           </section>
         </aside>
       ) : null}
@@ -461,6 +650,51 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
     setSettingsStatus(null);
   }
 
+  async function refreshMemoryPanel(targetSessionId = sessionId): Promise<void> {
+    const data = await window.workbench.getMemoryPanelData({
+      projectId: PROJECT_ID,
+      sessionId: targetSessionId
+    });
+    setMemoryPanelData(data);
+    setSelectedMemoryId((current) => {
+      const candidate = current ? findMemoryById(data, current) : undefined;
+      return candidate?.id ?? data.layers.flatMap((layer) => layer.memories).at(0)?.id;
+    });
+  }
+
+  async function refreshEnvironmentFingerprint(): Promise<void> {
+    const fingerprint = await window.workbench.getEnvironmentFingerprint();
+    setEnvironmentFingerprint(fingerprint ?? null);
+  }
+
+  function pushFlowToastStep(step: FlowToastStep): void {
+    setFlowToastVisible(true);
+    clearFlowToastTimer(flowToastTimerRef);
+    setFlowToastSteps((current) => {
+      const previous = current.at(-1);
+      if (previous && previous.label === step.label && previous.detail === step.detail) {
+        return current;
+      }
+      return [...current, step];
+    });
+  }
+
+  function finalizeFlowToast(summaryLabel: string): void {
+    setStageLabel(null);
+    setFlowToastVisible(true);
+    setFlowToastSteps((current) => {
+      const previous = current.at(-1);
+      if (previous?.label === summaryLabel) {
+        return current;
+      }
+      return [...current, { id: `flow-summary-${Date.now()}`, label: summaryLabel }];
+    });
+    clearFlowToastTimer(flowToastTimerRef);
+    flowToastTimerRef.current = window.setTimeout(() => {
+      setFlowToastVisible(false);
+    }, 4200);
+  }
+
   async function saveModelSettings(status = "已保存到 config/model-runtime.local.json"): Promise<void> {
     if (!modelSettings) {
       return;
@@ -477,7 +711,12 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
         return current;
       }
 
-      const modelBlocks = current.modelBlocks.map((item) => item.id === block.id ? block : item);
+      const modelBlocks = current.modelBlocks.map((item) => shouldShareApiKey(item, block)
+        ? { ...item, apiKey: block.apiKey }
+        : item.id === block.id
+          ? block
+          : item
+      );
       const next = {
         ...current,
         modelBlocks
@@ -524,11 +763,24 @@ export function MinimalChatPage({ modelProfiles }: MinimalChatPageProps): JSX.El
     });
     setSettingsStatus("已切换主模型为 MiMo OpenAI 原生工具模式，请确认 API Key 后保存。");
   }
+
+  function pushArtifactNotice(notice: ArtifactNotice): void {
+    setArtifactNotices((current) => [...current, notice]);
+    setArtifactToastVisible(true);
+    clearArtifactToastTimer(artifactToastTimerRef);
+    artifactToastTimerRef.current = window.setTimeout(() => {
+      setArtifactToastVisible(false);
+      artifactToastTimerRef.current = null;
+    }, 8000);
+  }
 }
 
 function MessageContent(props: {
   readonly content: string;
   readonly sender: ChatMessage["sender"];
+  readonly replyState?: ReplyState;
+  readonly replyCompletedAt?: string | null;
+  readonly artifacts?: readonly ArtifactNotice[];
 }): JSX.Element {
   if (props.sender === "user") {
     return <div className="minimal-message__body">{props.content}</div>;
@@ -544,6 +796,25 @@ function MessageContent(props: {
           <div className="message-section__content">{section.content || "(empty)"}</div>
         </section>
       ))}
+      {props.artifacts && props.artifacts.length > 0 ? (
+        <div className="minimal-message__artifacts">
+          {props.artifacts.map((artifact) => (
+            <div className="minimal-message__artifact" data-action={artifact.action} key={artifact.id}>
+              <strong>{artifact.action === "created" ? "已新建" : "已更新"}</strong>
+              <span>{artifact.path}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <div className="minimal-message__status" data-state={props.replyState ?? "idle"}>
+        {props.replyState === "streaming"
+          ? "生成中"
+          : props.replyState === "completed"
+            ? `本轮完成 · ${formatTime(props.replyCompletedAt ?? new Date().toISOString())}`
+            : props.replyState === "failed"
+              ? "已中断"
+              : ""}
+      </div>
     </div>
   );
 }
@@ -616,21 +887,57 @@ function pushMessageSection(
 }
 
 function ProfileView(props: {
+  readonly environmentFingerprint: EnvironmentFingerprint | null;
   readonly events: readonly AgentEventRecord[];
   readonly sessionId?: ChatSessionId;
 }): JSX.Element {
-  if (!props.sessionId) {
+  if (!props.sessionId && !props.environmentFingerprint) {
     return <p className="debug-empty">发送消息后，Router 会开始建立用户、项目和环境画像。</p>;
   }
 
   const profile = buildProfileOverview(props.events);
 
-  if (profile.totalObservations === 0) {
+  if (profile.totalObservations === 0 && !props.environmentFingerprint) {
     return <p className="debug-empty">当前会话还没有画像观察。继续对话后，这里会显示 Router 的画像快照和候选更新。</p>;
   }
 
   return (
     <div className="profile-panel">
+      {props.environmentFingerprint ? (
+        <section className="profile-card profile-card--shared">
+          <header>
+            <div>
+              <span>Global</span>
+              <h3>共享环境指纹</h3>
+            </div>
+            <strong>{props.environmentFingerprint.fingerprintHash}</strong>
+          </header>
+          <p>{props.environmentFingerprint.summary}</p>
+
+          <section className="profile-card__block">
+            <h4>稳定环境快照</h4>
+            <ul>
+              {props.environmentFingerprint.snapshot.map((item, index) => (
+                <li key={`environment-shared-${index}`}>{item}</li>
+              ))}
+            </ul>
+          </section>
+
+          <section className="profile-card__block">
+            <h4>工具可用性</h4>
+            <ol className="profile-update-list">
+              {props.environmentFingerprint.payload.tools.map((tool) => (
+                <li key={`environment-tool-${tool.name}`}>
+                  <strong>{tool.name}</strong>
+                  <span>{tool.available ? "available" : "missing"}</span>
+                  <small>{tool.version || "未检测到版本信息"}</small>
+                </li>
+              ))}
+            </ol>
+          </section>
+        </section>
+      ) : null}
+
       <section className="profile-overview" aria-label="画像总览">
         <header>
           <span>画像总览</span>
@@ -742,6 +1049,212 @@ interface ProfileUpdateView {
   readonly reason: string;
   readonly evidence: string;
   readonly confidence: number;
+}
+
+function MemoryView(props: {
+  readonly data: MemoryPanelData | null;
+  readonly selectedMemoryId?: string;
+  readonly sessionId?: ChatSessionId;
+  readonly onSelectMemory: (memoryId: string) => void;
+}): JSX.Element {
+  if (!props.sessionId) {
+    return <p className="debug-empty">发送消息后，系统才会开始写入和召回项目记忆。</p>;
+  }
+
+  if (!props.data) {
+    return <p className="debug-empty">正在读取记忆面板...</p>;
+  }
+
+  const selectedMemory = props.selectedMemoryId ? findMemoryById(props.data, props.selectedMemoryId) : undefined;
+
+  return (
+    <div className="memory-panel">
+      <section className="memory-overview" aria-label="记忆总览">
+        <header>
+          <span>记忆总览</span>
+          <strong>{props.data.stats.totalProjectMemories} 条项目记忆</strong>
+        </header>
+        <dl>
+          <div>
+            <dt>本轮写入</dt>
+            <dd>{props.data.stats.recentWrites}</dd>
+          </div>
+          <div>
+            <dt>本轮召回</dt>
+            <dd>{props.data.stats.recentRecalls}</dd>
+          </div>
+          <div>
+            <dt>项目累计</dt>
+            <dd>{props.data.stats.totalProjectMemories}</dd>
+          </div>
+          <div>
+            <dt>会话沉淀</dt>
+            <dd>{props.data.stats.totalSessionMemories}</dd>
+          </div>
+        </dl>
+
+        <div className="memory-overview__meta">
+          <section className="memory-chip-group">
+            <h3>类型分布</h3>
+            <div>
+              {props.data.stats.typeCounts.map((item) => (
+                <span className="memory-chip" data-kind={item.type} key={item.type}>
+                  {formatMemoryTypeLabel(item.type)} {item.count}
+                </span>
+              ))}
+            </div>
+          </section>
+
+          <section className="memory-chip-group">
+            <h3>活跃标签</h3>
+            <div>
+              {props.data.stats.topTags.length > 0 ? props.data.stats.topTags.map((item) => (
+                <span className="memory-chip memory-chip--tag" key={item.tag}>
+                  #{item.tag} {item.count}
+                </span>
+              )) : (
+                <span className="memory-chip memory-chip--muted">暂无标签</span>
+              )}
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <div className="memory-layout">
+        <div className="memory-layer-list">
+          {props.data.layers.map((layer) => (
+            <details className="memory-layer" key={layer.key} open>
+              <summary>
+                <div>
+                  <span>{layer.title}</span>
+                  <strong>{layer.count} 条</strong>
+                </div>
+                <p>{layer.description}</p>
+              </summary>
+
+              <div className="memory-layer__items">
+                {layer.memories.length > 0 ? layer.memories.slice(0, 3).map((memory) => (
+                  <button
+                    className="memory-card"
+                    data-active={memory.id === selectedMemory?.id}
+                    key={`${layer.key}-${memory.id}`}
+                    onClick={() => props.onSelectMemory(memory.id)}
+                    type="button"
+                  >
+                    <div className="memory-card__top">
+                      <span className="memory-chip" data-kind={memory.type}>{formatMemoryTypeLabel(memory.type)}</span>
+                      <strong>{formatMemoryConfidence(memory.confidence)}</strong>
+                    </div>
+                    <p>{compactText(memory.content, 92)}</p>
+                    <div className="memory-card__meta">
+                      <small>{formatTime(memory.updatedAt)}</small>
+                      <small>{memory.tags.slice(0, 3).map((tag) => `#${tag}`).join(" ") || "无标签"}</small>
+                    </div>
+                  </button>
+                )) : (
+                  <p className="debug-empty">这一层暂时没有内容。</p>
+                )}
+
+                {layer.memories.length > 3 ? (
+                  <details className="memory-layer__more">
+                    <summary>展开剩余 {layer.memories.length - 3} 条</summary>
+                    <div className="memory-layer__items">
+                      {layer.memories.slice(3).map((memory) => (
+                        <button
+                          className="memory-card"
+                          data-active={memory.id === selectedMemory?.id}
+                          key={`${layer.key}-${memory.id}-more`}
+                          onClick={() => props.onSelectMemory(memory.id)}
+                          type="button"
+                        >
+                          <div className="memory-card__top">
+                            <span className="memory-chip" data-kind={memory.type}>{formatMemoryTypeLabel(memory.type)}</span>
+                            <strong>{formatMemoryConfidence(memory.confidence)}</strong>
+                          </div>
+                          <p>{compactText(memory.content, 92)}</p>
+                          <div className="memory-card__meta">
+                            <small>{formatTime(memory.updatedAt)}</small>
+                            <small>{memory.tags.slice(0, 3).map((tag) => `#${tag}`).join(" ") || "无标签"}</small>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </details>
+                ) : null}
+              </div>
+            </details>
+          ))}
+        </div>
+
+        <aside className="memory-detail" aria-label="记忆详情">
+          {selectedMemory ? (
+            <>
+              <header>
+                <div>
+                  <span>{formatMemoryTypeLabel(selectedMemory.type)}</span>
+                  <h3>记忆详情</h3>
+                </div>
+                <strong>{selectedMemory.status}</strong>
+              </header>
+              <p className="memory-detail__content">{selectedMemory.content}</p>
+              <dl>
+                <div>
+                  <dt>重要性</dt>
+                  <dd>{formatMemoryScore(selectedMemory.importance)}</dd>
+                </div>
+                <div>
+                  <dt>置信度</dt>
+                  <dd>{formatMemoryScore(selectedMemory.confidence)}</dd>
+                </div>
+                <div>
+                  <dt>会话</dt>
+                  <dd>{selectedMemory.sourceSessionId || "-"}</dd>
+                </div>
+                <div>
+                  <dt>事件数</dt>
+                  <dd>{selectedMemory.sourceEventIds.length}</dd>
+                </div>
+                <div>
+                  <dt>创建时间</dt>
+                  <dd>{formatTime(selectedMemory.createdAt)}</dd>
+                </div>
+                <div>
+                  <dt>最近更新</dt>
+                  <dd>{formatTime(selectedMemory.updatedAt)}</dd>
+                </div>
+              </dl>
+
+              <section className="memory-detail__block">
+                <h4>标签</h4>
+                <div className="memory-detail__tags">
+                  {selectedMemory.tags.length > 0 ? selectedMemory.tags.map((tag) => (
+                    <span className="memory-chip memory-chip--tag" key={`${selectedMemory.id}-${tag}`}>#{tag}</span>
+                  )) : (
+                    <span className="memory-chip memory-chip--muted">暂无标签</span>
+                  )}
+                </div>
+              </section>
+
+              <section className="memory-detail__block">
+                <h4>来源事件</h4>
+                {selectedMemory.sourceEventIds.length > 0 ? (
+                  <ul className="memory-source-list">
+                    {selectedMemory.sourceEventIds.map((eventId) => (
+                      <li key={eventId}>{eventId}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>暂无来源事件。</p>
+                )}
+              </section>
+            </>
+          ) : (
+            <p className="debug-empty">从左侧任意一层选择一条记忆，这里会展开它的完整上下文。</p>
+          )}
+        </aside>
+      </div>
+    </div>
+  );
 }
 
 function buildProfileOverview(events: readonly AgentEventRecord[]): ProfileOverview {
@@ -906,6 +1419,150 @@ const MODEL_PROFILE_PRESETS: readonly ModelProfilePreset[] = [
       apiKey: "",
       temperature: 1,
       maxTokens: 8192,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-v2-5",
+    label: "MiMo V2.5",
+    provider: "MiMo",
+    description: "同系列较轻文本模型，适合尝试更快回复。",
+    supports: ["planner", "main", "evaluator"],
+    config: {
+      label: "MiMo V2.5",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5",
+      apiKey: "",
+      temperature: 0.8,
+      maxTokens: 8192,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-v2-5-pro-openai",
+    label: "MiMo V2.5 Pro",
+    provider: "MiMo",
+    description: "文本主模型，可继续测试 OpenAI-compatible 路径速度。",
+    supports: ["planner", "main", "evaluator"],
+    config: {
+      label: "MiMo V2.5 Pro",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5-Pro",
+      apiKey: "",
+      temperature: 1,
+      maxTokens: 8192,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-v2-pro",
+    label: "MiMo V2 Pro",
+    provider: "MiMo",
+    description: "上一代 Pro 文本模型，可用于速度和质量对比。",
+    supports: ["planner", "main", "evaluator"],
+    config: {
+      label: "MiMo V2 Pro",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2-Pro",
+      apiKey: "",
+      temperature: 1,
+      maxTokens: 8192,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-v2-omni",
+    label: "MiMo V2 Omni",
+    provider: "MiMo",
+    description: "Omni 多模态模型，当前文本链路可先当通用对话模型试用。",
+    supports: ["planner", "main"],
+    config: {
+      label: "MiMo V2 Omni",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2-Omni",
+      apiKey: "",
+      temperature: 1,
+      maxTokens: 8192,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-v2-5-tts",
+    label: "MiMo V2.5 TTS",
+    provider: "MiMo",
+    description: "TTS 模型，当前文本 Agent 主链通常不优先使用。",
+    supports: ["main"],
+    config: {
+      label: "MiMo V2.5 TTS",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5-TTS",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 4096,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-v2-5-tts-voiceclone",
+    label: "MiMo V2.5 TTS VoiceClone",
+    provider: "MiMo",
+    description: "偏语音克隆，当前文本链路可配置但不建议默认使用。",
+    supports: ["main"],
+    config: {
+      label: "MiMo V2.5 TTS VoiceClone",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5-TTS-VoiceClone",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 4096,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-v2-5-tts-voicedesign",
+    label: "MiMo V2.5 TTS VoiceDesign",
+    provider: "MiMo",
+    description: "偏语音设计，当前文本链路可配置但不建议默认使用。",
+    supports: ["main"],
+    config: {
+      label: "MiMo V2.5 TTS VoiceDesign",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5-TTS-VoiceDesign",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 4096,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    }
+  },
+  {
+    id: "mimo-v2-tts",
+    label: "MiMo V2 TTS",
+    provider: "MiMo",
+    description: "上一代 TTS 模型，保留用于切换测试。",
+    supports: ["main"],
+    config: {
+      label: "MiMo V2 TTS",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2-TTS",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 4096,
       toolCallingMode: "text-json",
       thinkingEnabled: false
     }
@@ -1185,9 +1842,11 @@ function ModelStepBindingEditor(props: {
   };
 
   function update(patch: Partial<ModelRuntimeConfig>): void {
+    const shouldDetach = shouldDetachFromModelBlock(patch);
     const next = normalizeLinkedModelConfig({
       ...props.config,
-      ...patch
+      ...patch,
+      modelBlockId: shouldDetach ? buildCustomModelBlockId(props.config.role) : props.config.modelBlockId
     });
     props.onChange(next);
   }
@@ -1352,6 +2011,24 @@ function applyModelBlockToRole(config: ModelRuntimeConfig, block: ModelBlockConf
   });
 }
 
+function shouldDetachFromModelBlock(patch: Partial<ModelRuntimeConfig>): boolean {
+  return [
+    "label",
+    "providerKind",
+    "baseURL",
+    "model",
+    "apiKey",
+    "temperature",
+    "maxTokens",
+    "toolCallingMode",
+    "thinkingEnabled"
+  ].some((key) => key in patch);
+}
+
+function buildCustomModelBlockId(role: ModelRuntimeRole): string {
+  return `custom-${role}`;
+}
+
 function applyModelBlockToMatchingStep(config: ModelRuntimeConfig, block: ModelBlockConfig): ModelRuntimeConfig {
   if (config.modelBlockId !== block.id) {
     return config;
@@ -1395,6 +2072,13 @@ function providerLabel(providerKind: ModelProviderKind): string {
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+function shouldShareApiKey(current: ModelBlockConfig, updated: ModelBlockConfig): boolean {
+  const currentProvider = current.provider.trim().toLowerCase();
+  const updatedProvider = updated.provider.trim().toLowerCase();
+
+  return currentProvider.length > 0 && currentProvider === updatedProvider;
 }
 
 function maskApiKey(value: string): string {
@@ -3620,4 +4304,54 @@ function compactText(value: string, maxLength: number): string {
 
 function evaluationSummary(payload: Record<string, unknown>): string {
   return evaluationDisplayFromPayload(payload).summary;
+}
+
+function findMemoryById(data: MemoryPanelData, memoryId: string): MemoryRecord | undefined {
+  for (const layer of data.layers) {
+    const matched = layer.memories.find((memory) => memory.id === memoryId);
+    if (matched) {
+      return matched;
+    }
+  }
+
+  return undefined;
+}
+
+function formatMemoryTypeLabel(type: MemoryType): string {
+  switch (type) {
+    case "fact":
+      return "事实";
+    case "decision":
+      return "决策";
+    case "plan":
+      return "规划";
+    case "preference":
+      return "偏好";
+    case "constraint":
+      return "约束";
+    default:
+      return type;
+  }
+}
+
+function formatMemoryScore(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(2) : "-";
+}
+
+function formatMemoryConfidence(value: number): string {
+  return `置信 ${formatMemoryScore(value)}`;
+}
+
+function clearFlowToastTimer(timerRef: { current: number | null }): void {
+  if (timerRef.current !== null) {
+    window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }
+}
+
+function clearArtifactToastTimer(timerRef: { current: number | null }): void {
+  if (timerRef.current !== null) {
+    window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }
 }

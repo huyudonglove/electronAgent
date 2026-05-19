@@ -129,7 +129,7 @@ async function executeLocalTool(input: {
 }
 
 function readFileTool(request: FileReadRequest): Pick<ToolResult, "output" | "data"> {
-  const filePath = resolveWorkspacePath(request.path);
+  const filePath = resolveLocalPath(request.path);
   const stat = fs.statSync(filePath);
 
   if (!stat.isFile()) {
@@ -152,7 +152,7 @@ function readFileTool(request: FileReadRequest): Pick<ToolResult, "output" | "da
 }
 
 function listFileTool(request: FileListRequest): Pick<ToolResult, "output" | "data"> {
-  const dirPath = resolveWorkspacePath(request.path);
+  const dirPath = resolveLocalPath(request.path);
   const stat = fs.statSync(dirPath);
 
   if (!stat.isDirectory()) {
@@ -170,7 +170,7 @@ function listFileTool(request: FileListRequest): Pick<ToolResult, "output" | "da
       });
 
   return {
-    output: entries.map((entry) => `${entry.type === "directory" ? "[dir]" : "[file]"} ${relativeWorkspacePath(entry.path)}`).join("\n"),
+    output: entries.map((entry) => `${entry.type === "directory" ? "[dir]" : "[file]"} ${displayPath(entry.path)}`).join("\n"),
     data: {
       path: dirPath,
       entries,
@@ -180,7 +180,7 @@ function listFileTool(request: FileListRequest): Pick<ToolResult, "output" | "da
 }
 
 function searchFileTool(request: FileSearchRequest): Pick<ToolResult, "output" | "data"> {
-  const rootPath = resolveWorkspacePath(request.path ?? ".");
+  const rootPath = resolveLocalPath(request.path ?? ".");
   const stat = fs.statSync(rootPath);
   const maxResults = request.maxResults ?? DEFAULT_MAX_SEARCH_RESULTS;
   const files = stat.isDirectory() ? collectFiles(rootPath, maxResults * 20) : [rootPath];
@@ -214,7 +214,7 @@ function searchFileTool(request: FileSearchRequest): Pick<ToolResult, "output" |
   }
 
   return {
-    output: results.map((item) => `${relativeWorkspacePath(item.path)}:${item.line}: ${item.text}`).join("\n"),
+    output: results.map((item) => `${displayPath(item.path)}:${item.line}: ${item.text}`).join("\n"),
     data: {
       query: request.query,
       results,
@@ -224,9 +224,10 @@ function searchFileTool(request: FileSearchRequest): Pick<ToolResult, "output" |
 }
 
 function writeFileTool(request: FileWriteRequest): Pick<ToolResult, "output" | "data"> {
-  const filePath = resolveWorkspacePath(request.path);
+  const filePath = resolveLocalPath(request.path);
   assertNotProtectedWritePath(filePath);
   const bytes = Buffer.byteLength(request.content, "utf8");
+  const existedBefore = fs.existsSync(filePath);
 
   if (bytes > MAX_WRITE_BYTES) {
     throw new Error(`写入内容过大：${bytes} bytes`);
@@ -236,10 +237,11 @@ function writeFileTool(request: FileWriteRequest): Pick<ToolResult, "output" | "
   fs.writeFileSync(filePath, request.content, "utf8");
 
   return {
-    output: `已写入 ${relativeWorkspacePath(filePath)} (${bytes} bytes)`,
+    output: `已写入 ${displayPath(filePath)} (${bytes} bytes)`,
     data: {
       path: filePath,
-      bytes
+      bytes,
+      existedBefore
     }
   };
 }
@@ -266,20 +268,18 @@ function saveMemoryTool(
   };
 }
 
-function resolveWorkspacePath(inputPath: string): string {
-  const workspaceRoot = path.resolve(resolveProjectPath());
-  const resolved = path.isAbsolute(inputPath) ? path.resolve(inputPath) : path.resolve(workspaceRoot, inputPath);
-  const relative = path.relative(workspaceRoot, resolved);
-
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`路径不在工作区内：${resolved}`);
-  }
-
-  return resolved;
+function resolveLocalPath(inputPath: string): string {
+  const baseDir = path.resolve(resolveProjectPath());
+  return path.isAbsolute(inputPath) ? path.resolve(inputPath) : path.resolve(baseDir, inputPath);
 }
 
 function relativeWorkspacePath(inputPath: string): string {
   return path.relative(resolveProjectPath(), inputPath) || ".";
+}
+
+function displayPath(inputPath: string): string {
+  const relative = relativeWorkspacePath(inputPath);
+  return relative.startsWith("..") || path.isAbsolute(relative) ? path.resolve(inputPath) : relative;
 }
 
 function isReadTool(request: ToolRequest): boolean {

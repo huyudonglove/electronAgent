@@ -26,7 +26,8 @@
 
 【输出 JSON 格式】
 
-必须同时输出 v2 嵌套字段和旧版兼容字段。
+只输出一份精简的 v2 JSON，不要重复输出旧版平铺字段。
+Core 会自行把 v2 字段映射成兼容字段。
 
 {
   "turn_analysis": {
@@ -77,36 +78,6 @@
     "verification_question": "",
     "success_criteria": [],
     "confidence": 0.8
-  },
-
-  "intent": "analysis",
-  "secondary_intents": [],
-  "rewritten_input": "",
-  "keywords": [],
-  "is_task": false,
-  "task_goal": "",
-  "task_type": "analysis",
-  "complexity": "moderate",
-  "task_scope": "single_turn",
-  "execution_mode": "answer_only",
-  "reasoning_brief": "",
-  "planned_steps": [],
-  "expected_output": "",
-  "required_context": [],
-  "constraints": [],
-  "risks": [],
-  "suggested_roles": [],
-  "main_model_brief": "",
-  "routing_notes": "",
-  "verification_question": "",
-  "success_criteria": [],
-  "needs_user_clarification": false,
-  "clarifying_questions": [],
-  "requires_project_context": false,
-  "needs_tools": false,
-  "suggested_tools": [],
-  "tool_reason": "",
-  "confidence": 0.8
 }
 
 ---
@@ -195,23 +166,17 @@ suggested_tools 只能从以下选择：
 - 需要用户确认设计方向、架构策略、权限边界时：workflow_route 可以是 "ask_user"。
 - 删除文件、清理命令、敏感写入、高风险权限变更：input_risk.requires_confirmation=true。
 - 如果用户表达长期偏好、规则、路径、工具、项目决策：profile_updates 应提出候选更新。
+- 如果输入中提供了共享环境指纹，应优先把它视为稳定环境底座；只有发现明显变化、缺失或新增能力时，才提出 environment 更新候选。
 - 如果用户谈到“今天、刚才、上次、长期、以后、过期、历史记录”：time_context_mode 至少是 "current_time" 或 "recent_history"。
 - Router 可以观察画像变化，但不要声称已经保存画像；保存由 Core 决定。
 - evaluation_seed 在 is_task=true 时必须填写。
+- success_criteria 必须尽量客观、可交付、可观察；不要写“用户无异议”“等用户确认无误”“用户满意”这类依赖事后认可的条件，除非用户明确要求审批/评审闭环。
 
 ---
 
-【兼容字段】
+【简洁要求】
 
-为了兼容现有系统，旧版字段必须和 v2 字段保持一致：
-
-- intent = turn_analysis.intent
-- task_type = turn_analysis.task_type
-- execution_mode = workflow_decision.execution_mode
-- required_context = context_decision.required_context
-- verification_question = evaluation_seed.verification_question
-- success_criteria = evaluation_seed.success_criteria
-- confidence = evaluation_seed.confidence
-
-main_model_brief 应基于 v2 分析写给 Planning/Execution，1 到 3 句话。
-routing_notes 应面向调试面板，说明本轮为什么这样路由。
+- 所有字符串尽量短句，不要写长段解释。
+- keywords、required_context、suggested_tools、success_criteria 保持精简，通常 0 到 4 项即可。
+- reasoning_brief、tool_reason、verification_question 控制在一句话内。
+- 不要输出 planned_steps、constraints、risks、suggested_roles、main_model_brief、routing_notes 这类额外长字段。

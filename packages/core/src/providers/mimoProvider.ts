@@ -9,6 +9,7 @@ import { streamOpenAiChat, streamOpenAiChatWithNativeTools } from "./openAiCompa
 interface StreamMimoChatInput {
   readonly messages: readonly ChatMessage[];
   readonly latestUserMessage: string;
+  readonly environmentFingerprint?: string;
   readonly routerContext: string;
   readonly conversationSummary?: ConversationSummary;
   readonly memories?: readonly MemoryRecord[];
@@ -31,6 +32,7 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
 
   if (config.providerKind === "openai-compatible") {
     const runtimeContext = [
+      input.environmentFingerprint ? input.environmentFingerprint : "",
       input.conversationSummary ? formatConversationSummary(input.conversationSummary) : "",
       input.memories && input.memories.length > 0 ? formatLongTermMemories(input.memories) : "",
       buildRouterContextMessage(input.routerContext)
@@ -65,6 +67,7 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
       messages: input.messages,
       latestUserMessage: input.latestUserMessage,
       routerContext: input.routerContext,
+      environmentFingerprint: input.environmentFingerprint,
       conversationSummary: input.conversationSummary,
       memories: input.memories,
       onDelta: input.onDelta
@@ -80,7 +83,14 @@ export async function streamMimoChat(input: StreamMimoChatInput): Promise<ModelR
     model: config.model,
     max_tokens: config.maxTokens,
     system: systemPrompt,
-    messages: buildMimoMessages(input.messages, input.routerContext, input.conversationSummary, input.memories),
+    messages: buildMimoMessages(
+      input.messages,
+      input.routerContext,
+      input.conversationSummary,
+      input.memories,
+      input.environmentFingerprint
+    ),
+    // Shared environment fingerprint is merged into the runtime/user context block.
     top_p: 0.95,
     stream: true,
     temperature: config.temperature
@@ -171,7 +181,8 @@ function buildMimoMessages(
   messages: readonly ChatMessage[],
   routerContext: string,
   conversationSummary?: ConversationSummary,
-  memories?: readonly MemoryRecord[]
+  memories?: readonly MemoryRecord[],
+  environmentFingerprint?: string
 ): Anthropic.Messages.MessageParam[] {
   const activeMessages = trimCompressedMessages(messages, conversationSummary);
   const conversationMessages = toAnthropicMessages(activeMessages);
@@ -187,6 +198,17 @@ function buildMimoMessages(
           }
         ]
       } satisfies Anthropic.Messages.MessageParam
+    : undefined;
+  const environmentContextMessage: Anthropic.Messages.MessageParam | undefined = environmentFingerprint
+    ? {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: environmentFingerprint
+          }
+        ]
+      }
     : undefined;
   const runtimeContextMessage: Anthropic.Messages.MessageParam = {
     role: "user",
@@ -209,6 +231,7 @@ function buildMimoMessages(
       }
     : undefined;
   const stableContextMessages = [
+    ...(environmentContextMessage ? [environmentContextMessage] : []),
     ...(summaryContextMessage ? [summaryContextMessage] : []),
     ...(memoryContextMessage ? [memoryContextMessage] : [])
   ];
@@ -225,6 +248,7 @@ async function streamOllamaMainChat(input: {
   readonly systemPrompt: string;
   readonly messages: readonly ChatMessage[];
   readonly latestUserMessage: string;
+  readonly environmentFingerprint?: string;
   readonly routerContext: string;
   readonly conversationSummary?: ConversationSummary;
   readonly memories?: readonly MemoryRecord[];
@@ -337,6 +361,7 @@ async function streamOllamaMainChat(input: {
 function buildOllamaMessages(input: {
   readonly systemPrompt: string;
   readonly messages: readonly ChatMessage[];
+  readonly environmentFingerprint?: string;
   readonly routerContext: string;
   readonly conversationSummary?: ConversationSummary;
   readonly memories?: readonly MemoryRecord[];
@@ -351,6 +376,7 @@ function buildOllamaMessages(input: {
   const latestUserMessage = conversationMessages.at(-1);
   const historyMessages = latestUserMessage ? conversationMessages.slice(0, -1) : conversationMessages;
   const runtimeContext = [
+    input.environmentFingerprint ? input.environmentFingerprint : "",
     input.conversationSummary ? formatConversationSummary(input.conversationSummary) : "",
     input.memories && input.memories.length > 0 ? formatLongTermMemories(input.memories) : "",
     buildRouterContextMessage(input.routerContext)
@@ -433,6 +459,7 @@ function formatList(label: string, items: readonly string[]): string {
 function toAnthropicMessages(messages: readonly ChatMessage[]): Anthropic.Messages.MessageParam[] {
   return messages
     .filter((message) => message.sender === "user" || message.sender === "assistant")
+    .filter((message) => message.content.trim().length > 0)
     .map((message) => ({
       role: message.sender === "assistant" ? "assistant" : "user",
       content: [

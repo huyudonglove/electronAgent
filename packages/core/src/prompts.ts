@@ -46,8 +46,13 @@ export function buildRouterSystemPrompt(): string {
   return readMarkdownFiles(ROUTER_PROMPT_MODULES);
 }
 
-export function buildRouterUserPrompt(messages: readonly ChatMessage[], latestUserMessage: string): string {
+export function buildRouterUserPrompt(
+  messages: readonly ChatMessage[],
+  latestUserMessage: string,
+  environmentFingerprint: string
+): string {
   return renderTemplate(readMarkdownFiles(ROUTER_USER_MODULES), {
+    environment_fingerprint: environmentFingerprint || "无",
     recent_messages: formatRecentMessages(messages),
     input: latestUserMessage
   });
@@ -69,6 +74,7 @@ export function buildPlanningSystemPrompt(): string {
 
 export function buildPlanningUserPrompt(input: {
   readonly userInput: string;
+  readonly environmentFingerprint: string;
   readonly routerResult: string;
   readonly toolSelection: string;
   readonly memories: string;
@@ -77,6 +83,7 @@ export function buildPlanningUserPrompt(input: {
 }): string {
   return renderTemplate(readMarkdownFiles(PLANNING_USER_MODULES), {
     user_input: input.userInput,
+    environment_fingerprint: input.environmentFingerprint || "无",
     router_result: input.routerResult,
     tool_selection: input.toolSelection,
     memories: input.memories || "无",
@@ -106,12 +113,16 @@ export function buildEvaluatorSystemPrompt(): string {
 export function buildEvaluatorUserPrompt(input: {
   readonly userInput: string;
   readonly routerResult: string;
+  readonly planningResult: string;
   readonly assistantAnswer: string;
+  readonly evaluationAttempt?: number;
 }): string {
   return renderTemplate(readMarkdownFiles(EVALUATOR_USER_MODULES), {
     user_input: input.userInput,
     router_result: input.routerResult,
-    assistant_answer: input.assistantAnswer
+    planning_result: input.planningResult || "无",
+    assistant_answer: input.assistantAnswer,
+    evaluation_attempt: input.evaluationAttempt ? String(input.evaluationAttempt) : "1"
   });
 }
 

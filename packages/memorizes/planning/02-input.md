@@ -4,6 +4,12 @@
 
 ---
 
+【共享环境指纹】
+
+{{environment_fingerprint}}
+
+---
+
 【Router 路由报告】
 
 {{router_result}}

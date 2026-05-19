@@ -1,11 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ModelBlockConfig, ModelRuntimeConfig, ModelRuntimeRole, ModelRuntimeSettings } from "@xiaomi/shared";
-import { MIMO_MAX_TOKENS, MIMO_MODEL, MIMO_OPENAI_BASE_URL, OLLAMA_BASE_URL, OLLAMA_INTENT_MODEL } from "./modelConfig";
+import { MIMO_BASE_URL, MIMO_MAX_TOKENS, MIMO_MODEL, MIMO_OPENAI_BASE_URL, OLLAMA_BASE_URL, OLLAMA_INTENT_MODEL } from "./modelConfig";
 import { getMimoApiKey } from "./localSecrets";
-import { resolveProjectPath } from "./utils/projectRoot";
-
-const CONFIG_PATH = resolveProjectPath("config", "model-runtime.local.json");
+import { resolveAppStoragePath, resolveProjectPath } from "./utils/projectRoot";
 
 export function getModelRuntimeSettings(): ModelRuntimeSettings {
   return normalizeSettings(readModelRuntimeSettings());
@@ -13,8 +11,9 @@ export function getModelRuntimeSettings(): ModelRuntimeSettings {
 
 export function saveModelRuntimeSettings(settings: ModelRuntimeSettings): ModelRuntimeSettings {
   const normalized = normalizeSettings(settings);
-  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+  const configPath = getConfigPath();
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
 
   return normalized;
 }
@@ -24,15 +23,34 @@ export function getModelRuntimeConfig(role: ModelRuntimeRole): ModelRuntimeConfi
 }
 
 function readModelRuntimeSettings(): Partial<ModelRuntimeSettings> {
-  if (!fs.existsSync(CONFIG_PATH)) {
+  const configPath = getReadableConfigPath();
+  if (!configPath || !fs.existsSync(configPath)) {
     return {};
   }
 
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) as Partial<ModelRuntimeSettings>;
+    return JSON.parse(fs.readFileSync(configPath, "utf8")) as Partial<ModelRuntimeSettings>;
   } catch {
     return {};
   }
+}
+
+function getConfigPath(): string {
+  return resolveAppStoragePath("config", "model-runtime.local.json");
+}
+
+function getReadableConfigPath(): string | undefined {
+  const appConfigPath = getConfigPath();
+  if (fs.existsSync(appConfigPath)) {
+    return appConfigPath;
+  }
+
+  const legacyConfigPath = resolveProjectPath("config", "model-runtime.local.json");
+  if (fs.existsSync(legacyConfigPath)) {
+    return legacyConfigPath;
+  }
+
+  return appConfigPath;
 }
 
 function normalizeSettings(settings: Partial<ModelRuntimeSettings>): ModelRuntimeSettings {
@@ -59,7 +77,7 @@ function normalizeModelBlocks(value: unknown): readonly ModelBlockConfig[] {
 }
 
 function normalizeModelBlock(value: Partial<ModelBlockConfig> | undefined, fallback: ModelBlockConfig): ModelBlockConfig {
-  return {
+  const normalized: ModelBlockConfig = {
     id: stringOr(value?.id, fallback.id),
     label: stringOr(value?.label, fallback.label),
     provider: stringOr(value?.provider, fallback.provider),
@@ -75,6 +93,26 @@ function normalizeModelBlock(value: Partial<ModelBlockConfig> | undefined, fallb
       : fallback.toolCallingMode,
     thinkingEnabled: typeof value?.thinkingEnabled === "boolean" ? value.thinkingEnabled : fallback.thinkingEnabled
   };
+
+  if (fallback.id === "mimo-v2-5" && normalized.providerKind === "anthropic-compatible") {
+    return {
+      ...normalized,
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5"
+    };
+  }
+
+  if (fallback.id === "mimo-anthropic-pro") {
+    return {
+      ...normalized,
+      providerKind: "anthropic-compatible",
+      baseURL: MIMO_BASE_URL,
+      model: MIMO_MODEL
+    };
+  }
+
+  return normalized;
 }
 
 function normalizeRoleConfig(
@@ -143,7 +181,7 @@ function defaultModelBlocks(): readonly ModelBlockConfig[] {
       model: "deepseek-v4-flash",
       apiKey: "",
       temperature: 0.2,
-      maxTokens: 1024,
+      maxTokens: 2048,
       toolCallingMode: "text-json",
       thinkingEnabled: false
     },
@@ -172,6 +210,118 @@ function defaultModelBlocks(): readonly ModelBlockConfig[] {
       apiKey: getMimoApiKey() ?? "",
       temperature: 1,
       maxTokens: MIMO_MAX_TOKENS,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    },
+    {
+      id: "mimo-v2-5",
+      label: "MiMo V2.5",
+      provider: "MiMo",
+      description: "同系列较轻文本模型，适合尝试更快回复。",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5",
+      apiKey: "",
+      temperature: 0.8,
+      maxTokens: MIMO_MAX_TOKENS,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    },
+    {
+      id: "mimo-v2-5-pro-openai",
+      label: "MiMo V2.5 Pro",
+      provider: "MiMo",
+      description: "文本主模型，适合继续走 OpenAI-compatible 路径测试速度。",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5-Pro",
+      apiKey: "",
+      temperature: 1,
+      maxTokens: MIMO_MAX_TOKENS,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    },
+    {
+      id: "mimo-v2-pro",
+      label: "MiMo V2 Pro",
+      provider: "MiMo",
+      description: "上一代 Pro 文本模型，可用于速度与质量对比。",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2-Pro",
+      apiKey: "",
+      temperature: 1,
+      maxTokens: MIMO_MAX_TOKENS,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    },
+    {
+      id: "mimo-v2-omni",
+      label: "MiMo V2 Omni",
+      provider: "MiMo",
+      description: "Omni 多模态模型，当前文本链路可先当通用对话模型试用。",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2-Omni",
+      apiKey: "",
+      temperature: 1,
+      maxTokens: MIMO_MAX_TOKENS,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    },
+    {
+      id: "mimo-v2-5-tts",
+      label: "MiMo V2.5 TTS",
+      provider: "MiMo",
+      description: "TTS 模型，先保留在模型库中，当前文本 Agent 主链通常不优先使用。",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5-TTS",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 4096,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    },
+    {
+      id: "mimo-v2-5-tts-voiceclone",
+      label: "MiMo V2.5 TTS VoiceClone",
+      provider: "MiMo",
+      description: "偏语音克隆，当前文本链路可配置但不建议作为默认主模型。",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5-TTS-VoiceClone",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 4096,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    },
+    {
+      id: "mimo-v2-5-tts-voicedesign",
+      label: "MiMo V2.5 TTS VoiceDesign",
+      provider: "MiMo",
+      description: "偏语音设计，当前文本链路可配置但不建议作为默认主模型。",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2.5-TTS-VoiceDesign",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 4096,
+      toolCallingMode: "text-json",
+      thinkingEnabled: false
+    },
+    {
+      id: "mimo-v2-tts",
+      label: "MiMo V2 TTS",
+      provider: "MiMo",
+      description: "上一代 TTS 模型，保留用于模型库切换测试。",
+      providerKind: "openai-compatible",
+      baseURL: MIMO_OPENAI_BASE_URL,
+      model: "MiMo-V2-TTS",
+      apiKey: "",
+      temperature: 0.7,
+      maxTokens: 4096,
       toolCallingMode: "text-json",
       thinkingEnabled: false
     },
@@ -216,7 +366,7 @@ function defaultRouterConfig(): ModelRuntimeConfig {
     model: OLLAMA_INTENT_MODEL,
     apiKey: "",
     temperature: 0.2,
-    maxTokens: 768,
+    maxTokens: 1024,
     toolCallingMode: "text-json",
     thinkingEnabled: false
   };

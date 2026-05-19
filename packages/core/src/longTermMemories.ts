@@ -1,5 +1,15 @@
-import type { MemoryRecord, MemoryType, RouterResult } from "@xiaomi/shared";
+import type {
+  AgentEventRecord,
+  MemoryPanelData,
+  MemoryPanelStats,
+  MemoryRecord,
+  MemoryTagCount,
+  MemoryType,
+  MemoryTypeCount,
+  RouterResult
+} from "@xiaomi/shared";
 import { getDatabase } from "./storage/database";
+import { listSessionEvents } from "./events";
 
 interface MemoryRow {
   readonly id: string;
@@ -135,6 +145,89 @@ export function listRelevantMemories(input: {
     .map((item) => item.memory);
 }
 
+export function listProjectMemories(input: {
+  readonly projectId: string;
+  readonly limit?: number;
+}): readonly MemoryRecord[] {
+  const rows = getDatabase()
+    .prepare(
+      `
+        SELECT *
+        FROM memories
+        WHERE project_id = ? AND status = 'active'
+        ORDER BY updated_at DESC, importance DESC
+        LIMIT ?
+      `
+    )
+    .all(input.projectId, input.limit ?? 200) as MemoryRow[];
+
+  return rows.map(toMemoryRecord);
+}
+
+export function getMemoryPanelData(input: {
+  readonly projectId: string;
+  readonly sessionId?: string;
+}): MemoryPanelData {
+  const projectMemories = listProjectMemories({
+    projectId: input.projectId,
+    limit: 200
+  });
+  const sessionMemories = input.sessionId
+    ? projectMemories.filter((memory) => memory.sourceSessionId === input.sessionId)
+    : [];
+  const events = input.sessionId
+    ? listSessionEvents({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        limit: 200
+      })
+    : [];
+  const recentWrites = readMemoriesFromLatestEvent(events, "memory_write");
+  const recentRecalls = readMemoriesFromLatestEvent(events, "memory_recall");
+  const stats: MemoryPanelStats = {
+    recentWrites: recentWrites.length,
+    recentRecalls: recentRecalls.length,
+    totalProjectMemories: projectMemories.length,
+    totalSessionMemories: sessionMemories.length,
+    typeCounts: buildMemoryTypeCounts(projectMemories),
+    topTags: buildTopTags(projectMemories)
+  };
+
+  return {
+    stats,
+    layers: [
+      {
+        key: "recent_writes",
+        title: "本轮新增",
+        description: "这一轮对话刚写入的长期记忆。",
+        count: recentWrites.length,
+        memories: recentWrites
+      },
+      {
+        key: "recent_recalls",
+        title: "本轮召回",
+        description: "系统本轮真正拿来参与推理的长期记忆。",
+        count: recentRecalls.length,
+        memories: recentRecalls
+      },
+      {
+        key: "session_memories",
+        title: "当前会话沉淀",
+        description: "来自当前会话的历史记忆，适合回顾本段讨论累计了什么。",
+        count: sessionMemories.length,
+        memories: sessionMemories
+      },
+      {
+        key: "project_memories",
+        title: "项目长期记忆",
+        description: "当前项目下全部有效长期记忆，按最近更新时间排序。",
+        count: projectMemories.length,
+        memories: projectMemories
+      }
+    ]
+  };
+}
+
 function shouldCaptureMemory(content: string, routerResult: RouterResult): boolean {
   const normalized = content.toLowerCase();
   const explicitSignals = [
@@ -198,6 +291,61 @@ function scoreMemory(memory: MemoryRecord, queryTerms: readonly string[]): numbe
   return termScore + memory.importance * 0.5 + memory.confidence * 0.25;
 }
 
+function readMemoriesFromLatestEvent(
+  events: readonly AgentEventRecord[],
+  type: "memory_write" | "memory_recall"
+): readonly MemoryRecord[] {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.type !== type) {
+      continue;
+    }
+
+    const payload = asRecord(event.payload);
+    const memories = payload.memories;
+    if (!Array.isArray(memories)) {
+      return [];
+    }
+
+    return memories.map(asMemoryRecord).filter((item): item is MemoryRecord => Boolean(item));
+  }
+
+  return [];
+}
+
+function buildMemoryTypeCounts(memories: readonly MemoryRecord[]): readonly MemoryTypeCount[] {
+  const order: readonly MemoryType[] = ["fact", "decision", "plan", "preference", "constraint"];
+  const counts = new Map<MemoryType, number>();
+
+  for (const memory of memories) {
+    counts.set(memory.type, (counts.get(memory.type) ?? 0) + 1);
+  }
+
+  return order.map((type) => ({
+    type,
+    count: counts.get(type) ?? 0
+  }));
+}
+
+function buildTopTags(memories: readonly MemoryRecord[]): readonly MemoryTagCount[] {
+  const counts = new Map<string, number>();
+
+  for (const memory of memories) {
+    for (const tag of memory.tags) {
+      const normalized = tag.trim();
+      if (!normalized) {
+        continue;
+      }
+      counts.set(normalized, (counts.get(normalized) ?? 0) + 1);
+    }
+  }
+
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"))
+    .slice(0, 6)
+    .map(([tag, count]) => ({ tag, count }));
+}
+
 function terms(value: string): readonly string[] {
   return value
     .toLowerCase()
@@ -223,6 +371,44 @@ function toMemoryRecord(row: MemoryRow): MemoryRecord {
   };
 }
 
+function asMemoryRecord(value: unknown): MemoryRecord | undefined {
+  const record = asRecord(value);
+  const id = stringOrEmpty(record.id);
+  const projectId = stringOrEmpty(record.projectId);
+  const type = record.type;
+  const content = stringOrEmpty(record.content);
+  const status = record.status;
+  const createdAt = stringOrEmpty(record.createdAt);
+  const updatedAt = stringOrEmpty(record.updatedAt);
+
+  if (!id || !projectId || !content || !createdAt || !updatedAt) {
+    return undefined;
+  }
+
+  if (type !== "fact" && type !== "preference" && type !== "decision" && type !== "plan" && type !== "constraint") {
+    return undefined;
+  }
+
+  if (status !== "active" && status !== "archived") {
+    return undefined;
+  }
+
+  return {
+    id,
+    projectId,
+    type,
+    content,
+    tags: arrayOfStrings(record.tags),
+    importance: numberOrDefault(record.importance, 0),
+    confidence: numberOrDefault(record.confidence, 0),
+    sourceSessionId: stringOrUndefined(record.sourceSessionId),
+    sourceEventIds: arrayOfStrings(record.sourceEventIds),
+    status,
+    createdAt,
+    updatedAt
+  };
+}
+
 function parseStringArray(value: string): readonly string[] {
   const parsed = JSON.parse(value) as unknown;
   return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
@@ -230,4 +416,24 @@ function parseStringArray(value: string): readonly string[] {
 
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function arrayOfStrings(value: unknown): readonly string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function stringOrEmpty(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function numberOrDefault(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }

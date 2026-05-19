@@ -32,15 +32,30 @@ function resolveMarkdownPath(filePath: string): string | undefined {
   }
 
   const rootDir = findProjectRoot();
+  const appRoot = process.env.APP_ROOT;
+  const resourcesPath = process.resourcesPath;
   const normalizedPath = normalizeRelativePath(filePath);
   const candidatePaths = new Set<string>();
 
   candidatePaths.add(path.resolve(process.cwd(), filePath));
+  candidatePaths.add(path.resolve(process.cwd(), normalizedPath));
 
   if (rootDir) {
     candidatePaths.add(path.resolve(rootDir, filePath));
     candidatePaths.add(path.resolve(rootDir, normalizedPath));
     candidatePaths.add(path.resolve(rootDir, "packages", normalizedPath));
+  }
+
+  if (appRoot) {
+    candidatePaths.add(path.resolve(appRoot, filePath));
+    candidatePaths.add(path.resolve(appRoot, normalizedPath));
+    candidatePaths.add(path.resolve(appRoot, "packages", normalizedPath));
+  }
+
+  if (resourcesPath) {
+    candidatePaths.add(path.resolve(resourcesPath, filePath));
+    candidatePaths.add(path.resolve(resourcesPath, normalizedPath));
+    candidatePaths.add(path.resolve(resourcesPath, "packages", normalizedPath));
   }
 
   for (const candidatePath of candidatePaths) {
@@ -57,6 +72,16 @@ function normalizeRelativePath(filePath: string): string {
 }
 
 function findProjectRoot(): string | undefined {
+  const appRoot = process.env.APP_ROOT;
+  if (appRoot && fs.existsSync(path.join(appRoot, "package.json"))) {
+    return appRoot;
+  }
+
+  const resourcesPath = process.resourcesPath;
+  if (resourcesPath && fs.existsSync(path.join(resourcesPath, "package.json"))) {
+    return resourcesPath;
+  }
+
   let currentDir = process.cwd();
 
   while (true) {

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { resolveProjectPath } from "../utils/projectRoot";
+import { resolveAppStoragePath } from "../utils/projectRoot";
 
 let database: Database.Database | undefined;
 
@@ -10,7 +10,7 @@ export function getDatabase(): Database.Database {
     return database;
   }
 
-  const dataDir = resolveProjectPath("data");
+  const dataDir = resolveAppStoragePath("data");
   fs.mkdirSync(dataDir, { recursive: true });
 
   database = new Database(path.join(dataDir, "agent.db"));
@@ -94,5 +94,31 @@ function migrate(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_prompt_iterations_project
       ON prompt_iterations (project_id, status, updated_at);
+
+    CREATE TABLE IF NOT EXISTS environment_profiles (
+      id TEXT PRIMARY KEY,
+      scope TEXT NOT NULL UNIQUE,
+      fingerprint_hash TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL DEFAULT '[]',
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS runtime_logs (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      session_id TEXT,
+      turn_id TEXT,
+      stage TEXT NOT NULL,
+      level TEXT NOT NULL,
+      message TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_runtime_logs_session
+      ON runtime_logs (project_id, session_id, created_at);
   `);
 }

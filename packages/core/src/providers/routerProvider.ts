@@ -13,57 +13,125 @@ import type {
 } from "@xiaomi/shared";
 import { getModelRuntimeConfig } from "../modelRuntimeConfig";
 import { buildRouterSystemPrompt, buildRouterUserPrompt } from "../prompts";
+import { parseModelJson } from "../utils/parseModelJson";
 import { createJsonChat } from "./jsonChatProvider";
 
-export async function analyzeRoute(messages: readonly ChatMessage[], latestUserMessage: string): Promise<RouterResult> {
+export async function analyzeRoute(
+  messages: readonly ChatMessage[],
+  latestUserMessage: string,
+  environmentFingerprint: string
+): Promise<RouterResult> {
   const config = getModelRuntimeConfig("router");
   const content = await createJsonChat({
     config,
     providerId: "router",
     systemPrompt: buildRouterSystemPrompt(),
-    userPrompt: buildRouterUserPrompt(messages, latestUserMessage),
+    userPrompt: buildRouterUserPrompt(messages, latestUserMessage, environmentFingerprint),
     latestUserMessage,
     messageCount: messages.length
   });
 
-  return parseRouterResult(content);
+  try {
+    return parseRouterResult(content);
+  } catch (error) {
+    const retryContent = await createJsonChat({
+      config: {
+        ...config,
+        temperature: Math.min(config.temperature, 0.1),
+        maxTokens: Math.max(config.maxTokens, 2048)
+      },
+      providerId: "router-retry",
+      systemPrompt: [
+        buildRouterSystemPrompt(),
+        "",
+        "上一次输出的 JSON 不完整或不合法。",
+        "这一次请只输出一个完整 JSON 对象。",
+        "不要重复字段，不要输出解释，不要截断 suggested_tools 或 success_criteria。"
+      ].join("\n"),
+      userPrompt: buildRouterUserPrompt(messages, latestUserMessage, environmentFingerprint),
+      latestUserMessage,
+      messageCount: messages.length
+    });
+
+    try {
+      return parseRouterResult(retryContent);
+    } catch {
+      throw error;
+    }
+  }
+}
+
+/**
+ * 根据意图和任务类型生成默认推荐的 skill
+ */
+function getDefaultSkillsForIntent(
+  intent: RouterIntent,
+  taskType: RouterTaskType
+): readonly string[] {
+  // 代码分析类任务
+  if (intent === "code" && taskType === "analysis") {
+    return ["code-review", "technical-analysis", "performance-optimization"];
+  }
+
+  // 代码实现类任务
+  if (intent === "code" && taskType === "implementation") {
+    return ["web-dev", "coding-standards", "best-practices"];
+  }
+
+  // 调试类任务
+  if (intent === "debug") {
+    return ["debugging", "error-analysis", "log-analysis"];
+  }
+
+  // 数据分析类任务
+  if (intent === "analysis") {
+    return ["data-analysis", "system-design", "architecture-review"];
+  }
+
+  // 聊天类任务不需要特定 skill
+  if (intent === "chat") {
+    return [];
+  }
+
+  // 默认不推荐特定 skill
+  return [];
 }
 
 function parseRouterResult(content: string): RouterResult {
-  const parsed = JSON.parse(content) as Partial<RouterResult>;
+  const parsed = parseModelJson<Partial<RouterResult>>(content, "Router") as Partial<RouterResult>;
   const turnAnalysis = asRecord(parsed.turn_analysis);
   const workflowDecision = asRecord(parsed.workflow_decision);
   const contextDecision = asRecord(parsed.context_decision);
   const profileObservation = asRecord(parsed.profile_observation);
   const evaluationSeed = asRecord(parsed.evaluation_seed);
   const allowedIntents = ["code", "chat", "search", "debug", "analysis"];
-  const intent = normalizeIntent(turnAnalysis.intent ?? parsed.intent, allowedIntents);
+  const intent = normalizeIntent(turnAnalysis.intent, allowedIntents);
 
   if (!intent) {
     throw new Error(`Router 任务分析结果无效：turn_analysis.intent 必须是 ${allowedIntents.join(" | ")} 之一。实际返回：${content}`);
   }
 
-  const taskType = normalizeTaskType(turnAnalysis.task_type ?? parsed.task_type) ?? defaultTaskTypeForIntent(intent);
-  const needsTools = toBoolean(contextDecision.needs_tools ?? parsed.needs_tools);
-  const suggestedTools = normalizeSuggestedTools(contextDecision.suggested_tools ?? parsed.suggested_tools, needsTools);
-  const secondaryIntents = normalizeSecondaryIntents(turnAnalysis.secondary_intents ?? parsed.secondary_intents, allowedIntents, intent);
-  const rewrittenInput = toStringValue(turnAnalysis.rewritten_input ?? parsed.rewritten_input);
-  const keywords = toStringArray(turnAnalysis.keywords ?? parsed.keywords);
+  const taskType = normalizeTaskType(turnAnalysis.task_type) ?? defaultTaskTypeForIntent(intent);
+  const needsTools = toBoolean(contextDecision.needs_tools);
+  const suggestedTools = normalizeSuggestedTools(contextDecision.suggested_tools, needsTools);
+  const secondaryIntents = normalizeSecondaryIntents(turnAnalysis.secondary_intents, allowedIntents, intent);
+  const rewrittenInput = toStringValue(turnAnalysis.rewritten_input);
+  const keywords = toStringArray(turnAnalysis.keywords);
   const isTask = toBoolean(turnAnalysis.is_task ?? parsed.is_task);
-  const taskGoal = toStringValue(turnAnalysis.task_goal ?? parsed.task_goal);
-  const complexity = normalizeComplexity(turnAnalysis.complexity ?? parsed.complexity);
-  const taskScope = normalizeTaskScope(turnAnalysis.task_scope ?? parsed.task_scope);
-  const executionMode = normalizeExecutionMode(workflowDecision.execution_mode ?? parsed.execution_mode, needsTools);
-  const reasoningBrief = toStringValue(turnAnalysis.reasoning_brief ?? parsed.reasoning_brief);
-  const expectedOutput = toStringValue(turnAnalysis.expected_output ?? parsed.expected_output);
-  const requiredContext = toStringArray(contextDecision.required_context ?? parsed.required_context);
-  const requiresProjectContext = toBoolean(contextDecision.requires_project_context ?? parsed.requires_project_context);
-  const needsUserClarification = toBoolean(workflowDecision.needs_user_clarification ?? parsed.needs_user_clarification);
-  const clarifyingQuestions = toStringArray(workflowDecision.clarifying_questions ?? parsed.clarifying_questions);
-  const toolReason = toStringValue(contextDecision.tool_reason ?? parsed.tool_reason);
-  const verificationQuestion = toStringValue(evaluationSeed.verification_question ?? parsed.verification_question);
-  const successCriteria = toStringArray(evaluationSeed.success_criteria ?? parsed.success_criteria);
-  const confidence = clampConfidence(evaluationSeed.confidence ?? parsed.confidence);
+  const taskGoal = toStringValue(turnAnalysis.task_goal);
+  const complexity = normalizeComplexity(turnAnalysis.complexity);
+  const taskScope = normalizeTaskScope(turnAnalysis.task_scope);
+  const executionMode = normalizeExecutionMode(workflowDecision.execution_mode, needsTools);
+  const reasoningBrief = toStringValue(turnAnalysis.reasoning_brief);
+  const expectedOutput = toStringValue(turnAnalysis.expected_output);
+  const requiredContext = toStringArray(contextDecision.required_context);
+  const requiresProjectContext = toBoolean(contextDecision.requires_project_context);
+  const needsUserClarification = toBoolean(workflowDecision.needs_user_clarification);
+  const clarifyingQuestions = toStringArray(workflowDecision.clarifying_questions);
+  const toolReason = toStringValue(contextDecision.tool_reason);
+  const verificationQuestion = toStringValue(evaluationSeed.verification_question);
+  const successCriteria = toStringArray(evaluationSeed.success_criteria);
+  const confidence = clampConfidence(evaluationSeed.confidence);
   const workflowRoute = normalizeWorkflowRoute(workflowDecision.workflow_route, executionMode, isTask);
   const inputRisk = normalizeInputRisk(asRecord(workflowDecision.input_risk));
   const profileSnapshotUsed = normalizeProfileSnapshot(asRecord(profileObservation.profile_snapshot_used));
@@ -71,6 +139,11 @@ function parseRouterResult(content: string): RouterResult {
   const contextNeeds = toStringArray(contextDecision.context_needs);
   const memoryQuery = toStringValue(contextDecision.memory_query);
   const timeContextMode = normalizeTimeContextMode(contextDecision.time_context_mode);
+
+  // 解析 suggested_skills：优先使用 AI 返回的值，否则根据意图生成默认推荐
+  const aiSuggestedSkills = toStringArray(parsed.suggested_skills);
+  const defaultSuggestedSkills = getDefaultSkillsForIntent(intent, taskType);
+  const suggestedSkills = aiSuggestedSkills.length > 0 ? aiSuggestedSkills : defaultSuggestedSkills;
 
   return {
     intent,
@@ -90,6 +163,7 @@ function parseRouterResult(content: string): RouterResult {
     constraints: toStringArray(parsed.constraints),
     risks: toStringArray(parsed.risks),
     suggested_roles: toStringArray(parsed.suggested_roles),
+    suggested_skills: suggestedSkills,
     main_model_brief: toStringValue(parsed.main_model_brief),
     routing_notes: toStringValue(parsed.routing_notes),
     verification_question: verificationQuestion,

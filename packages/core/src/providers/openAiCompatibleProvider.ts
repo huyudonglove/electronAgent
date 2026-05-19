@@ -52,9 +52,15 @@ export async function createOpenAiJsonChat(input: {
   readonly providerId: string;
 }): Promise<string> {
   const startedAtMs = Date.now();
+  const sanitizedMessages = sanitizeOpenAiMessages(input.messages);
+  if (sanitizedMessages.length === 0) {
+    throw new Error(
+      `${input.providerId} OpenAI-compatible 调用前消息为空。通常表示对应步骤的提示词未成功加载，或 system/user prompt 被构造成了空字符串。`
+    );
+  }
   const requestBody = {
     model: input.config.model,
-    messages: input.messages,
+    messages: sanitizedMessages,
     temperature: input.config.temperature,
     max_tokens: input.config.maxTokens,
     response_format: {
@@ -72,7 +78,7 @@ export async function createOpenAiJsonChat(input: {
       endpoint,
       headers: buildDebugHeaders(input.config),
       body: requestBody,
-      messageCount: input.messages.length,
+      messageCount: sanitizedMessages.length,
       latestUserMessage: input.latestUserMessage
     }
   });
@@ -84,7 +90,7 @@ export async function createOpenAiJsonChat(input: {
   });
 
   if (!response.ok) {
-    const message = `${response.status}: ${await response.text()}`;
+    const message = formatOpenAiErrorMessage(input.config, response.status, await response.text());
     addProviderDebugLog({
       ...debugLog,
       status: "failed",
@@ -121,9 +127,10 @@ export async function streamOpenAiChat(input: {
   readonly onDelta: (delta: string) => void;
 }): Promise<OpenAiStreamResponse> {
   const startedAtMs = Date.now();
+  const sanitizedMessages = buildOpenAiMessages(input);
   const requestBody = {
     model: input.config.model,
-    messages: buildOpenAiMessages(input),
+    messages: sanitizedMessages,
     temperature: input.config.temperature,
     max_tokens: input.config.maxTokens,
     stream: true
@@ -150,7 +157,7 @@ export async function streamOpenAiChat(input: {
   });
 
   if (!response.ok || !response.body) {
-    const message = `${response.status}: ${await response.text()}`;
+    const message = formatOpenAiErrorMessage(input.config, response.status, await response.text());
     addProviderDebugLog({
       ...debugLog,
       status: "failed",
@@ -261,6 +268,9 @@ export async function streamOpenAiChatWithNativeTools(input: {
       requestIndex
     });
     const assistantMessage = normalizeAssistantMessage(response.message);
+    if (!assistantMessage) {
+      throw new Error("OpenAI-compatible 原生工具调用返回了空 assistant 消息：既没有 content，也没有 reasoning_content，也没有 tool_calls。");
+    }
     messages.push(assistantMessage);
     nativeMessages.push(assistantMessage);
     stopReason = response.stopReason;
@@ -326,9 +336,10 @@ async function createOpenAiNativeToolChat(input: {
   readonly usage?: unknown;
 }> {
   const startedAtMs = Date.now();
+  const sanitizedMessages = sanitizeOpenAiMessages(input.messages);
   const requestBody = {
     model: input.config.model,
-    messages: input.messages,
+    messages: sanitizedMessages,
     tools: input.tools,
     tool_choice: "auto",
     temperature: input.config.temperature,
@@ -346,7 +357,7 @@ async function createOpenAiNativeToolChat(input: {
       endpoint,
       headers: buildDebugHeaders(input.config),
       body: requestBody,
-      messageCount: input.messages.length,
+      messageCount: sanitizedMessages.length,
       latestUserMessage: input.latestUserMessage
     }
   });
@@ -357,7 +368,7 @@ async function createOpenAiNativeToolChat(input: {
   });
 
   if (!response.ok) {
-    const message = `${response.status}: ${await response.text()}`;
+    const message = formatOpenAiErrorMessage(input.config, response.status, await response.text());
     addProviderDebugLog({
       ...debugLog,
       status: "failed",
@@ -408,10 +419,18 @@ function buildOpenAiMessages(input: {
           return nativeMessages;
         }
 
+        if (!hasMeaningfulText(message.content)) {
+          return [];
+        }
+
         return [{
           role: "assistant",
           content: message.content
         }];
+      }
+
+      if (!hasMeaningfulText(message.content)) {
+        return [];
       }
 
       return [{
@@ -422,7 +441,7 @@ function buildOpenAiMessages(input: {
   const latestUserMessage = conversationMessages.at(-1);
   const historyMessages = latestUserMessage ? conversationMessages.slice(0, -1) : conversationMessages;
 
-  return [
+  return sanitizeOpenAiMessages([
     {
       role: "system",
       content: input.system
@@ -433,7 +452,7 @@ function buildOpenAiMessages(input: {
       content: input.runtimeContext
     },
     ...(latestUserMessage ? [latestUserMessage] : [])
-  ];
+  ]);
 }
 
 interface OpenAiToolDefinition {
@@ -622,12 +641,20 @@ function toolRequestToLocalRequest(toolCall: OpenAiToolCall): ToolRequest | unde
   return undefined;
 }
 
-function normalizeAssistantMessage(message?: OpenAiChoiceMessage): OpenAiAssistantMessage {
+function normalizeAssistantMessage(message?: OpenAiChoiceMessage): OpenAiAssistantMessage | undefined {
+  const content = typeof message?.content === "string" ? message.content : undefined;
+  const reasoningContent = typeof message?.reasoning_content === "string" ? message.reasoning_content : undefined;
+  const toolCalls = message?.tool_calls && message.tool_calls.length > 0 ? message.tool_calls : undefined;
+
+  if (!hasMeaningfulText(content) && !hasMeaningfulText(reasoningContent) && !toolCalls) {
+    return undefined;
+  }
+
   return {
     role: "assistant",
-    content: message?.content ?? "",
-    ...(message?.reasoning_content ? { reasoning_content: message.reasoning_content } : {}),
-    ...(message?.tool_calls && message.tool_calls.length > 0 ? { tool_calls: message.tool_calls } : {})
+    ...(content !== undefined ? { content } : {}),
+    ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+    ...(toolCalls ? { tool_calls: toolCalls } : {})
   };
 }
 
@@ -661,7 +688,11 @@ function formatNativeToolResult(result: ToolResult): string {
 
 function extractNativeOpenAiMessages(message: ChatMessage): readonly OpenAiMessage[] {
   const value = message.metadata?.openaiNativeMessages;
-  return Array.isArray(value) ? value.filter(isOpenAiMessage) : [];
+  return Array.isArray(value)
+    ? value
+        .filter(isOpenAiMessage)
+        .filter((item) => item.role !== "assistant" || isValidAssistantMessage(item))
+    : [];
 }
 
 function isOpenAiMessage(value: unknown): value is OpenAiMessage {
@@ -671,6 +702,30 @@ function isOpenAiMessage(value: unknown): value is OpenAiMessage {
 
   const role = (value as { readonly role?: unknown }).role;
   return role === "assistant" || role === "tool" || role === "user" || role === "system";
+}
+
+function isValidAssistantMessage(message: OpenAiAssistantMessage): boolean {
+  return hasMeaningfulText(typeof message.content === "string" ? message.content : undefined)
+    || hasMeaningfulText(message.reasoning_content)
+    || Boolean(message.tool_calls && message.tool_calls.length > 0);
+}
+
+function hasMeaningfulText(value: string | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function sanitizeOpenAiMessages(messages: readonly OpenAiMessage[]): readonly OpenAiMessage[] {
+  return messages.filter((message) => {
+    if (message.role === "assistant") {
+      return isValidAssistantMessage(message);
+    }
+
+    if (message.role === "tool") {
+      return hasMeaningfulText(message.content);
+    }
+
+    return hasMeaningfulText(message.content);
+  });
 }
 
 function parseArguments(value: string): Record<string, unknown> {
@@ -710,19 +765,54 @@ function numberSchema(description: string): Record<string, unknown> {
 }
 
 function buildHeaders(config: ModelRuntimeConfig): HeadersInit {
-  return {
+  const headers: Record<string, string> = {
     "content-type": "application/json",
     ...(config.apiKey ? { authorization: `Bearer ${config.apiKey.trim()}` } : {})
   };
+
+  if (isMimoOpenAiEndpoint(config.baseURL) && config.apiKey) {
+    headers["x-api-key"] = config.apiKey.trim();
+  }
+
+  return headers;
 }
 
 function buildDebugHeaders(config: ModelRuntimeConfig): Record<string, string> {
-  return {
+  const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: config.apiKey ? "Bearer [redacted]" : ""
   };
+
+  if (isMimoOpenAiEndpoint(config.baseURL) && config.apiKey) {
+    headers["x-api-key"] = "[redacted]";
+  }
+
+  return headers;
 }
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+function isMimoOpenAiEndpoint(baseURL: string): boolean {
+  return /xiaomimimo\.com/i.test(baseURL);
+}
+
+function formatOpenAiErrorMessage(config: ModelRuntimeConfig, status: number, responseText: string): string {
+  const text = `${status}: ${responseText}`;
+  if (!isMimoOpenAiEndpoint(config.baseURL)) {
+    return text;
+  }
+
+  const normalizedBody = responseText.toLowerCase();
+  const normalizedModel = config.model.toLowerCase();
+  if (status === 401 && normalizedBody.includes("invalid api key")) {
+    return `${text}。MiMo /v1 当前拒绝了这把 key；如果同一把 key 可以访问 Anthropic-compatible 路径，说明它很可能没有 /v1 权限，当前不能用于原生 OpenAI tools。`;
+  }
+
+  if (status === 400 && normalizedBody.includes("not supported model")) {
+    return `${text}。当前 MiMo /v1 或兼容路由不支持模型 ${normalizedModel}，请改用该路由实际支持的模型名。`;
+  }
+
+  return text;
 }

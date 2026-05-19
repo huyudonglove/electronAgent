@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { resolveAppStoragePath } from "./utils/projectRoot";
 
 interface LocalSecrets {
   readonly mimoApiKey?: string;
@@ -24,6 +25,11 @@ function readLocalSecrets(): LocalSecrets {
 }
 
 function findSecretsPath(): string {
+  const appSecretsPath = resolveAppStoragePath("config", "secrets.local.json");
+  if (fs.existsSync(appSecretsPath)) {
+    return appSecretsPath;
+  }
+
   let currentDir = process.cwd();
 
   while (true) {

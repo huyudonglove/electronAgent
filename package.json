@@ -1,5 +1,5 @@
 {
-  "name": "xiaomi-agent-workbench",
+  "name": "huyd-agent",
   "version": "0.1.0",
   "private": true,
   "description": "Electron GUI workbench for multi-role agent orchestration.",
@@ -8,6 +8,8 @@
   "scripts": {
     "dev": "pnpm --filter @xiaomi/desktop dev",
     "build": "pnpm --filter @xiaomi/desktop build",
+    "pack:win": "pnpm --filter @xiaomi/desktop pack:win",
+    "dist:win": "pnpm --filter @xiaomi/desktop dist:win",
     "postinstall": "pnpm --filter @xiaomi/desktop rebuild:native",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint"

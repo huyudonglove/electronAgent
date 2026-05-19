@@ -8,11 +8,13 @@ import type {
 import type { ConversationSummary } from "../conversationSummaries";
 import { getModelRuntimeConfig } from "../modelRuntimeConfig";
 import { buildPlanningSystemPrompt, buildPlanningUserPrompt } from "../prompts";
+import { parseModelJson } from "../utils/parseModelJson";
 import { createJsonChat } from "./jsonChatProvider";
 
 export async function createExecutionPlan(input: {
   readonly messages: readonly ChatMessage[];
   readonly latestUserMessage: string;
+  readonly environmentFingerprint: string;
   readonly routerResult: RouterResult;
   readonly toolSelection: ToolSelectionResult;
   readonly conversationSummary?: ConversationSummary;
@@ -22,6 +24,7 @@ export async function createExecutionPlan(input: {
   const systemPrompt = buildPlanningSystemPrompt();
   const userPrompt = buildPlanningUserPrompt({
     userInput: input.latestUserMessage,
+    environmentFingerprint: input.environmentFingerprint,
     routerResult: JSON.stringify(input.routerResult, null, 2),
     toolSelection: JSON.stringify(input.toolSelection, null, 2),
     memories: formatMemories(input.memories ?? []),
@@ -48,7 +51,7 @@ function parsePlanningResult(
     readonly toolSelection: ToolSelectionResult;
   }
 ): PlanningResult {
-  const parsed = JSON.parse(content) as Partial<PlanningResult>;
+  const parsed = parseModelJson<Partial<PlanningResult>>(content, "Planner");
   const requiredTools = toStringArray(parsed.required_tools)
     .filter((tool) => fallbackInput.toolSelection.selected_tools.includes(tool));
 

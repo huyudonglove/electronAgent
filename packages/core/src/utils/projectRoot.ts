@@ -23,3 +23,12 @@ export function findProjectRoot(): string | undefined {
 export function resolveProjectPath(...parts: readonly string[]): string {
   return path.resolve(findProjectRoot() ?? process.cwd(), ...parts);
 }
+
+export function resolveAppStoragePath(...parts: readonly string[]): string {
+  const appUserData = process.env.APP_USER_DATA?.trim();
+  if (appUserData) {
+    return path.resolve(appUserData, ...parts);
+  }
+
+  return resolveProjectPath(...parts);
+}

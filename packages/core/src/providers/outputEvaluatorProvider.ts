@@ -1,20 +1,25 @@
-import type { ChatMessage, EvaluationNextAction, OutputEvaluationResult, RouterResult } from "@xiaomi/shared";
+import type { ChatMessage, EvaluationNextAction, OutputEvaluationResult, PlanningResult, RouterResult } from "@xiaomi/shared";
 import { getModelRuntimeConfig } from "../modelRuntimeConfig";
 import { buildEvaluatorSystemPrompt, buildEvaluatorUserPrompt } from "../prompts";
+import { parseModelJson } from "../utils/parseModelJson";
 import { createJsonChat } from "./jsonChatProvider";
 
 export async function evaluateOutput(input: {
   readonly messages: readonly ChatMessage[];
   readonly userInput: string;
   readonly routerResult: RouterResult;
+  readonly planningResult?: PlanningResult;
   readonly assistantAnswer: string;
+  readonly evaluationAttempt?: number;
 }): Promise<OutputEvaluationResult> {
   const config = getModelRuntimeConfig("evaluator");
   const routerResultText = JSON.stringify(input.routerResult, null, 2);
   const userPrompt = buildEvaluatorUserPrompt({
     userInput: input.userInput,
     routerResult: routerResultText,
-    assistantAnswer: input.assistantAnswer
+    planningResult: input.planningResult ? JSON.stringify(input.planningResult, null, 2) : "",
+    assistantAnswer: input.assistantAnswer,
+    evaluationAttempt: input.evaluationAttempt
   });
 
   const content = await createJsonChat({
@@ -33,7 +38,7 @@ export async function evaluateOutput(input: {
 }
 
 function parseEvaluationResult(content: string, routerResult: RouterResult): OutputEvaluationResult {
-  const parsed = JSON.parse(content) as Partial<OutputEvaluationResult>;
+  const parsed = parseModelJson<Partial<OutputEvaluationResult>>(content, "Evaluator");
   const nextAction = normalizeNextAction(parsed.next_action);
   const shouldEvaluate = toBoolean(parsed.should_evaluate);
   const missingCriteria = toStringArray(parsed.missing_criteria);

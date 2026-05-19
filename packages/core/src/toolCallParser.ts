@@ -9,8 +9,12 @@ import type {
   ToolRequest
 } from "@xiaomi/shared";
 import { resolveProjectPath } from "./utils/projectRoot";
+import { parseModelJson } from "./utils/parseModelJson";
 
 const JSON_FENCE_PATTERN = /```(?:json)?\s*([\s\S]*?)```/gi;
+const TOOL_CALLS_BLOCK_PATTERN = /<tool_calls>[\s\S]*?<\/tool_calls>/gi;
+const TOOL_CALL_BLOCK_PATTERN = /<tool_call>[\s\S]*?<\/tool_call>/gi;
+const XML_TOOL_CALL_PATTERN = /<function>([^<]+)<\/function>\s*<parameters>([\s\S]*?)<\/parameters>/gi;
 const TOOL_TYPES = new Set([
   "command.run",
   "file.read",
@@ -33,6 +37,8 @@ export function parseLocalToolRequests(content: string): readonly ToolRequest[] 
     collectRequests(parsed, requests);
   }
 
+  requests.push(...collectXmlToolRequests(content));
+
   return requests.slice(0, 8);
 }
 
@@ -48,7 +54,10 @@ export function removeLocalToolRequestBlocks(content: string): string {
 
     return requests.length > 0 ? "" : block;
   });
-  const trimmed = withoutFencedRequests.trim();
+  const withoutXmlRequests = withoutFencedRequests
+    .replace(TOOL_CALLS_BLOCK_PATTERN, "")
+    .replace(TOOL_CALL_BLOCK_PATTERN, "");
+  const trimmed = withoutXmlRequests.trim();
   const parsed = parseJson(trimmed);
   const requests: ToolRequest[] = [];
   collectRequests(parsed, requests);
@@ -57,7 +66,7 @@ export function removeLocalToolRequestBlocks(content: string): string {
     return "";
   }
 
-  return withoutFencedRequests.trim();
+  return withoutXmlRequests.trim();
 }
 
 function collectJsonCandidates(content: string): readonly string[] {
@@ -78,10 +87,69 @@ function collectJsonCandidates(content: string): readonly string[] {
 
 function parseJson(content: string): unknown {
   try {
-    return JSON.parse(content);
+    return parseModelJson<unknown>(content, "Tool request");
   } catch {
     return undefined;
   }
+}
+
+function collectXmlToolRequests(content: string): readonly ToolRequest[] {
+  const requests: ToolRequest[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = XML_TOOL_CALL_PATTERN.exec(content))) {
+    const functionName = match[1]?.trim() ?? "";
+    const parameterBlock = match[2] ?? "";
+
+    if (!TOOL_TYPES.has(functionName)) {
+      continue;
+    }
+
+    const value = xmlToolCallToRecord(functionName, parameterBlock);
+    const request = toToolRequest(value);
+    if (request) {
+      requests.push(request);
+    }
+  }
+
+  return requests;
+}
+
+function xmlToolCallToRecord(functionName: string, parameterBlock: string): Record<string, unknown> {
+  const record: Record<string, unknown> = {
+    type: functionName
+  };
+  const parameterPattern = /<([a-zA-Z0-9_.-]+)>([\s\S]*?)<\/\1>/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = parameterPattern.exec(parameterBlock))) {
+    const key = match[1]?.trim() ?? "";
+    const rawValue = (match[2] ?? "").trim();
+    if (!key) {
+      continue;
+    }
+
+    record[key] = normalizeXmlParameterValue(rawValue);
+  }
+
+  return record;
+}
+
+function normalizeXmlParameterValue(value: string): unknown {
+  if (value === "true") {
+    return true;
+  }
+
+  if (value === "false") {
+    return false;
+  }
+
+  if (/^\d+$/.test(value)) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : value;
+  }
+
+  return value;
 }
 
 function collectRequests(value: unknown, requests: ToolRequest[]): void {

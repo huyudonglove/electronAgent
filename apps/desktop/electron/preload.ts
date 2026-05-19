@@ -4,9 +4,12 @@ import type {
   ChatRequest,
   ChatResponse,
   ChatStreamEvent,
+  EnvironmentFingerprint,
+  MemoryPanelData,
   ModelRuntimeSettings,
   ModelProfile,
   ProviderDebugLog,
+  RuntimeLogRecord,
 } from "@xiaomi/shared";
 
 export interface WorkbenchInitialState {
@@ -19,10 +22,20 @@ export interface WorkbenchApi {
   readonly streamChatMessage: (request: ChatRequest) => Promise<void>;
   readonly onChatStreamEvent: (handler: (event: ChatStreamEvent) => void) => () => void;
   readonly listProviderDebugLogs: () => Promise<readonly ProviderDebugLog[]>;
+  readonly listRuntimeLogs: (request?: {
+    readonly projectId?: string;
+    readonly sessionId?: string;
+    readonly limit?: number;
+  }) => Promise<readonly RuntimeLogRecord[]>;
   readonly listSessionEvents: (request: {
     readonly projectId: string;
     readonly sessionId: string;
   }) => Promise<readonly AgentEventRecord[]>;
+  readonly getMemoryPanelData: (request: {
+    readonly projectId: string;
+    readonly sessionId?: string;
+  }) => Promise<MemoryPanelData>;
+  readonly getEnvironmentFingerprint: () => Promise<EnvironmentFingerprint | undefined>;
   readonly getModelRuntimeSettings: () => Promise<ModelRuntimeSettings>;
   readonly saveModelRuntimeSettings: (settings: ModelRuntimeSettings) => Promise<ModelRuntimeSettings>;
 }
@@ -41,7 +54,10 @@ const api: WorkbenchApi = {
     };
   },
   listProviderDebugLogs: () => ipcRenderer.invoke("workbench:list-provider-debug-logs"),
+  listRuntimeLogs: (request) => ipcRenderer.invoke("workbench:list-runtime-logs", request),
   listSessionEvents: (request) => ipcRenderer.invoke("workbench:list-session-events", request),
+  getMemoryPanelData: (request) => ipcRenderer.invoke("workbench:get-memory-panel-data", request),
+  getEnvironmentFingerprint: () => ipcRenderer.invoke("workbench:get-environment-fingerprint"),
   getModelRuntimeSettings: () => ipcRenderer.invoke("workbench:get-model-runtime-settings"),
   saveModelRuntimeSettings: (settings) => ipcRenderer.invoke("workbench:save-model-runtime-settings", settings)
 };

@@ -2,22 +2,78 @@
   "name": "@xiaomi/desktop",
   "version": "0.1.0",
   "private": true,
+  "description": "Electron desktop shell for huydAgent.",
+  "author": "huyd",
   "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build --emptyOutDir",
+    "pack:win": "pnpm build && electron-builder --win --dir",
+    "dist:win": "pnpm build && electron-builder --win nsis portable",
     "rebuild:native": "electron-rebuild -f -w better-sqlite3",
     "preview": "vite preview --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "com.huyd.agent",
+    "productName": "huydAgent",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "package.json",
+      "packages/memorizes/**",
+      "node_modules/better-sqlite3/**",
+      "node_modules/bindings/**",
+      "node_modules/file-uri-to-path/**"
+    ],
+    "extraMetadata": {
+      "main": "dist-electron/main.js"
+    },
+    "extraResources": [
+      {
+        "from": "../../packages/memorizes",
+        "to": "packages/memorizes"
+      },
+      {
+        "from": "node_modules/bindings",
+        "to": "app.asar.unpacked/node_modules/bindings"
+      },
+      {
+        "from": "node_modules/file-uri-to-path",
+        "to": "app.asar.unpacked/node_modules/file-uri-to-path"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-${arch}-setup.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-${arch}-portable.${ext}"
+    }
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.4",
     "@xiaomi/core": "workspace:*",
     "@xiaomi/shared": "workspace:*",
     "better-sqlite3": "^12.10.0",
-    "electron": "^33.2.1",
+    "bindings": "^1.5.0",
+    "file-uri-to-path": "^1.0.0",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -28,6 +84,8 @@
     "@electron/rebuild": "^4.0.4",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "electron": "^33.2.1",
+    "electron-builder": "^26.8.1",
     "typescript": "^5.7.2"
   }
 }
